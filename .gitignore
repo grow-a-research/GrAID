@@ -1,0 +1,25 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Hugging Face / model caches (keep out of repo)
+.cache/
+**/.cache/
+
+# Local outputs
+procPapers/
+**/procPapers/
+*.png
+*.jpg
+*.jpeg
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
