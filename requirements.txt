@@ -1,0 +1,15 @@
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+python-multipart>=0.0.9
+
+pillow>=10.4.0
+opencv-python>=4.10.0.0
+numpy>=1.26.4
+
+transformers>=4.47.0
+accelerate>=1.0.0
+bitsandbytes>=0.44.1
+
+qwen-vl-utils>=0.0.8
+
+surya-ocr==0.13.1
