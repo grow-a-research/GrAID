@@ -285,12 +285,16 @@ Fixes for known issues discovered during testing.
 
 ---
 
-## Phase 19 — OCR / OMR Quality (planned)
-- Adaptive Otsu per-bubble for varying lighting conditions
-- Morphological open/close to remove noise before fill-ratio computation
-- Pre-check scan quality (blur detection via Laplacian variance) before OCR
-- TrOCR cascade: fall back to TrOCR when Qwen confidence is low
-- Separate answer sheet layout option (questions on one side, bubbles/boxes on other)
+## Phase 19 — OCR / OMR Quality ✅
+- Per-bubble adaptive Otsu: local patch extracted around each bubble (3× radius
+  padding), Otsu applied on that patch → robust to uneven lighting / shadowing
+- Morphological open + close (elliptic kernel, ~r/4 px) applied after binarization
+  to remove speckle noise and fill small gaps inside filled marks
+- Blur / quality pre-check via Laplacian variance before OCR; threshold = 80
+- Low-quality pages collected as `quality_warnings` list in new `OcrResult`
+  response schema (`{ answers, quality_warnings }`)
+- Amber warning banner in Submissions tab when OCR detects a blurry scan;
+  includes sharpness score and retake suggestion; OCR still proceeds
 
 ---
 

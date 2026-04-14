@@ -314,6 +314,12 @@ class FlagStats(BaseModel):
     recall: float | None      # TP / (TP + FN); None if no data
 
 
+# --- Phase 19: OCR result wrapper (includes quality warnings) ---
+class OcrResult(BaseModel):
+    answers: list[SubmissionAnswerRead]
+    quality_warnings: list[str] = []
+
+
 # --- Phase 10: Batch scan upload ---
 class BatchFileResult(BaseModel):
     filename: str

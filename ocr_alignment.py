@@ -56,6 +56,39 @@ def _template_marker_corners(template_spec: dict[str, Any]) -> dict[int, np.ndar
     return out
 
 
+# ── Scan quality check (Phase 19) ────────────────────────────────────────────
+
+# Laplacian variance below this value is considered a blurry/out-of-focus scan.
+# Empirically tuned: crisp A4 scans at ≥200 DPI yield variance >> 100;
+# camera photos taken in poor lighting or out-of-focus typically fall below 80.
+_BLUR_THRESHOLD: float = 80.0
+
+
+def check_scan_quality(scan: Image.Image) -> tuple[float, bool]:
+    """
+    Estimate scan sharpness using the Laplacian variance (focus measure).
+
+    A high variance indicates many sharp edges (sharp, high-contrast scan).
+    A low variance indicates blurry or low-contrast content.
+
+    Parameters
+    ----------
+    scan : Raw uploaded scan as a PIL Image.
+
+    Returns
+    -------
+    (variance, is_blurry)
+        variance   : Laplacian variance (higher = sharper).
+        is_blurry  : True when variance < _BLUR_THRESHOLD.
+    """
+    gray = np.array(scan.convert("L"))
+    lap_var = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+    logger.debug(
+        "Scan quality — Laplacian variance: %.1f (threshold=%.1f)", lap_var, _BLUR_THRESHOLD
+    )
+    return lap_var, lap_var < _BLUR_THRESHOLD
+
+
 # ── Preprocessing — scan level (before ArUco detection) ──────────────────────
 
 def _denoise(rgb: np.ndarray) -> np.ndarray:

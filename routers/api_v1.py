@@ -40,6 +40,7 @@ from api_schemas import (
     FlagReview,
     FlagStats,
     ImportResult,
+    OcrResult,
     QuestionImportResult,
     QuestionStats,
     RubricImportResult,
@@ -526,11 +527,11 @@ async def upload_submission_file(
 # ---------------------------------------------------------------------------
 
 
-@router.post("/submissions/{submission_id}/ocr", response_model=list[SubmissionAnswerRead])
+@router.post("/submissions/{submission_id}/ocr", response_model=OcrResult)
 async def run_submission_ocr(
     submission_id: int,
     db: Session = Depends(get_db),
-) -> list[m.SubmissionAnswer]:
+) -> OcrResult:
     """
     Phase 5 OCR pipeline — template-aware per-question extraction.
 
@@ -545,7 +546,12 @@ async def run_submission_ocr(
     """
     import ocr_pipeline
     from ai_grader import correct_ocr_text
-    from ocr_alignment import crop_content_area, crop_region, detect_and_warp
+    from ocr_alignment import (
+        check_scan_quality,
+        crop_content_area,
+        crop_region,
+        detect_and_warp,
+    )
 
     sub = db.get(m.Submission, submission_id)
     if not sub:
@@ -586,6 +592,7 @@ async def run_submission_ocr(
     dest_dir = DATA_ROOT / str(submission_id)
     dest_dir.mkdir(parents=True, exist_ok=True)
     results: list[m.SubmissionAnswer] = []
+    quality_warnings: list[str] = []
 
     for sf in files:
         img_path = project_root / sf.stored_path
@@ -595,6 +602,16 @@ async def run_submission_ocr(
             raise HTTPException(
                 status_code=500, detail=f"Could not open page {sf.page_number}: {e}"
             ) from e
+
+        # Phase 19: blur / quality pre-check before OCR
+        lap_var, is_blurry = check_scan_quality(image)
+        if is_blurry:
+            msg = (
+                f"Page {sf.page_number}: scan appears blurry or low-contrast "
+                f"(sharpness score {lap_var:.0f} — retake for best results)."
+            )
+            quality_warnings.append(msg)
+            logger.warning("Quality check — %s", msg)
 
         now = datetime.now(timezone.utc)
         aligned = False
@@ -727,7 +744,7 @@ async def run_submission_ocr(
 
     sub.status = "ocr_done"
     db.commit()
-    return results
+    return OcrResult(answers=results, quality_warnings=quality_warnings)
 
 
 # ---------------------------------------------------------------------------
