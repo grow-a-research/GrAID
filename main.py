@@ -1,28 +1,26 @@
-import base64
 import io
 import os
-from dataclasses import dataclass
-from typing import Any, Optional
+from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import AsyncIterator
 
-import cv2
-import numpy as np
-import torch
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from PIL import Image, ImageDraw
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
+from PIL import Image
 from pydantic import BaseModel
-from qwen_vl_utils import process_vision_info
-from transformers import (
-    AutoModelForVision2Seq,
-    AutoProcessor,
-    BitsAndBytesConfig,
-)
 
-# Surya line detection
-from surya.detection import DetectionPredictor
+import ocr_pipeline
+from database import init_db
+from routers.api_v1 import router as api_v1_router
 
+_FRONTEND_DIST = Path(__file__).parent / "frontend" / "dist"
 
-QWEN_MODEL_ID = os.getenv("QWEN_MODEL_ID", "Qwen/Qwen2.5-VL-7B-Instruct")
+# Set SKIP_MODEL_LOAD=1 to start the server without loading Qwen/Surya.
+# All data-platform endpoints (/api/v1/*) work normally.
+# OCR endpoints (/extract, /api/v1/submissions/{id}/ocr) will return 503.
+_SKIP_MODEL_LOAD = os.getenv("SKIP_MODEL_LOAD", "0") == "1"
 
 
 class ExtractResponse(BaseModel):
@@ -30,201 +28,36 @@ class ExtractResponse(BaseModel):
     boxed_image_png_base64: str
 
 
-@dataclass
-class Models:
-    # Surya
-    surya_detector: Any
-    # Qwen
-    qwen_model: Any
-    qwen_processor: Any
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    try:
+        init_db()
+    except Exception as e:
+        print(f"\n[STARTUP ERROR] Database init failed: {e}\n")
+        raise
+
+    if _SKIP_MODEL_LOAD:
+        print("[Models] SKIP_MODEL_LOAD=1 — skipping model load. OCR endpoints will return 503.")
+    else:
+        try:
+            ocr_pipeline.load_models()
+        except Exception as e:
+            print(f"\n[STARTUP ERROR] Model loading failed: {e}\n")
+            raise
+
+    yield
 
 
-app = FastAPI(title="Handwritten Test Paper OCR Backend")
+app = FastAPI(title="GrAId — AI-Powered Exam Grading Backend", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-
-MODELS: Optional[Models] = None
-
-
-def _pil_to_cv2_bgr(img: Image.Image) -> np.ndarray:
-    rgb = np.array(img.convert("RGB"))
-    return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-
-
-def _cv2_bgr_to_pil(img_bgr: np.ndarray) -> Image.Image:
-    rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-    return Image.fromarray(rgb)
-
-
-def preprocess_for_detection(img: Image.Image) -> Image.Image:
-    """
-    Preprocess for line detection:
-    - grayscale
-    - denoise
-    - adaptive threshold
-    Return PIL RGB (Surya expects PIL Images).
-    """
-    bgr = _pil_to_cv2_bgr(img)
-    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-    den = cv2.fastNlMeansDenoising(gray, None, h=12, templateWindowSize=7, searchWindowSize=21)
-    thr = cv2.adaptiveThreshold(
-        den,
-        255,
-        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY,
-        31,
-        15,
-    )
-    rgb = cv2.cvtColor(thr, cv2.COLOR_GRAY2RGB)
-    return Image.fromarray(rgb)
-
-
-def draw_boxes(image: Image.Image, boxes_xyxy: list[tuple[int, int, int, int]]) -> Image.Image:
-    out = image.convert("RGB").copy()
-    draw = ImageDraw.Draw(out)
-    for (x1, y1, x2, y2) in boxes_xyxy:
-        draw.rectangle([x1, y1, x2, y2], outline=(255, 0, 0), width=2)
-    return out
-
-
-def _encode_png_base64(img: Image.Image) -> str:
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    return base64.b64encode(buf.getvalue()).decode("utf-8")
-
-
-def _extract_surya_xyxy(pred: Any) -> list[tuple[int, int, int, int]]:
-    """
-    Surya returns prediction objects with .bboxes iterable.
-    Each bbox has .bbox as [x1,y1,x2,y2] (rect) in image coords.
-    """
-    boxes: list[tuple[int, int, int, int]] = []
-    if pred is None:
-        return boxes
-    bboxes = getattr(pred, "bboxes", None)
-    if not bboxes:
-        return boxes
-    for b in bboxes:
-        rect = getattr(b, "bbox", None)
-        if not rect or len(rect) != 4:
-            continue
-        x1, y1, x2, y2 = rect
-        boxes.append((int(x1), int(y1), int(x2), int(y2)))
-    return boxes
-
-
-def crop_lines(original_rgb: Image.Image, boxes_xyxy: list[tuple[int, int, int, int]]) -> list[Image.Image]:
-    w, h = original_rgb.size
-    crops: list[Image.Image] = []
-    for (x1, y1, x2, y2) in boxes_xyxy:
-        x1c, y1c = max(0, x1), max(0, y1)
-        x2c, y2c = min(w, x2), min(h, y2)
-        if x2c <= x1c or y2c <= y1c:
-            continue
-        crops.append(original_rgb.crop((x1c, y1c, x2c, y2c)))
-    return crops
-
-
-def qwen_ocr_lines(line_images: list[Image.Image]) -> list[str]:
-    assert MODELS is not None
-
-    # Simple prompt for line-level transcription; tune later if needed.
-    prompt = "Transcribe the handwritten text in this image line. Output only the text."
-
-    texts: list[str] = []
-    for img in line_images:
-        # Qwen2.5-VL expects image placeholders in the text. The safest way is the chat template
-        # + qwen-vl-utils vision preprocessing helper.
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image", "image": img},
-                    {"type": "text", "text": prompt},
-                ],
-            }
-        ]
-        text = MODELS.qwen_processor.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
-        )
-        image_inputs, video_inputs = process_vision_info(messages)
-        inputs = MODELS.qwen_processor(
-            text=[text],
-            images=image_inputs,
-            videos=video_inputs,
-            return_tensors="pt",
-        )
-        inputs = {k: v.to(MODELS.qwen_model.device) for k, v in inputs.items() if hasattr(v, "to")}
-
-        with torch.inference_mode():
-            output_ids = MODELS.qwen_model.generate(
-                **inputs,
-                max_new_tokens=128,
-                do_sample=False,
-            )
-
-        # Remove the prompt tokens and decode only newly generated tokens.
-        prompt_len = inputs["input_ids"].shape[1]
-        gen_only = output_ids[:, prompt_len:]
-        decoded = MODELS.qwen_processor.batch_decode(gen_only, skip_special_tokens=True)
-        txt = decoded[0].strip()
-        texts.append(txt)
-
-    return texts
-
-
-@app.on_event("startup")
-def startup_load_models() -> None:
-    global MODELS
-
-    if MODELS is not None:
-        return
-
-    if not torch.cuda.is_available():
-        raise RuntimeError("CUDA not available. Install a CUDA-enabled PyTorch build and NVIDIA drivers.")
-
-    # Surya detector
-    # Note: Surya's public API changed across versions; DetectionPredictor works for surya-ocr==0.13.1.
-    surya_detector = DetectionPredictor()
-    # Move to GPU if available
-    if torch.cuda.is_available():
-        try:
-            # Surya's predictor `.to(...)` is in-place (returns None), so don't reassign.
-            surya_detector.to("cuda")
-        except Exception:
-            # If moving fails, it'll run on CPU (slower) but keep the server alive.
-            pass
-
-    # Qwen2.5-VL 4-bit
-    bnb_config = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_quant_type="nf4",
-        bnb_4bit_use_double_quant=True,
-        bnb_4bit_compute_dtype=torch.float16,
-    )
-
-    qwen_processor = AutoProcessor.from_pretrained(QWEN_MODEL_ID, trust_remote_code=True)
-    qwen_model = AutoModelForVision2Seq.from_pretrained(
-        QWEN_MODEL_ID,
-        quantization_config=bnb_config,
-        device_map="auto",
-        torch_dtype=torch.float16,
-        trust_remote_code=True,
-    )
-    qwen_model.eval()
-
-    MODELS = Models(
-        surya_detector=surya_detector,
-        qwen_model=qwen_model,
-        qwen_processor=qwen_processor,
-    )
+app.include_router(api_v1_router)
 
 
 @app.get("/health")
@@ -234,11 +67,9 @@ def health() -> dict[str, str]:
 
 @app.post("/extract", response_model=ExtractResponse)
 async def extract(file: UploadFile = File(...)) -> ExtractResponse:
-    if MODELS is None:
+    if ocr_pipeline.MODELS is None:
         raise HTTPException(status_code=503, detail="Models not loaded yet")
 
-    # Some clients (including Python requests) may send uploads as application/octet-stream.
-    # We accept that and rely on Pillow to validate/parse the actual bytes.
     if file.content_type and not (
         file.content_type.startswith("image/") or file.content_type == "application/octet-stream"
     ):
@@ -250,27 +81,24 @@ async def extract(file: UploadFile = File(...)) -> ExtractResponse:
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Could not decode image: {e}") from e
 
-    det_img = preprocess_for_detection(original)
+    full_text, _boxes, boxed = ocr_pipeline.run_ocr_pipeline(original)
+    return ExtractResponse(
+        text=full_text,
+        boxed_image_png_base64=ocr_pipeline.encode_png_base64(boxed),
+    )
 
-    # Surya expects list of PIL images; returns list of TextDetectionResult
-    preds = MODELS.surya_detector([det_img])
-    pred0 = preds[0] if preds else None
-    boxes = _extract_surya_xyxy(pred0)
 
-    # Crop from original (not binarized), keep reading order top-to-bottom.
-    boxes_sorted = sorted(boxes, key=lambda b: (b[1], b[0]))
-    line_crops = crop_lines(original, boxes_sorted)
+# ── Serve built frontend (production) ────────────────────────────────────────
+# Only active when `frontend/dist` exists (i.e. after `npm run build`).
+# In dev, run `npm run dev` separately and use http://localhost:5173.
+if _FRONTEND_DIST.exists():
+    app.mount(
+        "/assets",
+        StaticFiles(directory=str(_FRONTEND_DIST / "assets")),
+        name="frontend-assets",
+    )
 
-    if not line_crops:
-        boxed = draw_boxes(original, boxes_sorted)
-        return ExtractResponse(text="", boxed_image_png_base64=_encode_png_base64(boxed))
-
-    line_texts = qwen_ocr_lines(line_crops)
-
-    # Minimal cleanup: join lines, normalize whitespace.
-    clean_lines = [" ".join(t.split()) for t in line_texts if t and t.strip()]
-    full_text = "\n".join(clean_lines).strip()
-
-    boxed = draw_boxes(original, boxes_sorted)
-    return ExtractResponse(text=full_text, boxed_image_png_base64=_encode_png_base64(boxed))
-
+    @app.get("/{full_path:path}", include_in_schema=False)
+    async def serve_spa(full_path: str) -> FileResponse:
+        """Catch-all: serve index.html for any unmatched path (SPA routing)."""
+        return FileResponse(str(_FRONTEND_DIST / "index.html"))
