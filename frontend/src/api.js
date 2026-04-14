@@ -121,6 +121,12 @@ export const api = {
     originalImageUrl: (id, page = 1) => `${V1}/submissions/${id}/original-image/${page}`,
   },
 
+  // ── Queue (Phase 21) ──────────────────────────────────────────────────────
+  queue: {
+    enqueue: (examId) => req('POST', `${V1}/queue/enqueue/${examId}`),
+    status:  ()       => req('GET',  `${V1}/queue/status`),
+  },
+
   // ── Legacy OCR (Phase 2) ───────────────────────────────────────────────────
   extract: (file) => {
     const fd = new FormData()

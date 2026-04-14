@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useRef, useState, useCallback } from 'react'
 import { api } from '../api'
 import { tw, ErrorBox, Empty } from '../ui'
 
@@ -66,6 +66,10 @@ export default function SubmissionsPage() {
   const [bulkProcessing, setBulkProcessing] = useState(false)
   const [bulkResult, setBulkResult] = useState(null)
 
+  // background queue
+  const [queueStatus, setQueueStatus] = useState(null)
+  const queuePollRef = useRef(null)
+
   useEffect(() => { api.exams.list().then(setExams).catch(() => {}) }, [])
 
   async function selectExam(exam) {
@@ -88,6 +92,14 @@ export default function SubmissionsPage() {
       const result = await api.exams.batchUpload(selectedExam.id, files)
       setBatchResult(result)
       setSubmissions(await api.exams.submissions(selectedExam.id))
+      // Auto-enqueue newly uploaded scans for background processing
+      if (result.ok_count > 0) {
+        try {
+          await api.queue.enqueue(selectedExam.id)
+          setQueueStatus(await api.queue.status())
+          startQueuePolling()
+        } catch {}
+      }
     } catch (err) { setBatchResult({ error: err.message }) }
     setBatching(false)
     e.target.value = ''
@@ -102,6 +114,34 @@ export default function SubmissionsPage() {
       setSubmissions(await api.exams.submissions(selectedExam.id))
     } catch (err) { setBulkResult({ error: err.message }) }
     setBulkProcessing(false)
+  }
+
+  const startQueuePolling = useCallback(() => {
+    if (queuePollRef.current) return   // already polling
+    queuePollRef.current = setInterval(async () => {
+      try {
+        const s = await api.queue.status()
+        setQueueStatus(s)
+        const active = s.pending > 0 || s.current !== null
+        if (!active) {
+          clearInterval(queuePollRef.current)
+          queuePollRef.current = null
+          // Refresh submission list after queue drains
+          if (selectedExam) {
+            try { setSubmissions(await api.exams.submissions(selectedExam.id)) } catch {}
+          }
+        }
+      } catch {}
+    }, 2000)
+  }, [selectedExam])
+
+  async function enqueueAll() {
+    if (!selectedExam) return
+    try {
+      const result = await api.queue.enqueue(selectedExam.id)
+      setQueueStatus(await api.queue.status())
+      if (result.enqueued > 0) startQueuePolling()
+    } catch (err) { alert(`Enqueue failed: ${err.message}`) }
   }
 
   async function deleteSub(sub) {
@@ -354,6 +394,52 @@ export default function SubmissionsPage() {
                   </div>
                 ))}
               </div>
+            )}
+          </div>
+        )}
+        {/* Queue status panel */}
+        {selectedExam && (
+          <div className={`${tw.card} flex flex-col gap-2`}>
+            <div className="flex items-center justify-between">
+              <div className={tw.label}>Processing queue</div>
+              <button className={tw.btnSm} onClick={enqueueAll} title="Add all pending scans to queue">
+                Enqueue all
+              </button>
+            </div>
+            {!queueStatus ? (
+              <p className={tw.muted}>No queue activity yet.</p>
+            ) : (
+              <>
+                {queueStatus.current && (
+                  <div className="flex items-center gap-2 text-xs text-zinc-300">
+                    <span className="inline-block w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
+                    Processing: {queueStatus.current.label}
+                  </div>
+                )}
+                <div className="text-xs text-zinc-400 flex gap-3">
+                  <span>Pending: <span className="text-zinc-200">{queueStatus.pending}</span></span>
+                  <span>Done: <span className="text-emerald-400">{queueStatus.completed}</span></span>
+                  {queueStatus.failed > 0 && (
+                    <span>Failed: <span className="text-red-400">{queueStatus.failed}</span></span>
+                  )}
+                </div>
+                {/* Progress bar */}
+                {queueStatus.total_enqueued > 0 && (
+                  <div className="h-1.5 rounded-full bg-zinc-800 overflow-hidden">
+                    <div
+                      className="h-full rounded-full bg-emerald-500 transition-all"
+                      style={{
+                        width: `${Math.round(
+                          (queueStatus.completed / queueStatus.total_enqueued) * 100
+                        )}%`
+                      }}
+                    />
+                  </div>
+                )}
+                {queueStatus.recent_errors?.slice(-3).map((e, i) => (
+                  <div key={i} className="text-xs text-red-400 truncate">{e}</div>
+                ))}
+              </>
             )}
           </div>
         )}

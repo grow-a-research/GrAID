@@ -26,6 +26,8 @@ from api_schemas import (
     BulkEnrollResult,
     BulkProcessResult,
     ClassAnalytics,
+    QueueEnqueueResult,
+    QueueStatus,
     CourseClassCreate,
     CourseClassRead,
     EnrollmentCreate,
@@ -547,6 +549,7 @@ async def run_submission_ocr(
     """
     import ocr_pipeline
     from ai_grader import correct_ocr_text
+    from job_queue import _laplacian_var as _crop_clarity
     from ocr_alignment import (
         check_scan_quality,
         crop_content_area,
@@ -662,6 +665,7 @@ async def run_submission_ocr(
                     else:
                         # ── OCR path (essay / identification / no bubbles) ────
                         crop = crop_region(warped, region, template_spec)
+                        ocr_clarity_val: float | None = _crop_clarity(crop)
                         ocr_text, boxes, _ = ocr_pipeline.run_ocr_pipeline(crop)
                         # MCQ/TF without bubbles: skip Groq correction (answer is
                         # a single letter/word — correction may mangle it)
@@ -685,6 +689,7 @@ async def run_submission_ocr(
                         existing.boxes_json     = boxes_data
                         existing.status         = ans_status
                         existing.omr_confidence = omr_confidence
+                        existing.ocr_clarity    = ocr_clarity_val if qtype not in ("mcq", "tf") else None
                         existing.updated_at     = now
                         db.commit()
                         db.refresh(existing)
@@ -698,6 +703,7 @@ async def run_submission_ocr(
                             boxes_json=boxes_data,
                             status=ans_status,
                             omr_confidence=omr_confidence,
+                            ocr_clarity=ocr_clarity_val if qtype not in ("mcq", "tf") else None,
                         )
                         db.add(answer)
                         db.commit()
@@ -706,7 +712,8 @@ async def run_submission_ocr(
 
         # ── Fallback: content-area OCR (excludes header + question prompts) ────
         if not aligned:
-            fallback_image = crop_content_area(image, template_spec)
+            fallback_image  = crop_content_area(image, template_spec)
+            fallback_clarity = _crop_clarity(fallback_image)
             ocr_text, boxes, _ = ocr_pipeline.run_ocr_pipeline(fallback_image)
             ocr_text = correct_ocr_text(ocr_text)
             boxes_data = json.dumps(
@@ -722,10 +729,11 @@ async def run_submission_ocr(
                 .first()
             )
             if existing:
-                existing.ocr_text = ocr_text
-                existing.boxes_json = boxes_data
-                existing.status = "done"
-                existing.updated_at = now
+                existing.ocr_text    = ocr_text
+                existing.boxes_json  = boxes_data
+                existing.status      = "done"
+                existing.ocr_clarity = fallback_clarity
+                existing.updated_at  = now
                 db.commit()
                 db.refresh(existing)
                 results.append(existing)
@@ -737,6 +745,7 @@ async def run_submission_ocr(
                     ocr_text=ocr_text,
                     boxes_json=boxes_data,
                     status="done",
+                    ocr_clarity=fallback_clarity,
                 )
                 db.add(answer)
                 db.commit()
@@ -1559,6 +1568,70 @@ def teacher_override(
     db.commit()
     db.refresh(ans)
     return ans
+
+
+# ---------------------------------------------------------------------------
+# Phase 21 — Background processing queue
+# ---------------------------------------------------------------------------
+
+
+@router.post("/queue/enqueue/{exam_id}", response_model=QueueEnqueueResult)
+def enqueue_exam_submissions(
+    exam_id: int,
+    db: Session = Depends(get_db),
+) -> QueueEnqueueResult:
+    """
+    Add all 'submitted' submissions for an exam to the background OCR/grade queue.
+    Submissions already in the queue or already processed are not re-added.
+    """
+    from job_queue import QUEUE_STATE as _qs, enqueue_submission
+
+    exam = db.get(m.Exam, exam_id)
+    if not exam:
+        raise HTTPException(status_code=404, detail="Exam not found")
+
+    subs = (
+        db.query(m.Submission)
+        .filter(m.Submission.exam_id == exam_id, m.Submission.status == "submitted")
+        .all()
+    )
+
+    # Collect submission IDs already sitting in the queue to avoid duplicates
+    pending_ids: set[int] = set()
+    temp: list[dict] = []
+    while not _qs.queue.empty():
+        try:
+            j = _qs.queue.get_nowait()
+            temp.append(j)
+            pending_ids.add(j["submission_id"])
+        except Exception:
+            break
+    for j in temp:          # put them back
+        _qs.queue.put_nowait(j)
+
+    enqueued = 0
+    already  = 0
+    for sub in subs:
+        if sub.id in pending_ids:
+            already += 1
+            continue
+        student = db.get(m.Student, sub.student_id)
+        label   = f"{student.full_name} (#{sub.id})" if student else f"#{sub.id}"
+        enqueue_submission(sub.id, sub.exam_id, label)
+        enqueued += 1
+
+    return QueueEnqueueResult(
+        enqueued=enqueued,
+        already_pending=already,
+        queue_size=_qs.pending(),
+    )
+
+
+@router.get("/queue/status", response_model=QueueStatus)
+def queue_status() -> QueueStatus:
+    """Return the current state of the background processing queue."""
+    from job_queue import get_status
+    return get_status()
 
 
 # ---------------------------------------------------------------------------

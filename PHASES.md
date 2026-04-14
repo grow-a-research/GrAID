@@ -309,3 +309,34 @@ Fixes for known issues discovered during testing.
   "Align paper within frame" label rendered over the camera viewfinder
 - **Template outdated banner**: amber banner in Exams tab when questions exist but
   `template_spec_json` is null (i.e. template was never generated or was cleared by an edit)
+
+---
+
+## Phase 21 — OCR Accuracy & Queue Processing ✅
+**Crop top-padding fix:**
+- `crop_region()` now uses `top_padding_mm=0.5` (was 3 mm) so the printed question
+  prompt immediately above the answer box no longer bleeds into the crop
+
+**Per-crop OCR clarity score:**
+- Laplacian variance computed on each answer crop before OCR → stored as
+  `ocr_clarity FLOAT` on `SubmissionAnswer` (migration `0008`)
+- Shown in Results as a colour-coded bar (green ≥80, amber ≥40, red <40) for
+  essay and identification questions; separate from Groq grading confidence
+
+**Groq OCR correction prompt overhaul:**
+- Step 1: strip leading printed question-prompt lines (Q1., Q2., etc.)
+- Step 2: fix OCR character errors
+- Step 3: reconstruct fragmented paragraphs — merge Surya line-split sentences
+  back into continuous prose before restructuring into essay form
+
+**Background asyncio processing queue (`job_queue.py`):**
+- `asyncio.Queue`-based in-memory queue with a persistent background worker task
+  started via `start_worker()` in FastAPI lifespan
+- `POST /queue/enqueue/{exam_id}` — adds all `submitted` submissions to queue,
+  deduplicates against already-pending jobs
+- `GET /queue/status` — returns pending count, current job label, completed,
+  failed, total enqueued, last 10 errors
+- After batch upload (`POST /exams/{id}/submissions/batch`): frontend
+  automatically calls enqueue + starts 2-second polling
+- Submissions tab: "Processing queue" panel with live progress bar, animated
+  "Processing: …" indicator, and "Enqueue all" button

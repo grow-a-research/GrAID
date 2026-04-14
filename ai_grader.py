@@ -201,25 +201,35 @@ def _parse_response(raw: str, max_points: float) -> tuple[float, str, float]:
 
 _OCR_CORRECTION_SYSTEM = """\
 You are an OCR post-processor for handwritten exam answers.
-Your job has two parts:
+The input is raw text extracted by an OCR model from a scanned answer box.
+It may contain artefacts from imperfect cropping or line detection.
 
-1. FIX transcription errors caused by ambiguous handwriting:
-   - Misread letters (e.g. 'rn' → 'm', '0' vs 'O', '1' vs 'l', 'u' vs 'n')
-   - Garbled or missing special symbols
-   - Run-together words caused by unclear spacing
+Step 1 — STRIP any printed question text:
+  - Remove any leading line that looks like a printed question prompt
+    (e.g. lines starting with "Q1.", "Q2.", "Question", or ending with "?")
+  - The student's answer begins after the question prompt; keep only the answer.
 
-2. RESTRUCTURE the text into proper essay form:
-   - Capitalize the first letter of each sentence
-   - End sentences with appropriate punctuation (. ? !)
-   - Split run-on sentences at natural clause boundaries
-   - Group related sentences into paragraphs (separate with a blank line)
-   - Do NOT merge separate ideas into one sentence
+Step 2 — FIX transcription errors caused by ambiguous handwriting:
+  - Misread letters (e.g. 'rn' → 'm', '0' vs 'O', '1' vs 'l', 'u' vs 'n')
+  - Garbled or missing special symbols
+  - Run-together words caused by unclear spacing
 
-Rules:
+Step 3 — RECONSTRUCT fragmented paragraphs:
+  - OCR line detection may have split one continuous paragraph into many short lines.
+  - Merge lines that are part of the same sentence or thought into one continuous paragraph.
+  - Only preserve a line break when it clearly marks the start of a new idea or paragraph.
+  - Do NOT split sentences that belong together just because they appeared on separate OCR lines.
+
+Step 4 — RESTRUCTURE into proper essay form:
+  - Capitalize the first letter of each sentence
+  - End sentences with appropriate punctuation (. ? !)
+  - Separate distinct paragraphs with a blank line
+
+Rules (non-negotiable):
 - Do NOT add new content, expand ideas, or rephrase meaning
-- Do NOT remove or skip any part of the student's answer
+- Do NOT remove content that belongs to the student's answer
 - Preserve the student's own words and vocabulary
-- Return ONLY the corrected and restructured text, no explanation"""
+- Return ONLY the corrected and restructured answer text — no labels, no explanation"""
 
 
 def correct_ocr_text(raw_text: str) -> str:

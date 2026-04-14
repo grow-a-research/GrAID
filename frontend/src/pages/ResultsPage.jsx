@@ -372,6 +372,33 @@ function AnswerCard({ answer, question, flag, onOverrideSaved, onFlagChange }) {
         </div>
       )}
 
+      {/* OCR clarity (essay / identification — Laplacian variance of crop) */}
+      {answer.ocr_clarity != null && qtype !== 'mcq' && qtype !== 'tf' && (
+        <div className="flex items-center gap-2 mb-3">
+          <span className="text-xs text-zinc-500">OCR clarity</span>
+          <div className="flex-1 max-w-[120px] h-1.5 rounded-full bg-zinc-800">
+            <div
+              className={`h-1.5 rounded-full transition-all ${
+                answer.ocr_clarity >= 80 ? 'bg-emerald-500' :
+                answer.ocr_clarity >= 40 ? 'bg-amber-500'   : 'bg-red-500'
+              }`}
+              style={{ width: `${Math.min(100, Math.round(answer.ocr_clarity / 2))}%` }}
+            />
+          </div>
+          <span className={`text-xs font-mono tabular-nums ${
+            answer.ocr_clarity >= 80 ? 'text-emerald-400' :
+            answer.ocr_clarity >= 40 ? 'text-amber-400'   : 'text-red-400'
+          }`}>
+            {Math.round(answer.ocr_clarity)}
+          </span>
+          {answer.ocr_clarity < 40 && (
+            <span className="text-xs rounded bg-amber-900/50 border border-amber-700 text-amber-300 px-1.5 py-0.5">
+              blurry crop
+            </span>
+          )}
+        </div>
+      )}
+
       {/* OMR confidence (MCQ / TF only) */}
       {answer.omr_confidence != null && (
         <div className="flex items-center gap-2 mb-3">

@@ -278,7 +278,8 @@ def crop_region(
     warped: Image.Image,
     region: dict[str, Any],
     template_spec: dict[str, Any],
-    padding_mm: float = 3.0,
+    padding_mm: float = 2.0,
+    top_padding_mm: float = 0.5,
 ) -> Image.Image:
     """
     Crop a single answer region from a perspective-corrected image,
@@ -286,16 +287,19 @@ def crop_region(
 
     Parameters
     ----------
-    warped        : Output of detect_and_warp() with success=True.
-    region        : Dict with x1_mm, y1_mm, x2_mm, y2_mm (from region_json).
-    template_spec : Full template spec dict (needed for dpi).
-    padding_mm    : Extra margin on every side before cropping.
+    warped          : Output of detect_and_warp() with success=True.
+    region          : Dict with x1_mm, y1_mm, x2_mm, y2_mm (from region_json).
+    template_spec   : Full template spec dict (needed for dpi).
+    padding_mm      : Extra margin on left / right / bottom sides.
+    top_padding_mm  : Extra margin on the top edge only. Kept very small (0.5 mm)
+                      to avoid bleeding into the printed question prompt that sits
+                      immediately above the answer box.
     """
     dpi = float(template_spec.get("dpi", 300))
-    x1  = max(0,             int(_mm_to_px(region["x1_mm"] - padding_mm, dpi)))
-    y1  = max(0,             int(_mm_to_px(region["y1_mm"] - padding_mm, dpi)))
-    x2  = min(warped.width,  int(_mm_to_px(region["x2_mm"] + padding_mm, dpi)))
-    y2  = min(warped.height, int(_mm_to_px(region["y2_mm"] + padding_mm, dpi)))
+    x1  = max(0,             int(_mm_to_px(region["x1_mm"]    - padding_mm,     dpi)))
+    y1  = max(0,             int(_mm_to_px(region["y1_mm"]    - top_padding_mm, dpi)))
+    x2  = min(warped.width,  int(_mm_to_px(region["x2_mm"]    + padding_mm,     dpi)))
+    y2  = min(warped.height, int(_mm_to_px(region["y2_mm"]    + padding_mm,     dpi)))
     raw_crop = warped.crop((x1, y1, x2, y2))
     return preprocess_crop(raw_crop)
 

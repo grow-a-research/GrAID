@@ -13,6 +13,7 @@ from pydantic import BaseModel
 
 import ocr_pipeline
 from database import init_db
+from job_queue import start_worker
 from routers.api_v1 import router as api_v1_router
 
 _FRONTEND_DIST = Path(__file__).parent / "frontend" / "dist"
@@ -44,6 +45,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         except Exception as e:
             print(f"\n[STARTUP ERROR] Model loading failed: {e}\n")
             raise
+
+    await start_worker()
+    print("[Queue] Background OCR/grading queue worker started.")
 
     yield
 

@@ -161,6 +161,9 @@ class SubmissionAnswer(Base):
     omr_confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
     # Phase 16 — Groq grading confidence (0–1). Only populated for essay answers.
     groq_confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # Phase 21 — Laplacian variance of the answer crop (proxy for OCR scan clarity).
+    # Higher = sharper / more legible. None for OMR (MCQ/TF) answers.
+    ocr_clarity: Mapped[float | None] = mapped_column(Float, nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, onupdate=_utcnow)

@@ -176,6 +176,8 @@ class SubmissionAnswerRead(BaseModel):
     omr_confidence: float | None
     # Phase 16 — Groq grading confidence (essay only, None for other types)
     groq_confidence: float | None
+    # Phase 21 — Laplacian variance of the answer crop (OCR scan clarity proxy)
+    ocr_clarity: float | None
     # Computed: teacher_score takes priority over ai_score
     @property
     def final_score(self) -> float | None:
@@ -325,6 +327,28 @@ class BulkProcessResult(BaseModel):
     processed: int
     failed: int
     errors: list[str] = []
+
+
+# --- Phase 21: Queue status ---
+class QueueCurrentJob(BaseModel):
+    submission_id: int
+    label: str
+
+
+class QueueStatus(BaseModel):
+    pending: int
+    current: QueueCurrentJob | None
+    completed: int
+    failed: int
+    total_enqueued: int
+    recent_errors: list[str] = []
+    is_running: bool
+
+
+class QueueEnqueueResult(BaseModel):
+    enqueued: int
+    already_pending: int = 0
+    queue_size: int
 
 
 # --- Phase 10: Batch scan upload ---
