@@ -91,6 +91,7 @@ export const api = {
       import: (examId, file) => upload(`${V1}/exams/${examId}/rubrics/import`, file),
       clear: (examId) => req('DELETE', `${V1}/exams/${examId}/rubrics`),
     },
+    processAll: (examId) => req('POST', `${V1}/exams/${examId}/submissions/process-all`),
   },
 
   // ── Submissions ────────────────────────────────────────────────────────────

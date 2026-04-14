@@ -298,9 +298,14 @@ Fixes for known issues discovered during testing.
 
 ---
 
-## Phase 20 — UX & Workflow Polish (planned)
-- Bulk process all submissions for an exam (one-click OCR + grade)
-- OMR bubble grid clickable in Results for manual correction
-- Camera capture overlay with alignment guide
-- "Template outdated" banner when template_spec_json is null but questions exist
-- Drag-to-reorder questions in Exams tab
+## Phase 20 — UX & Workflow Polish ✅
+- **Bulk process**: `POST /exams/{id}/submissions/process-all` — runs OCR + AI grading
+  for every `submitted` submission sequentially; reports processed/failed counts + per-submission errors;
+  frontend shows "Process all pending (N)" card when pending submissions exist
+- **OMR bubble grid clickable**: in Results `AnswerCard` for MCQ/TF, a row of circular bubble
+  buttons lets the teacher click any option → auto-saves a teacher override with computed score
+  (full if matches correct_answer, 0 otherwise) + note "Manual bubble override: X"
+- **Camera alignment guide**: A4-ratio frame overlay (210:297) with corner brackets and
+  "Align paper within frame" label rendered over the camera viewfinder
+- **Template outdated banner**: amber banner in Exams tab when questions exist but
+  `template_spec_json` is null (i.e. template was never generated or was cleared by an edit)

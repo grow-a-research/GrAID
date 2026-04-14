@@ -62,6 +62,10 @@ export default function SubmissionsPage() {
   const [batching, setBatching] = useState(false)
   const [batchResult, setBatchResult] = useState(null)
 
+  // bulk process all pending
+  const [bulkProcessing, setBulkProcessing] = useState(false)
+  const [bulkResult, setBulkResult] = useState(null)
+
   useEffect(() => { api.exams.list().then(setExams).catch(() => {}) }, [])
 
   async function selectExam(exam) {
@@ -87,6 +91,17 @@ export default function SubmissionsPage() {
     } catch (err) { setBatchResult({ error: err.message }) }
     setBatching(false)
     e.target.value = ''
+  }
+
+  async function bulkProcessAll() {
+    if (!selectedExam) return
+    setBulkProcessing(true); setBulkResult(null)
+    try {
+      const result = await api.exams.processAll(selectedExam.id)
+      setBulkResult(result)
+      setSubmissions(await api.exams.submissions(selectedExam.id))
+    } catch (err) { setBulkResult({ error: err.message }) }
+    setBulkProcessing(false)
   }
 
   async function deleteSub(sub) {
@@ -273,6 +288,41 @@ export default function SubmissionsPage() {
           </div>
         )}
 
+        {/* Bulk process all pending */}
+        {selectedExam && (() => {
+          const pendingCount = submissions.filter(s => s.status === 'submitted').length
+          return pendingCount > 0 ? (
+            <div className={`${tw.card} flex flex-col gap-2`}>
+              <div className={tw.label}>Bulk process</div>
+              <p className={tw.muted}>
+                {pendingCount} submission{pendingCount !== 1 ? 's' : ''} with uploaded scans waiting to be processed.
+              </p>
+              <button
+                className={tw.btnPrimary}
+                onClick={bulkProcessAll}
+                disabled={bulkProcessing}>
+                {bulkProcessing ? 'Processing…' : `Process all pending (${pendingCount})`}
+              </button>
+              {bulkResult?.error && (
+                <div className="text-xs text-red-400">{bulkResult.error}</div>
+              )}
+              {bulkResult && !bulkResult.error && (
+                <div className="flex flex-col gap-1 mt-1">
+                  <div className="text-xs text-zinc-400">
+                    <span className="text-emerald-400">{bulkResult.processed} processed</span>
+                    {bulkResult.failed > 0 && (
+                      <span className="text-red-400 ml-2">{bulkResult.failed} failed</span>
+                    )}
+                  </div>
+                  {bulkResult.errors?.map((e, i) => (
+                    <div key={i} className="text-xs text-red-400">{e}</div>
+                  ))}
+                </div>
+              )}
+            </div>
+          ) : null
+        })()}
+
         {/* Batch upload */}
         {selectedExam && (
           <div className={`${tw.card} flex flex-col gap-2`}>
@@ -337,8 +387,24 @@ export default function SubmissionsPage() {
                   {/* Camera viewfinder */}
                   {camOpen && (
                     <div className="mt-2 flex flex-col gap-2">
-                      <video ref={videoRef} autoPlay playsInline
-                        className="w-full rounded-lg border border-zinc-700 bg-zinc-950" />
+                      {/* Video with A4 alignment overlay */}
+                      <div className="relative w-full rounded-lg overflow-hidden border border-zinc-700 bg-zinc-950">
+                        <video ref={videoRef} autoPlay playsInline className="w-full block" />
+                        {/* A4 alignment guide (210:297 aspect ratio) */}
+                        <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+                          <div className="relative border border-white/50"
+                            style={{ aspectRatio: '210/297', height: '82%' }}>
+                            {/* Corner brackets */}
+                            <span className="absolute top-0 left-0 w-5 h-5 border-t-2 border-l-2 border-white" />
+                            <span className="absolute top-0 right-0 w-5 h-5 border-t-2 border-r-2 border-white" />
+                            <span className="absolute bottom-0 left-0 w-5 h-5 border-b-2 border-l-2 border-white" />
+                            <span className="absolute bottom-0 right-0 w-5 h-5 border-b-2 border-r-2 border-white" />
+                            <span className="absolute inset-x-0 top-2 text-center text-xs text-white/60 select-none">
+                              Align paper within frame
+                            </span>
+                          </div>
+                        </div>
+                      </div>
                       <div className="flex gap-2">
                         <button className={tw.btnPrimary} type="button" onClick={capturePhoto}>
                           Capture

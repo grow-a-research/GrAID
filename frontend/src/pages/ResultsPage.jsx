@@ -279,6 +279,30 @@ function AnswerCard({ answer, question, flag, onOverrideSaved, onFlagChange }) {
     setSaving(false)
   }
 
+  async function autoOverride(selectedLabel) {
+    // Compute correct score based on selected bubble, then auto-save
+    const correct = question?.correct_answer ?? ''
+    const isMatch = selectedLabel.trim().toUpperCase() === correct.trim().toUpperCase()
+    const score   = isMatch ? maxPts : 0.0
+    setSaving(true); setSaveErr(''); setSaved(false)
+    try {
+      const updated = await api.submissions.override(
+        answer.submission_id, answer.id,
+        {
+          teacher_score: score,
+          teacher_note:  `Manual bubble override: ${selectedLabel}`,
+          reference_text: null,
+        }
+      )
+      onOverrideSaved(updated)
+      setScoreInput(String(score))
+      setNoteInput(`Manual bubble override: ${selectedLabel}`)
+      setSaved(true)
+      setTimeout(() => setSaved(false), 2000)
+    } catch (err) { setSaveErr(err.message) }
+    setSaving(false)
+  }
+
   function clearOverride(e) {
     e.preventDefault()
     setScoreInput('')
@@ -453,6 +477,43 @@ function AnswerCard({ answer, question, flag, onOverrideSaved, onFlagChange }) {
               </div>
             )
           })}
+        </div>
+      )}
+
+      {/* Clickable bubble grid for manual OMR correction (MCQ / TF) */}
+      {(qtype === 'mcq' || qtype === 'tf') && question && (
+        <div className="mb-3">
+          <div className={`${tw.label} mb-1`}>Manual bubble correction</div>
+          <div className="flex gap-2 flex-wrap">
+            {(qtype === 'tf'
+              ? ['True', 'False']
+              : mcqChoices.map((_, i) => String.fromCharCode(65 + i))
+            ).map(opt => {
+              const correct   = question.correct_answer ?? ''
+              const isCorrect = opt.toUpperCase() === correct.toUpperCase()
+              const isCurrent = answer.ocr_text?.trim().charAt(0).toUpperCase() === opt.toUpperCase()
+              return (
+                <button
+                  key={opt}
+                  type="button"
+                  disabled={saving}
+                  onClick={() => autoOverride(opt)}
+                  title={`Override answer to ${opt}`}
+                  className={[
+                    'rounded-full px-2 h-9 text-xs font-semibold border transition min-w-[2.25rem]',
+                    isCorrect
+                      ? 'border-emerald-600 bg-emerald-950/40 text-emerald-300 hover:bg-emerald-900/50'
+                      : 'border-zinc-700 text-zinc-400 hover:border-zinc-500 hover:text-zinc-200',
+                    isCurrent ? 'ring-1 ring-violet-500' : '',
+                  ].join(' ')}>
+                  {qtype === 'tf' ? opt : opt}
+                </button>
+              )
+            })}
+          </div>
+          <div className="mt-1 text-xs text-zinc-600">
+            Click a bubble to immediately save a teacher override with the computed score.
+          </div>
         </div>
       )}
 

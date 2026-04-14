@@ -341,6 +341,11 @@ export default function ExamsPage() {
                 Template generated — answer regions stored for Phase 5 OCR alignment.
               </div>
             )}
+            {!templateReady && questions.length > 0 && (
+              <div className="rounded-lg border border-amber-900/40 bg-amber-950/20 px-3 py-2 text-xs text-amber-300">
+                Template outdated — questions were added, edited, or deleted. Re-generate the PDF template before printing or scanning.
+              </div>
+            )}
 
             {/* Questions */}
             <div className="flex items-center justify-between gap-2 flex-wrap">

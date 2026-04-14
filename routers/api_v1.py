@@ -24,6 +24,7 @@ from api_schemas import (
     BatchFileResult,
     BatchUploadResult,
     BulkEnrollResult,
+    BulkProcessResult,
     ClassAnalytics,
     CourseClassCreate,
     CourseClassRead,
@@ -1239,6 +1240,277 @@ def grade_submission(
         .order_by(m.SubmissionAnswer.page_number)
         .all()
     )
+
+
+@router.post("/exams/{exam_id}/submissions/process-all", response_model=BulkProcessResult)
+async def bulk_process_submissions(
+    exam_id: int,
+    db: Session = Depends(get_db),
+) -> BulkProcessResult:
+    """
+    Phase 20: Run OCR + AI grading for every 'submitted' submission in an exam.
+
+    Processes submissions sequentially; errors on individual submissions are
+    captured per-entry and do not abort the whole batch.
+    Uses default fuzzy thresholds (full=0.85, partial=0.60) for Identification.
+    """
+    import difflib
+
+    import ocr_pipeline
+    from ai_grader import GradeResult, correct_ocr_text, grade_answer
+    from ocr_alignment import crop_content_area, crop_region, detect_and_warp
+    from omr_engine import LOW_CONFIDENCE_THRESHOLD, detect_omr
+
+    exam = db.get(m.Exam, exam_id)
+    if not exam:
+        raise HTTPException(status_code=404, detail="Exam not found")
+
+    template_spec = json.loads(exam.template_spec_json) if exam.template_spec_json else None
+    questions: list[m.ExamQuestion] = []
+    if template_spec:
+        questions = (
+            db.query(m.ExamQuestion)
+            .filter(m.ExamQuestion.exam_id == exam_id)
+            .order_by(m.ExamQuestion.order_index)
+            .all()
+        )
+
+    has_non_omr = (not template_spec) or any(
+        (q.question_type or "essay") not in ("mcq", "tf") for q in questions
+    )
+    if has_non_omr and ocr_pipeline.MODELS is None:
+        raise HTTPException(status_code=503, detail="Models not loaded yet")
+
+    subs = (
+        db.query(m.Submission)
+        .filter(m.Submission.exam_id == exam_id, m.Submission.status == "submitted")
+        .all()
+    )
+
+    project_root = Path(__file__).resolve().parent.parent
+    processed = 0
+    failed    = 0
+    errors: list[str] = []
+
+    for sub in subs:
+        files = (
+            db.query(m.SubmissionFile)
+            .filter(m.SubmissionFile.submission_id == sub.id)
+            .order_by(m.SubmissionFile.page_number)
+            .all()
+        )
+        if not files:
+            failed += 1
+            errors.append(f"Submission {sub.id} ({sub.student_id}): no files uploaded")
+            continue
+
+        try:
+            dest_dir = DATA_ROOT / str(sub.id)
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            now = datetime.now(timezone.utc)
+
+            # ── OCR ──────────────────────────────────────────────────────────
+            for sf in files:
+                img_path = project_root / sf.stored_path
+                image    = Image.open(img_path).convert("RGB")
+                aligned  = False
+
+                if template_spec:
+                    warped, aligned = detect_and_warp(image, template_spec)
+                    if aligned:
+                        try:
+                            (dest_dir / f"aligned_p{sf.page_number}.png").write_bytes(
+                                _pil_to_png_bytes(warped)
+                            )
+                        except Exception:
+                            pass
+
+                        for q in questions:
+                            if not q.region_json:
+                                continue
+                            region = json.loads(q.region_json)
+                            qtype  = (q.question_type or "essay")
+                            omr_confidence: float | None = None
+
+                            if qtype in ("mcq", "tf") and region.get("bubbles"):
+                                label, conf, _ = detect_omr(warped, region, template_spec)
+                                ocr_text   = label or ""
+                                boxes_data = "[]"
+                                omr_confidence = conf if label else None
+                                ans_status = (
+                                    "needs_review"
+                                    if not ocr_text or (
+                                        omr_confidence is not None
+                                        and omr_confidence < LOW_CONFIDENCE_THRESHOLD
+                                    )
+                                    else "done"
+                                )
+                            else:
+                                crop     = crop_region(warped, region, template_spec)
+                                ocr_text, boxes, _ = ocr_pipeline.run_ocr_pipeline(crop)
+                                if qtype not in ("mcq", "tf"):
+                                    ocr_text = correct_ocr_text(ocr_text)
+                                boxes_data = json.dumps(
+                                    [{"x1": b[0], "y1": b[1], "x2": b[2], "y2": b[3]}
+                                     for b in boxes]
+                                )
+                                ans_status = "done"
+
+                            existing = (
+                                db.query(m.SubmissionAnswer)
+                                .filter(
+                                    m.SubmissionAnswer.submission_id == sub.id,
+                                    m.SubmissionAnswer.question_id  == q.id,
+                                )
+                                .first()
+                            )
+                            if existing:
+                                existing.ocr_text       = ocr_text
+                                existing.boxes_json     = boxes_data
+                                existing.status         = ans_status
+                                existing.omr_confidence = omr_confidence
+                                existing.updated_at     = now
+                            else:
+                                db.add(m.SubmissionAnswer(
+                                    submission_id=sub.id,
+                                    question_id=q.id,
+                                    page_number=sf.page_number,
+                                    ocr_text=ocr_text,
+                                    boxes_json=boxes_data,
+                                    status=ans_status,
+                                    omr_confidence=omr_confidence,
+                                ))
+                            db.commit()
+
+                if not aligned:
+                    fallback = crop_content_area(image, template_spec)
+                    ocr_text, boxes, _ = ocr_pipeline.run_ocr_pipeline(fallback)
+                    ocr_text   = correct_ocr_text(ocr_text)
+                    boxes_data = json.dumps(
+                        [{"x1": b[0], "y1": b[1], "x2": b[2], "y2": b[3]} for b in boxes]
+                    )
+                    existing = (
+                        db.query(m.SubmissionAnswer)
+                        .filter(
+                            m.SubmissionAnswer.submission_id == sub.id,
+                            m.SubmissionAnswer.page_number  == sf.page_number,
+                            m.SubmissionAnswer.question_id.is_(None),
+                        )
+                        .first()
+                    )
+                    if existing:
+                        existing.ocr_text   = ocr_text
+                        existing.boxes_json = boxes_data
+                        existing.status     = "done"
+                        existing.updated_at = now
+                    else:
+                        db.add(m.SubmissionAnswer(
+                            submission_id=sub.id,
+                            question_id=None,
+                            page_number=sf.page_number,
+                            ocr_text=ocr_text,
+                            boxes_json=boxes_data,
+                            status="done",
+                        ))
+                    db.commit()
+
+            sub.status = "ocr_done"
+            db.commit()
+
+            # ── Grade ─────────────────────────────────────────────────────────
+            answers = (
+                db.query(m.SubmissionAnswer)
+                .filter(m.SubmissionAnswer.submission_id == sub.id)
+                .all()
+            )
+            for ans in answers:
+                if not ans.ocr_text:
+                    continue
+                question = db.get(m.ExamQuestion, ans.question_id) if ans.question_id else None
+                qtype    = (question.question_type if question else "essay") or "essay"
+
+                if qtype == "essay":
+                    result: GradeResult = grade_answer(
+                        question_prompt=question.prompt      if question else "General answer",
+                        rubric=         question.rubric_text if question else "Grade for content and clarity.",
+                        max_points=     question.max_points  if question else 10.0,
+                        ocr_text=       ans.ocr_text,
+                    )
+                    ans.ai_score        = result.score
+                    ans.ai_feedback     = result.feedback
+                    ans.groq_confidence = result.confidence
+                    ans.status          = "graded"
+                    if result.score == 0.0:
+                        _auto_flag(ans, "essay_score_zero", db)
+                    elif result.confidence < 0.4:
+                        _auto_flag(ans, "essay_low_confidence", db)
+
+                elif qtype in ("mcq", "tf"):
+                    correct     = (question.correct_answer or "").strip().upper()
+                    given       = ans.ocr_text.strip().upper()
+                    given_first = given.split()[0] if given else ""
+                    match       = (given_first == correct) or (given == correct)
+                    max_pts     = question.max_points if question else 1.0
+                    ans.ai_score    = max_pts if match else 0.0
+                    ans.ai_feedback = (
+                        f"Correct answer: {question.correct_answer}. "
+                        f"Detected: {ans.ocr_text.strip() or '(none)'}. "
+                        + ("Correct." if match else "Incorrect.")
+                    )
+                    if ans.omr_confidence is not None and ans.omr_confidence < 0.30:
+                        ans.ai_feedback += f" ⚠ Low OMR confidence ({ans.omr_confidence:.0%})."
+                        ans.status = "needs_review"
+                        _auto_flag(ans, "omr_low_confidence", db)
+                    elif not ans.ocr_text.strip():
+                        ans.status = "needs_review"
+                        _auto_flag(ans, "omr_no_detection", db)
+                    else:
+                        ans.status = "graded"
+
+                elif qtype == "identification":
+                    correct = (question.correct_answer or "").strip()
+                    given   = ans.ocr_text.strip()
+                    max_pts = question.max_points if question else 1.0
+                    if correct.lower() == given.lower():
+                        score   = max_pts
+                        verdict = "Exact match."
+                    else:
+                        ratio = difflib.SequenceMatcher(None, correct.lower(), given.lower()).ratio()
+                        if ratio >= 0.85:
+                            score   = max_pts
+                            verdict = f"Accepted (fuzzy {ratio:.0%})."
+                        elif ratio >= 0.60:
+                            score   = max_pts * 0.5
+                            verdict = f"Partial credit (fuzzy {ratio:.0%})."
+                        else:
+                            score   = 0.0
+                            verdict = f"Incorrect (fuzzy {ratio:.0%})."
+                    ans.ai_score    = score
+                    ans.ai_feedback = f"Expected: {correct}. Your answer: {given}. {verdict}"
+                    ans.status      = "graded"
+                    if score == 0.0:
+                        _auto_flag(ans, "identification_no_match", db)
+
+                ans.updated_at = now
+
+            sub.status = "graded"
+            db.commit()
+            processed += 1
+
+        except Exception as exc:
+            logger.error("Bulk process: submission %d failed: %s", sub.id, exc)
+            failed += 1
+            errors.append(f"Submission {sub.id}: {exc}")
+
+    return BulkProcessResult(processed=processed, failed=failed, errors=errors)
+
+
+def _pil_to_png_bytes(img: Image.Image) -> bytes:
+    """Helper to encode a PIL image as PNG bytes in memory."""
+    import io as _io
+    buf = _io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
 
 
 @router.patch(

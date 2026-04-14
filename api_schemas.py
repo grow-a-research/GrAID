@@ -320,6 +320,13 @@ class OcrResult(BaseModel):
     quality_warnings: list[str] = []
 
 
+# --- Phase 20: Bulk process result ---
+class BulkProcessResult(BaseModel):
+    processed: int
+    failed: int
+    errors: list[str] = []
+
+
 # --- Phase 10: Batch scan upload ---
 class BatchFileResult(BaseModel):
     filename: str
