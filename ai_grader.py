@@ -231,6 +231,47 @@ Rules (non-negotiable):
 - Preserve the student's own words and vocabulary
 - Return ONLY the corrected and restructured answer text — no labels, no explanation"""
 
+_ID_CORRECTION_SYSTEM = """\
+You are an OCR post-processor for short handwritten identification answers.
+The input is raw text extracted by an OCR model from a small answer box.
+The student's answer is typically 1–5 words.
+
+Fix ONLY character-level OCR errors caused by ambiguous handwriting:
+- Misread letters (e.g. 'rn' → 'm', '0' vs 'O', '1' vs 'l', 'u' vs 'n')
+- Extra or missing characters from noisy strokes
+- Run-together or split words caused by unclear spacing
+
+Rules (non-negotiable):
+- Do NOT reconstruct paragraphs or add punctuation beyond what is handwritten
+- Do NOT rephrase, expand, or interpret the answer
+- Do NOT remove words that appear to be part of the answer
+- Return ONLY the corrected short answer text — no labels, no explanation
+- If the input looks completely garbled and unrecoverable, return it unchanged"""
+
+
+def correct_id_text(raw_text: str) -> str:
+    """
+    Groq OCR post-processing for short identification answers.
+    Uses a simpler character-fix-only prompt — no paragraph reconstruction or essay formatting.
+    Falls back silently to raw_text on any error.
+    """
+    if not raw_text or not raw_text.strip():
+        return raw_text
+    try:
+        corrected = _groq_call_with_retry(
+            messages=[
+                {"role": "system", "content": _ID_CORRECTION_SYSTEM},
+                {"role": "user",   "content": f"Correct this short answer OCR text:\n\n{raw_text}"},
+            ],
+            temperature=0.1,
+            max_tokens=100,
+        )
+        logger.info("ID OCR correction: %d → %d chars", len(raw_text), len(corrected))
+        return corrected
+    except Exception as e:
+        logger.warning("ID OCR correction skipped (using raw text): %s", e)
+        return raw_text
+
 
 def correct_ocr_text(raw_text: str) -> str:
     """

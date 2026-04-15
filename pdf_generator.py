@@ -79,7 +79,7 @@ Q_LABEL_W: float     = 12.0   # mm reserved for "Q10." label
 OBJ_ROW_H: float     = 8.5    # mm total height per objective question row
 OBJ_GAP: float       = 1.5    # mm gap between objective rows
 
-ID_BOX_H: float      = 7.0    # mm height of identification answer box
+ID_BOX_H: float      = 14.0   # mm height of identification answer box (taller = more pixels for Qwen)
 ESSAY_GAP: float     = 3.0    # mm gap between essay questions
 
 TWO_COL_THRESHOLD: int = 10   # use two columns when # objective Qs > this

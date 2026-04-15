@@ -548,7 +548,7 @@ async def run_submission_ocr(
     Updates submission.status → 'ocr_done' when complete.
     """
     import ocr_pipeline
-    from ai_grader import correct_ocr_text
+    from ai_grader import correct_id_text, correct_ocr_text
     from job_queue import _laplacian_var as _crop_clarity
     from ocr_alignment import (
         check_scan_quality,
@@ -669,8 +669,10 @@ async def run_submission_ocr(
                         ocr_text, boxes, _ = ocr_pipeline.run_ocr_pipeline(crop)
                         # MCQ/TF without bubbles: skip Groq correction (answer is
                         # a single letter/word — correction may mangle it)
-                        if qtype not in ("mcq", "tf"):
+                        if qtype == "essay":
                             ocr_text = correct_ocr_text(ocr_text)
+                        elif qtype == "identification":
+                            ocr_text = correct_id_text(ocr_text)
                         boxes_data = json.dumps(
                             [{"x1": b[0], "y1": b[1], "x2": b[2], "y2": b[3]} for b in boxes]
                         )
@@ -1266,7 +1268,7 @@ async def bulk_process_submissions(
     import difflib
 
     import ocr_pipeline
-    from ai_grader import GradeResult, correct_ocr_text, grade_answer
+    from ai_grader import GradeResult, correct_id_text, correct_ocr_text, grade_answer
     from ocr_alignment import crop_content_area, crop_region, detect_and_warp
     from omr_engine import LOW_CONFIDENCE_THRESHOLD, detect_omr
 
@@ -1357,8 +1359,10 @@ async def bulk_process_submissions(
                             else:
                                 crop     = crop_region(warped, region, template_spec)
                                 ocr_text, boxes, _ = ocr_pipeline.run_ocr_pipeline(crop)
-                                if qtype not in ("mcq", "tf"):
+                                if qtype == "essay":
                                     ocr_text = correct_ocr_text(ocr_text)
+                                elif qtype == "identification":
+                                    ocr_text = correct_id_text(ocr_text)
                                 boxes_data = json.dumps(
                                     [{"x1": b[0], "y1": b[1], "x2": b[2], "y2": b[3]}
                                      for b in boxes]
