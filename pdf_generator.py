@@ -297,11 +297,12 @@ def _render_essay(
     pdf: FPDF, q: QuestionInput,
     margin: float, y: float, width: float, essay_h: float,
 ) -> dict:
-    """Draw a question-number label + ruled answer box. No prompt text printed."""
+    """Draw a question-number label ABOVE the ruled answer box. No prompt text printed."""
+    label_h = 5.0
     pdf.set_font("helvetica", "B", 10)
     pdf.set_xy(margin, y)
-    pdf.cell(width, 5, f"Q{q.order_index}.", align="L")
-    box_y = pdf.get_y() + 1.0
+    pdf.cell(width, label_h, f"Q{q.order_index}.", align="L")
+    box_y = y + label_h + 1.0   # label sits fully above the box, 1 mm gap
 
     # Outer border
     pdf.set_draw_color(80, 80, 80)
