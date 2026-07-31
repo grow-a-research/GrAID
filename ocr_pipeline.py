@@ -15,6 +15,7 @@ from typing import Any, Optional
 
 import cv2
 import numpy as np
+import requests
 import torch
 from PIL import Image, ImageDraw
 from qwen_vl_utils import process_vision_info
@@ -27,6 +28,11 @@ from surya.detection import DetectionPredictor
 
 
 QWEN_MODEL_ID = os.getenv("QWEN_MODEL_ID", "Qwen/Qwen2.5-VL-7B-Instruct")
+
+# When set (e.g. to an ngrok URL pointing at a Colab notebook running
+# colab_ocr_server.ipynb), OCR is delegated to that remote server instead of
+# loading Surya/Qwen locally. Use this when the local GPU lacks enough VRAM.
+REMOTE_OCR_URL = os.getenv("REMOTE_OCR_URL", "").rstrip("/")
 
 
 @dataclass
@@ -46,6 +52,17 @@ MODELS: Optional[Models] = None
 def load_models() -> None:
     global MODELS
     if MODELS is not None:
+        return
+
+    if REMOTE_OCR_URL:
+        print(f"[Models] REMOTE_OCR_URL set — delegating OCR to {REMOTE_OCR_URL}")
+        try:
+            r = requests.get(f"{REMOTE_OCR_URL}/health", timeout=10)
+            r.raise_for_status()
+            print("[Models] Remote OCR server reachable.")
+        except Exception as e:
+            print(f"[Models] WARNING: could not reach remote OCR server yet: {e}")
+        MODELS = Models(surya_detector=None, qwen_model=None, qwen_processor=None)
         return
 
     print("[Models] Checking CUDA...")
@@ -218,6 +235,9 @@ def run_ocr_pipeline(
     """
     assert MODELS is not None
 
+    if REMOTE_OCR_URL:
+        return _run_remote_ocr_pipeline(original)
+
     det_img = preprocess_for_detection(original)
     preds = MODELS.surya_detector([det_img])
     pred0 = preds[0] if preds else None
@@ -235,3 +255,27 @@ def run_ocr_pipeline(
     full_text = "\n".join(clean_lines).strip()
 
     return full_text, boxes_sorted, boxed
+
+
+def _run_remote_ocr_pipeline(
+    original: Image.Image,
+) -> tuple[str, list[tuple[int, int, int, int]], Image.Image]:
+    """Send the image to the remote Colab OCR server and adapt its response
+    to the same (full_text, boxes, boxed_image) shape as the local pipeline."""
+    buf = io.BytesIO()
+    original.convert("RGB").save(buf, format="PNG")
+    buf.seek(0)
+
+    resp = requests.post(
+        f"{REMOTE_OCR_URL}/ocr",
+        files={"file": ("image.png", buf, "image/png")},
+        timeout=180,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+
+    boxes = [tuple(b) for b in data.get("boxes", [])]
+    boxed_bytes = base64.b64decode(data["boxed_image_png_base64"])
+    boxed = Image.open(io.BytesIO(boxed_bytes)).convert("RGB")
+
+    return data.get("text", ""), boxes, boxed
