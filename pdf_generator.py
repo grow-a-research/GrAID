@@ -488,3 +488,84 @@ def generate_exam_paper(
     }
 
     return bytes(pdf.output()), template_spec
+
+
+# ── Questionnaire — separate reading document (Phase 23) ─────────────────────
+
+_TYPE_HINT: dict[str, str] = {
+    "mcq":            "Multiple Choice",
+    "tf":             "True or False",
+    "identification": "Identification",
+    "essay":          "Essay",
+}
+
+
+def generate_questionnaire(
+    exam_title: str,
+    exam_code: str,
+    class_code: str,
+    questions: list[QuestionInput],
+) -> bytes:
+    """
+    Render a plain, multi-page reading document listing each question's full
+    prompt (and MCQ choice text). No ArUco markers, QR code, or answer boxes —
+    this document is never scanned back; students read it while writing on
+    the separate answer-sheet template.
+    """
+    pdf = FPDF(orientation="P", unit="mm", format="A4")
+    pdf.set_margins(left=MARGIN, top=MARGIN, right=MARGIN)
+    pdf.set_auto_page_break(auto=True, margin=MARGIN)
+    pdf.add_page()
+
+    width = PAGE_W - 2.0 * MARGIN
+
+    pdf.set_font("helvetica", "B", 16)
+    pdf.set_xy(MARGIN, pdf.get_y())
+    pdf.multi_cell(width, 8, _safe(exam_title[:80]), align="C")
+
+    pdf.set_font("helvetica", "", 10)
+    pdf.set_xy(MARGIN, pdf.get_y())
+    pdf.multi_cell(width, 6, _safe(f"Class: {class_code}    Exam: {exam_code}"), align="C")
+
+    pdf.set_font("helvetica", "I", 9)
+    pdf.set_xy(MARGIN, pdf.get_y() + 2)
+    pdf.multi_cell(
+        width, 5,
+        "Read each question below and write your answers on the separate answer sheet. "
+        "Do not write on this questionnaire.",
+        align="C",
+    )
+
+    y = pdf.get_y() + 4
+    pdf.set_draw_color(0, 0, 0)
+    pdf.set_line_width(0.4)
+    pdf.line(MARGIN, y, PAGE_W - MARGIN, y)
+    pdf.set_xy(MARGIN, y + 6)
+
+    for q in sorted(questions, key=lambda x: x.order_index):
+        qtype = (q.question_type or "essay").strip()
+
+        pdf.set_font("helvetica", "B", 11)
+        pdf.set_x(MARGIN)
+        pdf.multi_cell(width, 6, _safe(f"Q{q.order_index}. {q.prompt}"), align="L")
+
+        pdf.set_font("helvetica", "I", 8)
+        pdf.set_x(MARGIN)
+        pdf.multi_cell(width, 4, f"({_TYPE_HINT.get(qtype, 'Essay')})", align="L")
+
+        if qtype == "mcq":
+            choices: list[str] = []
+            if q.choices_json:
+                try:
+                    choices = json.loads(q.choices_json)
+                except Exception:
+                    choices = []
+            pdf.set_font("helvetica", "", 10)
+            for i, choice in enumerate(choices):
+                letter = chr(65 + i)
+                pdf.set_x(MARGIN + 6)
+                pdf.multi_cell(width - 6, 5.5, _safe(f"{letter}. {choice}"), align="L")
+
+        pdf.set_xy(MARGIN, pdf.get_y() + 4)
+
+    return bytes(pdf.output())

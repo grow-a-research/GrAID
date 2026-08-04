@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, useCallback } from 'react'
 import { api } from '../api'
 import { tw, ErrorBox, Empty } from '../ui'
+import { useWorkflow } from '../context/WorkflowContext'
 
 const STATUS_STEPS = ['draft', 'submitted', 'ocr_done', 'graded']
 
@@ -25,10 +26,12 @@ function StatusBar({ status }) {
 }
 
 export default function SubmissionsPage() {
+  const {
+    selectedExam, selectExam: pickExam,
+    selectedSubmission: selectedSub, selectSubmission: pickSub, updateSelectedSubmission: setSelectedSub,
+  } = useWorkflow()
   const [exams, setExams] = useState([])
-  const [selectedExam, setSelectedExam] = useState(null)
   const [submissions, setSubmissions] = useState([])
-  const [selectedSub, setSelectedSub] = useState(null)
 
   // create
   const [newExamId, setNewExamId] = useState('')
@@ -61,6 +64,7 @@ export default function SubmissionsPage() {
   const batchRef = useRef(null)
   const [batching, setBatching] = useState(false)
   const [batchResult, setBatchResult] = useState(null)
+  const [batchToolsOpen, setBatchToolsOpen] = useState(false)
 
   // bulk process all pending
   const [bulkProcessing, setBulkProcessing] = useState(false)
@@ -72,16 +76,29 @@ export default function SubmissionsPage() {
 
   useEffect(() => { api.exams.list().then(setExams).catch(() => {}) }, [])
 
-  async function selectExam(exam) {
-    setSelectedExam(exam)
-    setSelectedSub(null)
-    try { setSubmissions(await api.exams.submissions(exam.id)) } catch { setSubmissions([]) }
-  }
+  // Loads the submission list whenever the shared selected exam changes — covers both
+  // an explicit pick here and arriving with an exam already selected from Exams/Results.
+  useEffect(() => {
+    if (!selectedExam) { setSubmissions([]); return }
+    api.exams.submissions(selectedExam.id).then(setSubmissions).catch(() => setSubmissions([]))
+  }, [selectedExam?.id])
 
-  async function selectSub(sub) {
+  // Loads full submission detail (files, etc.) whenever the shared selected submission
+  // changes — the row objects in the list above are lighter-weight than the full record.
+  useEffect(() => {
     setUploadErr(''); setProcessErr('')
-    const full = await api.submissions.get(sub.id)
-    setSelectedSub(full)
+    if (!selectedSub) return
+    api.submissions.get(selectedSub.id).then(mergeFullSubmission).catch(() => {})
+  }, [selectedSub?.id])
+
+  // GET /submissions/{id} returns the raw record (numeric student_id, no student_name) —
+  // preserve the denormalized display fields from the list row instead of clobbering them.
+  function mergeFullSubmission(full) {
+    setSelectedSub(prev => ({
+      ...full,
+      student_id: prev?.student_id ?? full.student_id,
+      student_name: prev?.student_name ?? full.student_name,
+    }))
   }
 
   async function batchUpload(e) {
@@ -163,13 +180,14 @@ export default function SubmissionsPage() {
         student_id: newStudentId.trim(),
       })
       const ex = exams.find(x => x.id === parseInt(newExamId))
-      if (ex && selectedExam?.id === ex.id) {
-        setSubmissions(await api.exams.submissions(ex.id))
-      }
+      // Refetch via the list endpoint (not GET /submissions/{id}) so the row carries the
+      // denormalized student_name/student_id the UI displays, not just the raw FK id.
+      const subList = ex ? await api.exams.submissions(ex.id) : []
+      if (ex) setSubmissions(subList)
       setNewStudentId('')
-      const full = await api.submissions.get(sub.id)
-      setSelectedSub(full)
-      if (ex) setSelectedExam(ex)
+      const row = subList.find(s => s.id === sub.id)
+      if (ex) pickExam(ex) // picking a (possibly different) exam clears submission first
+      setSelectedSub(row ?? sub)
     } catch (err) { setCreateErr(err.message) }
     setCreating(false)
   }
@@ -180,8 +198,7 @@ export default function SubmissionsPage() {
     setUploading(true); setUploadErr('')
     try {
       await api.submissions.uploadFile(selectedSub.id, uploadFile)
-      const full = await api.submissions.get(selectedSub.id)
-      setSelectedSub(full)
+      mergeFullSubmission(await api.submissions.get(selectedSub.id))
       setUploadFile(null)
       if (selectedExam) setSubmissions(await api.exams.submissions(selectedExam.id))
     } catch (err) { setUploadErr(err.message) }
@@ -199,8 +216,7 @@ export default function SubmissionsPage() {
       }
       setProcessStep('grade')
       await api.submissions.grade(selectedSub.id)
-      const full = await api.submissions.get(selectedSub.id)
-      setSelectedSub(full)
+      mergeFullSubmission(await api.submissions.get(selectedSub.id))
       if (selectedExam) setSubmissions(await api.exams.submissions(selectedExam.id))
     } catch (err) { setProcessErr(err.message) }
     setProcessing(false); setProcessStep('')
@@ -295,7 +311,7 @@ export default function SubmissionsPage() {
           {exams.map(ex => (
             <button key={ex.id} type="button"
               className={selectedExam?.id === ex.id ? tw.rowActive : tw.row}
-              onClick={() => selectExam(ex)}>
+              onClick={() => pickExam(ex)}>
               <div className="text-sm text-zinc-100">{ex.title}</div>
               <span className="text-xs text-zinc-500">{ex.exam_code}</span>
             </button>
@@ -311,7 +327,7 @@ export default function SubmissionsPage() {
               : submissions.map(s => (
                 <div key={s.id} className={`${selectedSub?.id === s.id ? tw.rowActive : tw.row} flex items-center gap-2`}>
                   <button type="button" className="flex-1 text-left flex items-center justify-between gap-2"
-                    onClick={() => selectSub(s)}>
+                    onClick={() => pickSub(s)}>
                     <div>
                       <div className="text-sm text-zinc-100">{s.student_name}</div>
                       <div className={tw.muted}>{s.student_id}</div>
@@ -363,83 +379,100 @@ export default function SubmissionsPage() {
           ) : null
         })()}
 
-        {/* Batch upload */}
+        {/* Batch tools: batch upload + processing queue — collapsed by default */}
         {selectedExam && (
           <div className={`${tw.card} flex flex-col gap-2`}>
-            <div className={tw.label}>Batch upload scans</div>
-            <p className={tw.muted}>
-              Select multiple scan images at once. Each must contain the printed QR code
-              so the system can identify the student automatically.
-            </p>
-            <label className={`${tw.btnSm} cursor-pointer w-fit`}>
-              {batching ? 'Uploading…' : 'Select files…'}
-              <input ref={batchRef} type="file" accept="image/*" multiple className="hidden"
-                onChange={batchUpload} disabled={batching} />
-            </label>
-
-            {batchResult?.error && (
-              <div className="text-xs text-red-400">{batchResult.error}</div>
-            )}
-            {batchResult && !batchResult.error && (
-              <div className="flex flex-col gap-1 mt-1">
-                <div className="text-xs text-zinc-400">
-                  {batchResult.ok_count} uploaded · {batchResult.error_count} failed
-                </div>
-                {batchResult.results.map((r, i) => (
-                  <div key={i} className={`text-xs flex items-start gap-1.5 ${r.status === 'ok' ? 'text-emerald-400' : 'text-red-400'}`}>
-                    <span>{r.status === 'ok' ? '✓' : '✕'}</span>
-                    <span className="truncate">{r.filename}</span>
-                    {r.student_name && <span className="text-zinc-400 shrink-0">→ {r.student_name}</span>}
-                    {r.detail && <span className="text-zinc-500 shrink-0">({r.detail})</span>}
-                  </div>
-                ))}
-              </div>
-            )}
-          </div>
-        )}
-        {/* Queue status panel */}
-        {selectedExam && (
-          <div className={`${tw.card} flex flex-col gap-2`}>
-            <div className="flex items-center justify-between">
-              <div className={tw.label}>Processing queue</div>
-              <button className={tw.btnSm} onClick={enqueueAll} title="Add all pending scans to queue">
-                Enqueue all
-              </button>
-            </div>
-            {!queueStatus ? (
-              <p className={tw.muted}>No queue activity yet.</p>
-            ) : (
-              <>
-                {queueStatus.current && (
-                  <div className="flex items-center gap-2 text-xs text-zinc-300">
-                    <span className="inline-block w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
-                    Processing: {queueStatus.current.label}
-                  </div>
+            <button type="button" className="flex items-center justify-between w-full text-left"
+              onClick={() => setBatchToolsOpen(o => !o)}>
+              <span className={tw.label}>Batch tools</span>
+              <span className="text-xs text-zinc-500 flex items-center gap-1.5">
+                {queueStatus && (queueStatus.pending > 0 || queueStatus.current) && (
+                  <span className="inline-block w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
                 )}
-                <div className="text-xs text-zinc-400 flex gap-3">
-                  <span>Pending: <span className="text-zinc-200">{queueStatus.pending}</span></span>
-                  <span>Done: <span className="text-emerald-400">{queueStatus.completed}</span></span>
-                  {queueStatus.failed > 0 && (
-                    <span>Failed: <span className="text-red-400">{queueStatus.failed}</span></span>
+                {batchToolsOpen ? 'Hide ▴' : 'Show ▾'}
+              </span>
+            </button>
+
+            {batchToolsOpen && (
+              <div className="flex flex-col gap-4 pt-1">
+                {/* Batch upload */}
+                <div className="flex flex-col gap-2">
+                  <div className={tw.label}>Batch upload scans</div>
+                  <p className={tw.muted}>
+                    Select multiple scan images at once. Each must contain the printed QR code
+                    so the system can identify the student automatically.
+                  </p>
+                  <label className={`${tw.btnSm} cursor-pointer w-fit`}>
+                    {batching ? 'Uploading…' : 'Select files…'}
+                    <input ref={batchRef} type="file" accept="image/*" multiple className="hidden"
+                      onChange={batchUpload} disabled={batching} />
+                  </label>
+
+                  {batchResult?.error && (
+                    <div className="text-xs text-red-400">{batchResult.error}</div>
+                  )}
+                  {batchResult && !batchResult.error && (
+                    <div className="flex flex-col gap-1 mt-1">
+                      <div className="text-xs text-zinc-400">
+                        {batchResult.ok_count} uploaded · {batchResult.error_count} failed
+                      </div>
+                      {batchResult.results.map((r, i) => (
+                        <div key={i} className={`text-xs flex items-start gap-1.5 ${r.status === 'ok' ? 'text-emerald-400' : 'text-red-400'}`}>
+                          <span>{r.status === 'ok' ? '✓' : '✕'}</span>
+                          <span className="truncate">{r.filename}</span>
+                          {r.student_name && <span className="text-zinc-400 shrink-0">→ {r.student_name}</span>}
+                          {r.detail && <span className="text-zinc-500 shrink-0">({r.detail})</span>}
+                        </div>
+                      ))}
+                    </div>
                   )}
                 </div>
-                {/* Progress bar */}
-                {queueStatus.total_enqueued > 0 && (
-                  <div className="h-1.5 rounded-full bg-zinc-800 overflow-hidden">
-                    <div
-                      className="h-full rounded-full bg-emerald-500 transition-all"
-                      style={{
-                        width: `${Math.round(
-                          (queueStatus.completed / queueStatus.total_enqueued) * 100
-                        )}%`
-                      }}
-                    />
+
+                {/* Queue status */}
+                <div className="flex flex-col gap-2 border-t border-zinc-800 pt-3">
+                  <div className="flex items-center justify-between">
+                    <div className={tw.label}>Processing queue</div>
+                    <button className={tw.btnSm} onClick={enqueueAll} title="Add all pending scans to queue">
+                      Enqueue all
+                    </button>
                   </div>
-                )}
-                {queueStatus.recent_errors?.slice(-3).map((e, i) => (
-                  <div key={i} className="text-xs text-red-400 truncate">{e}</div>
-                ))}
-              </>
+                  {!queueStatus ? (
+                    <p className={tw.muted}>No queue activity yet.</p>
+                  ) : (
+                    <>
+                      {queueStatus.current && (
+                        <div className="flex items-center gap-2 text-xs text-zinc-300">
+                          <span className="inline-block w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
+                          Processing: {queueStatus.current.label}
+                        </div>
+                      )}
+                      <div className="text-xs text-zinc-400 flex gap-3">
+                        <span>Pending: <span className="text-zinc-200">{queueStatus.pending}</span></span>
+                        <span>Done: <span className="text-emerald-400">{queueStatus.completed}</span></span>
+                        {queueStatus.failed > 0 && (
+                          <span>Failed: <span className="text-red-400">{queueStatus.failed}</span></span>
+                        )}
+                      </div>
+                      {/* Progress bar */}
+                      {queueStatus.total_enqueued > 0 && (
+                        <div className="h-1.5 rounded-full bg-zinc-800 overflow-hidden">
+                          <div
+                            className="h-full rounded-full bg-emerald-500 transition-all"
+                            style={{
+                              width: `${Math.round(
+                                (queueStatus.completed / queueStatus.total_enqueued) * 100
+                              )}%`
+                            }}
+                          />
+                        </div>
+                      )}
+                      {queueStatus.recent_errors?.slice(-3).map((e, i) => (
+                        <div key={i} className="text-xs text-red-400 truncate">{e}</div>
+                      ))}
+                    </>
+                  )}
+                </div>
+              </div>
             )}
           </div>
         )}

@@ -951,6 +951,52 @@ def download_template_pdf(exam_id: int, db: Session = Depends(get_db)) -> FileRe
     )
 
 
+@router.get("/exams/{exam_id}/questionnaire/pdf")
+def download_questionnaire_pdf(exam_id: int, db: Session = Depends(get_db)) -> Response:
+    """
+    Download a plain reading document listing each question's prompt (and MCQ
+    choices) — separate from the answer-sheet template. Generated fresh from
+    current question data on every request; independent of template generation
+    (no ArUco/QR, never scanned back, so it doesn't need region_json).
+    """
+    from pdf_generator import QuestionInput, generate_questionnaire
+
+    exam = db.get(m.Exam, exam_id)
+    if not exam:
+        raise HTTPException(status_code=404, detail="Exam not found")
+
+    questions = (
+        db.query(m.ExamQuestion)
+        .filter(m.ExamQuestion.exam_id == exam_id)
+        .order_by(m.ExamQuestion.order_index)
+        .all()
+    )
+    if not questions:
+        raise HTTPException(status_code=400, detail="Exam has no questions.")
+
+    course = db.get(m.CourseClass, exam.class_id)
+    class_code = course.code if course else "—"
+
+    q_inputs = [
+        QuestionInput(
+            id=q.id, order_index=q.order_index, prompt=q.prompt,
+            question_type=q.question_type or "essay", choices_json=q.choices_json,
+        )
+        for q in questions
+    ]
+    pdf_bytes = generate_questionnaire(
+        exam_title=exam.title, exam_code=exam.exam_code,
+        class_code=class_code, questions=q_inputs,
+    )
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": f'attachment; filename="exam_{exam.exam_code}_questionnaire.pdf"'
+        },
+    )
+
+
 @router.get("/exams/{exam_id}/papers/zip")
 def download_all_papers_zip(exam_id: int, db: Session = Depends(get_db)) -> StreamingResponse:
     """
@@ -2296,12 +2342,21 @@ async def import_questions(
     db: Session = Depends(get_db),
 ) -> QuestionImportResult:
     """
-    Bulk-import questions from a CSV file into an exam.
+    Bulk-import questions from a CSV file into an exam, across all four question types.
 
-    Expected columns (header required): rubric_text, max_points, prompt (optional)
-    If prompt is omitted or empty, it is auto-generated as "Question N".
+    Expected columns (header required):
+      prompt          — optional; auto-generated as "Question N" if omitted
+      question_type   — optional, defaults to "essay"; one of essay, mcq, tf, identification
+      rubric_text     — required for essay questions, ignored otherwise
+      max_points      — optional, defaults to 10
+      choices         — mcq only; pipe-separated choice text, e.g. "Oxygen|Carbon Dioxide|Nitrogen|Hydrogen"
+                         (position maps to bubble letter: 1st = A, 2nd = B, ...)
+      correct_answer  — required for mcq (a letter matching a choices position, e.g. "B"),
+                         tf ("True" or "False"), and identification (the expected answer text)
+
     Rows are assigned order_index starting after the current highest question index.
-    Skips rows missing rubric_text.
+    Skips rows with an invalid question_type, missing rubric_text (essay), or missing
+    correct_answer (mcq/tf/identification) — same requirements as adding a question manually.
     """
     exam = db.get(m.Exam, exam_id)
     if not exam:
@@ -2322,18 +2377,39 @@ async def import_questions(
     reader = csv.DictReader(io.StringIO(text))
     created = 0
     errors: list[str] = []
+    valid_types = ("essay", "mcq", "tf", "identification")
 
     for i, row in enumerate(reader, start=2):
-        prompt = (row.get("prompt") or "").strip()
-        rubric = (row.get("rubric_text") or "").strip()
+        prompt  = (row.get("prompt") or "").strip()
+        qtype   = (row.get("question_type") or "essay").strip().lower()
+        rubric  = (row.get("rubric_text") or "").strip()
+        correct = (row.get("correct_answer") or "").strip()
+        choices_raw = (row.get("choices") or "").strip()
         try:
             max_pts = float((row.get("max_points") or "10").strip())
         except ValueError:
             max_pts = 10.0
 
-        if not rubric:
-            errors.append(f"Row {i}: missing rubric_text — skipped")
+        if qtype not in valid_types:
+            errors.append(
+                f"Row {i}: invalid question_type '{qtype}' — must be one of "
+                f"{', '.join(valid_types)} — skipped"
+            )
             continue
+
+        if qtype == "essay" and not rubric:
+            errors.append(f"Row {i}: missing rubric_text for essay question — skipped")
+            continue
+
+        if qtype in ("mcq", "tf", "identification") and not correct:
+            errors.append(f"Row {i}: missing correct_answer for {qtype} question — skipped")
+            continue
+
+        choices_json = None
+        if qtype == "mcq" and choices_raw:
+            choice_list = [c.strip() for c in choices_raw.split("|") if c.strip()]
+            if choice_list:
+                choices_json = json.dumps(choice_list)
 
         if not prompt:
             prompt = f"Question {next_order}"
@@ -2342,9 +2418,11 @@ async def import_questions(
             exam_id=exam_id,
             order_index=next_order,
             prompt=prompt,
-            rubric_text=rubric,
+            rubric_text=rubric if qtype == "essay" else None,
             max_points=max_pts,
-            question_type="essay",
+            question_type=qtype,
+            choices_json=choices_json,
+            correct_answer=correct or None,
         ))
         next_order += 1
         created += 1

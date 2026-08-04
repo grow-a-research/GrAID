@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { api } from '../api'
 import { tw, ErrorBox, Empty } from '../ui'
+import { useWorkflow } from '../context/WorkflowContext'
 
 const PAPER_TABS = [
   { id: 'aligned',  label: 'Aligned scan',   hint: 'perspective-corrected' },
@@ -655,10 +656,12 @@ function AnswerCard({ answer, question, flag, onOverrideSaved, onFlagChange }) {
 }
 
 export default function ResultsPage() {
+  const {
+    selectedExam, selectExam: pickExam,
+    selectedSubmission: selectedSub, selectSubmission: pickSub, updateSelectedSubmission: setSelectedSub,
+  } = useWorkflow()
   const [exams, setExams]               = useState([])
-  const [selectedExam, setSelectedExam] = useState(null)
   const [submissions, setSubmissions]   = useState([])
-  const [selectedSub, setSelectedSub]   = useState(null)
   const [answers, setAnswers]           = useState([])
   const [questions, setQuestions]       = useState([])
   const [flags, setFlags]               = useState({})   // answerId → FlagLog | null
@@ -668,35 +671,31 @@ export default function ResultsPage() {
 
   useEffect(() => { api.exams.list().then(setExams).catch(() => {}) }, [])
 
-  async function selectExam(exam) {
-    setSelectedExam(exam); setSelectedSub(null); setAnswers([]); setQuestions([])
-    setFlags({}); setFlagStats(null)
-    try { setSubmissions(await api.exams.submissions(exam.id)) } catch { setSubmissions([]) }
-    try { setQuestions(await api.exams.questions.list(exam.id)) } catch {}
-    try { setFlagStats(await api.exams.flagStats(exam.id)) } catch {}
-  }
+  // Loads exam-level data (submission list, questions, flag stats) whenever the shared
+  // selected exam changes — covers both an explicit pick here and arriving with an exam
+  // already selected from Exams/Submissions.
+  useEffect(() => {
+    if (!selectedExam) { setSubmissions([]); setQuestions([]); setFlagStats(null); return }
+    api.exams.submissions(selectedExam.id).then(setSubmissions).catch(() => setSubmissions([]))
+    api.exams.questions.list(selectedExam.id).then(setQuestions).catch(() => setQuestions([]))
+    api.exams.flagStats(selectedExam.id).then(setFlagStats).catch(() => setFlagStats(null))
+  }, [selectedExam?.id])
 
-  async function selectSub(sub) {
+  // Loads submission-level data (answers, flags) whenever the shared selected
+  // submission changes.
+  useEffect(() => {
     setGradeErr('')
-    setSelectedSub(sub)
-    try {
-      const [ans, flagList] = await Promise.all([
-        api.submissions.answers(sub.id),
-        api.submissions.flags(sub.id),
-      ])
+    if (!selectedSub) { setAnswers([]); setFlags({}); return }
+    Promise.all([
+      api.submissions.answers(selectedSub.id),
+      api.submissions.flags(selectedSub.id),
+    ]).then(([ans, flagList]) => {
       setAnswers(ans)
       const flagMap = {}
       flagList.forEach(f => { flagMap[f.submission_answer_id] = f })
       setFlags(flagMap)
-    } catch { setAnswers([]); setFlags({}) }
-    if (!selectedExam) return
-    if (questions.length === 0) {
-      try {
-        const exam = await api.exams.list().then(list => list.find(e => e.id === sub.exam_id))
-        if (exam) setQuestions(await api.exams.questions.list(exam.id))
-      } catch {}
-    }
-  }
+    }).catch(() => { setAnswers([]); setFlags({}) })
+  }, [selectedSub?.id])
 
   function handleFlagChange(answerId, updatedFlag) {
     setFlags(prev => ({ ...prev, [answerId]: updatedFlag }))
@@ -722,8 +721,7 @@ export default function ResultsPage() {
       setFlags(flagMap)
       if (stats) setFlagStats(stats)
       setSubmissions(await api.exams.submissions(selectedExam.id))
-      const sub = submissions.find(s => s.id === selectedSub.id)
-      if (sub) setSelectedSub({ ...sub, status: 'graded' })
+      setSelectedSub(prev => ({ ...prev, status: 'graded' }))
     } catch (err) { setGradeErr(err.message) }
     setGrading(false)
   }
@@ -755,7 +753,7 @@ export default function ResultsPage() {
             : exams.map(ex => (
               <button key={ex.id} type="button"
                 className={selectedExam?.id === ex.id ? tw.rowActive : tw.row}
-                onClick={() => selectExam(ex)}>
+                onClick={() => pickExam(ex)}>
                 <div className="text-sm text-zinc-100">{ex.title}</div>
                 <span className="text-xs text-zinc-500">{ex.exam_code}</span>
               </button>
@@ -783,7 +781,7 @@ export default function ResultsPage() {
               : submissions.map(s => (
                 <button key={s.id} type="button"
                   className={selectedSub?.id === s.id ? tw.rowActive : tw.row}
-                  onClick={() => selectSub(s)}>
+                  onClick={() => pickSub(s)}>
                   <div>
                     <div className="text-sm text-zinc-100">{s.student_name}</div>
                     <div className={tw.muted}>{s.student_id}</div>
@@ -839,7 +837,8 @@ export default function ResultsPage() {
                 </div>
               )}
 
-              {/* Grade button if not yet graded */}
+              {/* Recovery action: OCR already ran (via Submissions → Process), but grading
+                  didn't complete. Not the primary entry point — Process in Submissions is. */}
               {selectedSub.status !== 'graded' && (
                 <div className="mt-3 flex items-center gap-3">
                   <button className={tw.btnSmPrimary} onClick={runGrading}
@@ -851,6 +850,9 @@ export default function ResultsPage() {
                   )}
                   {selectedSub.status === 'submitted' && (
                     <span className={tw.muted}>OCR not run yet — process in Submissions tab</span>
+                  )}
+                  {selectedSub.status === 'ocr_done' && (
+                    <span className={tw.muted}>OCR is done — this finishes the grading step only</span>
                   )}
                 </div>
               )}

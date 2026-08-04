@@ -29,6 +29,7 @@ export default function ClassesPage() {
   const csvRef = useRef(null)
   const [csvBulking, setCsvBulking] = useState(false)
   const [csvBulkResult, setCsvBulkResult] = useState(null)
+  const [csvToolsOpen, setCsvToolsOpen] = useState(false)
 
   useEffect(() => { loadClasses(); loadStudents() }, [])
 
@@ -40,7 +41,7 @@ export default function ClassesPage() {
   }
   async function selectClass(cls) {
     setSelected(cls); setEnrollErr(''); setEnrollId('')
-    setBulkSelected(new Set()); setBulkResult(null); setCsvBulkResult(null)
+    setBulkSelected(new Set()); setBulkResult(null); setCsvBulkResult(null); setCsvToolsOpen(false)
     setLoadingEnrolled(true)
     try { setEnrolled(await api.classes.enrolled(cls.id)) } catch { setEnrolled([]) }
     setLoadingEnrolled(false)
@@ -211,28 +212,36 @@ export default function ClassesPage() {
               <div className={`${tw.card} flex flex-col gap-3`}>
                 <div className="flex items-center justify-between">
                   <div className={tw.label}>Bulk enroll ({notEnrolled.length} not yet enrolled)</div>
-                  <div className="flex gap-2">
-                    <button type="button" className={tw.btnSm} onClick={downloadEnrollTemplate}>
-                      Download CSV template
-                    </button>
-                    <label className={`${tw.btnSm} cursor-pointer`}>
-                      {csvBulking ? 'Importing…' : 'Upload CSV'}
-                      <input ref={csvRef} type="file" accept=".csv,text/csv" className="hidden"
-                        onChange={importEnrollCsv} disabled={csvBulking} />
-                    </label>
-                  </div>
+                  <button type="button"
+                    className="text-xs text-zinc-500 hover:text-zinc-300 underline underline-offset-2"
+                    onClick={() => setCsvToolsOpen(o => !o)}>
+                    {csvToolsOpen ? 'Hide CSV import' : 'Use CSV instead'}
+                  </button>
                 </div>
 
-                {/* CSV result */}
-                {csvBulkResult && !csvBulkResult.error && (
-                  <div className="text-xs text-emerald-400">
-                    {csvBulkResult.enrolled} enrolled · {csvBulkResult.skipped} skipped
-                    {csvBulkResult.errors?.length > 0 && (
-                      <div className="text-red-400 mt-0.5">{csvBulkResult.errors.join(' · ')}</div>
+                {csvToolsOpen && (
+                  <div className="flex flex-col gap-2 rounded-lg border border-zinc-800 bg-zinc-950/40 p-3">
+                    <div className="flex gap-2 flex-wrap">
+                      <button type="button" className={tw.btnSm} onClick={downloadEnrollTemplate}>
+                        Download CSV template
+                      </button>
+                      <label className={`${tw.btnSm} cursor-pointer`}>
+                        {csvBulking ? 'Importing…' : 'Upload CSV'}
+                        <input ref={csvRef} type="file" accept=".csv,text/csv" className="hidden"
+                          onChange={importEnrollCsv} disabled={csvBulking} />
+                      </label>
+                    </div>
+                    {csvBulkResult && !csvBulkResult.error && (
+                      <div className="text-xs text-emerald-400">
+                        {csvBulkResult.enrolled} enrolled · {csvBulkResult.skipped} skipped
+                        {csvBulkResult.errors?.length > 0 && (
+                          <div className="text-red-400 mt-0.5">{csvBulkResult.errors.join(' · ')}</div>
+                        )}
+                      </div>
                     )}
+                    {csvBulkResult?.error && <div className="text-xs text-red-400">{csvBulkResult.error}</div>}
                   </div>
                 )}
-                {csvBulkResult?.error && <div className="text-xs text-red-400">{csvBulkResult.error}</div>}
 
                 {/* Checkbox list */}
                 <div className="max-h-48 overflow-y-auto flex flex-col gap-1 pr-1">

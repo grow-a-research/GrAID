@@ -1,12 +1,58 @@
 import { useEffect, useRef, useState } from 'react'
 import { api } from '../api'
 import { tw, ErrorBox, Empty } from '../ui'
+import { useWorkflow } from '../context/WorkflowContext'
+
+// Shown as a concrete example of a well-structured rubric — weighted criteria
+// grade more consistently through the AI grader than a single vague paragraph.
+const EXAMPLE_RUBRIC =
+  'Thesis clarity (3 pts): states a clear main argument. ' +
+  'Supporting evidence (4 pts): uses at least two specific examples from the text. ' +
+  'Grammar and organization (3 pts): logically structured paragraphs with minimal errors.'
+
+function csvCell(value) {
+  return `"${String(value).replace(/"/g, '""')}"`
+}
+
+function downloadCsv(filename, rows) {
+  const csv = rows.map(row => row.join(',')).join('\n') + '\n'
+  const blob = new Blob([csv], { type: 'text/csv' })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url; a.download = filename
+  document.body.appendChild(a); a.click(); a.remove()
+  URL.revokeObjectURL(url)
+}
+
+function downloadQuestionsCsvTemplate() {
+  downloadCsv('questions_template.csv', [
+    ['prompt', 'question_type', 'rubric_text', 'max_points', 'choices', 'correct_answer'],
+    [
+      csvCell('Explain how photosynthesis converts sunlight into chemical energy.'),
+      'essay', csvCell(EXAMPLE_RUBRIC), '10', '', '',
+    ],
+    [csvCell('What is the capital of France?'), 'identification', '', '5', '', 'Paris'],
+    [csvCell('The mitochondria is the powerhouse of the cell.'), 'tf', '', '2', '', 'True'],
+    [
+      csvCell('Which gas do plants absorb during photosynthesis?'),
+      'mcq', '', '2', csvCell('Oxygen|Carbon Dioxide|Nitrogen|Hydrogen'), 'B',
+    ],
+  ])
+}
+
+function downloadRubricsCsvTemplate() {
+  downloadCsv('rubrics_template.csv', [
+    ['order_index', 'rubric_text'],
+    ['1', csvCell(EXAMPLE_RUBRIC)],
+  ])
+}
 
 export default function ExamsPage() {
+  const { selectedExam: selected, selectExam: pickExam, updateSelectedExam: setSelected, clearWorkflow }
+    = useWorkflow()
   const [classes, setClasses] = useState([])
   const [exams, setExams] = useState([])
   const [filterClass, setFilterClass] = useState('')
-  const [selected, setSelected] = useState(null)   // selected exam
   const [questions, setQuestions] = useState([])
 
   // create exam form
@@ -46,6 +92,9 @@ export default function ExamsPage() {
   // exam duplication
   const [duplicating, setDuplicating] = useState(false)
 
+  // advanced tools disclosure (duplicate exam, CSV import/export)
+  const [advancedOpen, setAdvancedOpen] = useState(false)
+
   // inline question editing
   const [editingQId, setEditingQId] = useState(null)
   const [editQPrompt, setEditQPrompt] = useState('')
@@ -59,17 +108,24 @@ export default function ExamsPage() {
 
   useEffect(() => { loadClasses(); loadExams() }, [])
 
+  // Loads question/template state for whichever exam is selected — runs on explicit
+  // selection here, and also when arriving on this tab with an exam already picked
+  // from Submissions/Results (shared WorkflowContext selection).
+  useEffect(() => {
+    setAddQErr(''); setGenErr(''); setAdvancedOpen(false)
+    setQImportResult(null); setRubricImportResult(null)
+    if (!selected) { setQuestions([]); setTemplateReady(false); return }
+    setTemplateReady(!!selected.template_spec_json)
+    api.exams.questions.list(selected.id)
+      .then(setQuestions)
+      .catch(() => setQuestions([]))
+  }, [selected?.id])
+
   async function loadClasses() {
     try { setClasses(await api.classes.list()) } catch {}
   }
   async function loadExams(classId) {
     try { setExams(await api.exams.list(classId || undefined)) } catch {}
-  }
-  async function selectExam(exam) {
-    setSelected(exam)
-    setAddQErr(''); setGenErr('')
-    setTemplateReady(!!exam.template_spec_json)
-    try { setQuestions(await api.exams.questions.list(exam.id)) } catch { setQuestions([]) }
   }
   async function createExam(e) {
     e.preventDefault()
@@ -127,6 +183,13 @@ export default function ExamsPage() {
     const url = api.exams.templatePdfUrl(selected.id)
     const a = document.createElement('a')
     a.href = url; a.download = `exam_${selected.exam_code}_template.pdf`
+    document.body.appendChild(a); a.click(); a.remove()
+  }
+  function downloadQuestionnaire() {
+    if (!selected) return
+    const url = api.exams.questionnairePdfUrl(selected.id)
+    const a = document.createElement('a')
+    a.href = url; a.download = `exam_${selected.exam_code}_questionnaire.pdf`
     document.body.appendChild(a); a.click(); a.remove()
   }
 
@@ -237,7 +300,7 @@ export default function ExamsPage() {
     try {
       await api.exams.delete(exam.id)
       setExams(prev => prev.filter(e => e.id !== exam.id))
-      if (selected?.id === exam.id) { setSelected(null); setQuestions([]) }
+      if (selected?.id === exam.id) clearWorkflow()
     } catch (err) { alert(`Delete failed: ${err.message}`) }
   }
 
@@ -281,7 +344,7 @@ export default function ExamsPage() {
             : filteredExams.map(ex => (
               <div key={ex.id} className={`${selected?.id === ex.id ? tw.rowActive : tw.row} flex items-center gap-2`}>
                 <button type="button" className="flex-1 text-left flex items-center justify-between gap-2"
-                  onClick={() => selectExam(ex)}>
+                  onClick={() => pickExam(ex)}>
                   <div>
                     <div className="text-sm font-medium text-zinc-100">{ex.title}</div>
                     <div className={tw.muted}>{ex.exam_code}</div>
@@ -322,15 +385,20 @@ export default function ExamsPage() {
                     Download PDF
                   </button>
                 )}
+                {questions.length > 0 && (
+                  <button className={tw.btnSm} onClick={downloadQuestionnaire}
+                    title="Plain document listing question text — separate from the answer sheet, safe to hand out or read from">
+                    Download questionnaire
+                  </button>
+                )}
                 {templateReady && (
                   <button className={tw.btnSm} onClick={downloadAllPapers}
                     title="Generates a personalised PDF for every enrolled student and downloads as a ZIP">
                     Download all papers (ZIP)
                   </button>
                 )}
-                <button className={tw.btnSm} onClick={duplicateExam} disabled={duplicating}
-                  title="Clone this exam (questions + rubrics) as a new draft">
-                  {duplicating ? 'Duplicating…' : 'Duplicate exam'}
+                <button type="button" className={tw.btnSm} onClick={() => setAdvancedOpen(o => !o)}>
+                  {advancedOpen ? 'Hide advanced tools' : 'Advanced tools ▾'}
                 </button>
               </div>
             </div>
@@ -347,57 +415,97 @@ export default function ExamsPage() {
               </div>
             )}
 
+            {/* Advanced tools: duplicate exam, bulk CSV import/export — collapsed by default */}
+            {advancedOpen && (
+              <div className={`${tw.card} flex flex-col gap-3`}>
+                <div className={tw.label}>Advanced tools</div>
+
+                <button className={tw.btnSm} onClick={duplicateExam} disabled={duplicating}
+                  title="Clone this exam (questions + rubrics) as a new draft"
+                  style={{ alignSelf: 'flex-start' }}>
+                  {duplicating ? 'Duplicating…' : 'Duplicate exam'}
+                </button>
+
+                {/* Bulk import questions */}
+                <div className="flex flex-col gap-2 border-t border-zinc-800 pt-3">
+                  <div className={tw.label}>Bulk import questions (CSV)</div>
+                  <p className="text-xs text-zinc-500 leading-relaxed">
+                    Columns: <span className="font-mono text-zinc-400">prompt</span> (optional — auto-numbered if left blank),{' '}
+                    <span className="font-mono text-zinc-400">question_type</span> (<span className="font-mono">essay</span> / <span className="font-mono">mcq</span> / <span className="font-mono">tf</span> / <span className="font-mono">identification</span>, defaults to essay),{' '}
+                    <span className="font-mono text-zinc-400">rubric_text</span> (required for essay),{' '}
+                    <span className="font-mono text-zinc-400">max_points</span>,{' '}
+                    <span className="font-mono text-zinc-400">choices</span> (MCQ only — pipe-separated, e.g. <span className="font-mono">Oxygen|Carbon Dioxide|Nitrogen|Hydrogen</span>; order maps to A/B/C/D),{' '}
+                    <span className="font-mono text-zinc-400">correct_answer</span> (required for mcq/tf/identification — a letter for MCQ, "True"/"False" for T-F, the expected text for Identification).
+                    {' '}Download the template below to see a filled example of each type.
+                  </p>
+                  <div className="flex gap-2 flex-wrap">
+                    <button type="button" className={tw.btnSm} onClick={downloadQuestionsCsvTemplate}>
+                      Download template
+                    </button>
+                    <label className={`${tw.btnSm} cursor-pointer`}>
+                      {qImporting ? 'Importing…' : 'Upload CSV'}
+                      <input ref={qCsvRef} type="file" accept=".csv,text/csv" className="hidden"
+                        onChange={importQuestionsCsv} disabled={qImporting} />
+                    </label>
+                  </div>
+                  {qImportResult && !qImportResult.error && (
+                    <div className="text-xs text-emerald-400">
+                      {qImportResult.created} question(s) imported
+                      {qImportResult.errors?.length > 0 && (
+                        <div className="text-red-400 mt-0.5">{qImportResult.errors.join(' · ')}</div>
+                      )}
+                    </div>
+                  )}
+                  {qImportResult?.error && (
+                    <div className="text-xs text-red-400">{qImportResult.error}</div>
+                  )}
+                </div>
+
+                {/* Bulk update rubrics */}
+                <div className="flex flex-col gap-2 border-t border-zinc-800 pt-3">
+                  <div className="flex items-center justify-between gap-2 flex-wrap">
+                    <div className={tw.label}>Bulk update rubrics (CSV)</div>
+                    {questions.some(q => q.rubric_text) && (
+                      <button className={tw.btnSm} onClick={clearRubrics} disabled={clearingRubrics}
+                        title="Remove rubric text from all questions">
+                        {clearingRubrics ? 'Clearing…' : 'Clear rubrics'}
+                      </button>
+                    )}
+                  </div>
+                  <p className="text-xs text-zinc-500 leading-relaxed">
+                    Columns: <span className="font-mono text-zinc-400">order_index</span>,{' '}
+                    <span className="font-mono text-zinc-400">rubric_text</span>. Matches existing
+                    essay questions by their number and replaces the rubric — does not create new
+                    questions. Download the template for an example of a well-structured rubric
+                    (weighted criteria grade more consistently than a vague paragraph).
+                  </p>
+                  <div className="flex gap-2 flex-wrap">
+                    <button type="button" className={tw.btnSm} onClick={downloadRubricsCsvTemplate}>
+                      Download template
+                    </button>
+                    <label className={`${tw.btnSm} cursor-pointer`}>
+                      {rubricImporting ? 'Updating…' : 'Upload CSV'}
+                      <input ref={rubricCsvRef} type="file" accept=".csv,text/csv" className="hidden"
+                        onChange={importRubricsCsv} disabled={rubricImporting} />
+                    </label>
+                  </div>
+                  {rubricImportResult && !rubricImportResult.error && (
+                    <div className="text-xs text-emerald-400">
+                      {rubricImportResult.updated} rubric(s) updated
+                      {rubricImportResult.errors?.length > 0 && (
+                        <div className="text-red-400 mt-0.5">{rubricImportResult.errors.join(' · ')}</div>
+                      )}
+                    </div>
+                  )}
+                  {rubricImportResult?.error && (
+                    <div className="text-xs text-red-400">{rubricImportResult.error}</div>
+                  )}
+                </div>
+              </div>
+            )}
+
             {/* Questions */}
-            <div className="flex items-center justify-between gap-2 flex-wrap">
-              <div className={tw.label}>Questions ({questions.length})</div>
-              <div className="flex gap-2 flex-wrap">
-                <label className={`${tw.btnSm} cursor-pointer`}>
-                  {qImporting ? 'Importing…' : 'Import questions CSV'}
-                  <input ref={qCsvRef} type="file" accept=".csv,text/csv" className="hidden"
-                    onChange={importQuestionsCsv} disabled={qImporting} />
-                </label>
-                <label className={`${tw.btnSm} cursor-pointer`}
-                  title="CSV columns: order_index, rubric_text — updates rubrics on existing questions">
-                  {rubricImporting ? 'Updating…' : 'Update rubrics CSV'}
-                  <input ref={rubricCsvRef} type="file" accept=".csv,text/csv" className="hidden"
-                    onChange={importRubricsCsv} disabled={rubricImporting} />
-                </label>
-                {questions.some(q => q.rubric_text) && (
-                  <button className={tw.btnSm} onClick={clearRubrics} disabled={clearingRubrics}
-                    title="Remove rubric text from all questions">
-                    {clearingRubrics ? 'Clearing…' : 'Clear rubrics'}
-                  </button>
-                )}
-              </div>
-            </div>
-            {qImportResult && !qImportResult.error && (
-              <div className="text-xs text-emerald-400">
-                {qImportResult.created} question(s) imported
-                {qImportResult.errors?.length > 0 && (
-                  <div className="text-red-400 mt-0.5">{qImportResult.errors.join(' · ')}</div>
-                )}
-              </div>
-            )}
-            {qImportResult?.error && (
-              <div className="text-xs text-red-400">{qImportResult.error}</div>
-            )}
-            {rubricImportResult && !rubricImportResult.error && (
-              <div className="text-xs text-emerald-400">
-                {rubricImportResult.updated} rubric(s) updated
-                {rubricImportResult.errors?.length > 0 && (
-                  <div className="text-red-400 mt-0.5">{rubricImportResult.errors.join(' · ')}</div>
-                )}
-              </div>
-            )}
-            {rubricImportResult?.error && (
-              <div className="text-xs text-red-400">{rubricImportResult.error}</div>
-            )}
-            <div className="text-xs text-zinc-600">
-              Questions CSV: <span className="font-mono text-zinc-400">rubric_text, max_points</span>
-              <span className="ml-1">(prompt optional)</span>
-              {' · '}
-              Rubrics CSV: <span className="font-mono text-zinc-400">order_index, rubric_text</span>
-            </div>
+            <div className={tw.label}>Questions ({questions.length})</div>
 
             <form onSubmit={addQuestion} className={`${tw.card} flex flex-col gap-3`}>
               <div className={tw.label}>Add question</div>
@@ -423,7 +531,8 @@ export default function ExamsPage() {
 
               {/* Essay: rubric */}
               {qType === 'essay' && (
-                <textarea className={tw.input} placeholder="Rubric / marking criteria *" rows={2}
+                <textarea className={tw.input} rows={3}
+                  placeholder={`Rubric / marking criteria * — write it as weighted criteria, e.g.:\n${EXAMPLE_RUBRIC}`}
                   value={qRubric} onChange={e => setQRubric(e.target.value)} />
               )}
 
@@ -506,7 +615,8 @@ export default function ExamsPage() {
                             value={editQPrompt} onChange={e => setEditQPrompt(e.target.value)} />
 
                           {editQType === 'essay' && (
-                            <textarea className={tw.input} placeholder="Rubric / marking criteria" rows={2}
+                            <textarea className={tw.input} rows={3}
+                              placeholder={`Rubric / marking criteria — write it as weighted criteria, e.g.:\n${EXAMPLE_RUBRIC}`}
                               value={editQRubric} onChange={e => setEditQRubric(e.target.value)} />
                           )}
 

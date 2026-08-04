@@ -31,8 +31,7 @@ export const tw = {
       draft:       'bg-zinc-800 text-zinc-400',
       submitted:   'bg-blue-950 text-blue-300',
       ocr_done:    'bg-emerald-950 text-emerald-300',
-      reviewed:    'bg-violet-950 text-violet-300',
-      published:   'bg-amber-950 text-amber-300',
+      graded:      'bg-violet-950 text-violet-300',
     }
     return `inline-block rounded-full px-2 py-0.5 text-xs font-medium ${map[color] ?? 'bg-zinc-800 text-zinc-400'}`
   },

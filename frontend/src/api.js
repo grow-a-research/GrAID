@@ -80,6 +80,7 @@ export const api = {
     },
     generateTemplate: (examId) => req('POST', `${V1}/exams/${examId}/template`),
     templatePdfUrl: (examId) => `${V1}/exams/${examId}/template/pdf`,
+    questionnairePdfUrl: (examId) => `${V1}/exams/${examId}/questionnaire/pdf`,
     allPapersZipUrl: (examId) => `${V1}/exams/${examId}/papers/zip`,
     submissions: (examId) => req('GET', `${V1}/exams/${examId}/submissions`),
     analytics: (examId) => req('GET', `${V1}/exams/${examId}/analytics`),
