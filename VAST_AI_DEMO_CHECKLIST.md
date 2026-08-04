@@ -13,9 +13,9 @@ OCR server runs on internal port `10100`, mapped to external port `43240`.
    curl http://localhost:10100/health
    ```
    If you get `{"status":"ok"}`, skip to step 5.
-4. If not running, start it:
+4. If not running, start it (files live directly in `/workspace`, the default directory,
+   so no `cd` needed):
    ```bash
-   cd /GRAID
    tmux new -s ocr
    PORT=10100 python3 vast_ocr_server.py
    ```
