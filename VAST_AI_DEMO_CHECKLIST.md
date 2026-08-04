@@ -35,19 +35,24 @@ cd "C:\Users\ASUS\OneDrive\Desktop\Files\John\GrAID-Repo"
 ```
 - Enter `GROQ_API_KEY` if prompted.
 - Paste `http://158.181.52.18:43240` when asked for the remote OCR URL.
-- Wait for `Starting GrAId at http://127.0.0.1:8000`.
-- Open `http://127.0.0.1:8000` yourself first to confirm it loads before involving anyone else.
+- It prints two URLs when it starts:
+  - `http://127.0.0.1:8000` — for you, on this machine.
+  - `http://<your-LAN-IP>:8000` — **share this one with groupmates** on the same WiFi.
+- Open the `127.0.0.1` URL yourself first to confirm it loads before sharing the LAN one.
 
-## Part 3 — Sharing the URL with groupmates
+### Groupmates in a different location (not the same WiFi)
 
-By default the backend only binds to `127.0.0.1` — not reachable by anyone but you, even on the
-same WiFi.
-
-- **Same room/WiFi:** run `ipconfig`, find your WiFi adapter's "IPv4 Address," and have groupmates
-  browse to `http://<your-LAN-IP>:8000`. Requires changing `run_graid.ps1`'s last line from
-  `--host 127.0.0.1` to `--host 0.0.0.0` first.
-- **Different locations:** requires a tunneling tool (e.g. ngrok) to expose the local backend to
-  the internet — separate setup, ask if this is actually needed.
+The LAN URL won't reach them — use Cloudflare's quick tunnel instead. In a **second** PowerShell
+window (leave `run_graid.ps1` running in the first one):
+```powershell
+& "C:\Program Files (x86)\cloudflared\cloudflared.exe" tunnel --url http://localhost:8000
+```
+It prints a public link like `https://random-words.trycloudflare.com` — share that instead of
+the LAN URL. Notes:
+- The link changes every time you restart `cloudflared`, so re-share it each session.
+- It's publicly reachable by anyone with the link while the tunnel is running — only share it
+  with your groupmates, and close this window when done to shut it off.
+- Keep both PowerShell windows open at the same time (backend + tunnel).
 
 ## Part 0 — End of session (do this every time)
 

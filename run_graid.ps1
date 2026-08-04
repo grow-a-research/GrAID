@@ -44,6 +44,15 @@ if ($RemoteUrl) {
     Write-Host "No REMOTE_OCR_URL given - OCR endpoints will return 503 until one is set." -ForegroundColor Yellow
 }
 
+$LanIp = (Get-NetIPAddress -AddressFamily IPv4 -PrefixOrigin Dhcp, Manual -ErrorAction SilentlyContinue |
+    Where-Object { $_.IPAddress -notlike '169.254.*' } | Select-Object -First 1 -ExpandProperty IPAddress)
+
 Write-Host ""
-Write-Host "Starting GrAId at http://127.0.0.1:8000 (backend + built frontend, single process)..." -ForegroundColor Cyan
-& "$RepoRoot\venv\Scripts\python.exe" -m uvicorn main:app --host 127.0.0.1 --port 8000
+Write-Host "Starting GrAId (backend + built frontend, single process)..." -ForegroundColor Cyan
+Write-Host "  On this machine: http://127.0.0.1:8000" -ForegroundColor Cyan
+if ($LanIp) {
+    Write-Host "  Share with groupmates on the same WiFi: http://${LanIp}:8000" -ForegroundColor Cyan
+} else {
+    Write-Host "  Could not detect a LAN IP to share - run ipconfig manually if needed." -ForegroundColor Yellow
+}
+& "$RepoRoot\venv\Scripts\python.exe" -m uvicorn main:app --host 0.0.0.0 --port 8000
