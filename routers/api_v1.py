@@ -1917,6 +1917,8 @@ def _delete_submission_data(sub: m.Submission, db: Session) -> None:
     Physical scan files and aligned images are removed from disk.
     """
     for ans in list(sub.answers):
+        if ans.flag:
+            db.delete(ans.flag)
         db.delete(ans)
     for sf in list(sub.files):
         try:
@@ -1929,7 +1931,10 @@ def _delete_submission_data(sub: m.Submission, db: Session) -> None:
     if sub_dir.exists():
         shutil.rmtree(sub_dir, ignore_errors=True)
     # Remove cached student paper PDF
-    (_PAPERS_DIR / f"submission_{sub.id}.pdf").unlink(missing_ok=True)
+    try:
+        (_PAPERS_DIR / f"submission_{sub.id}.pdf").unlink(missing_ok=True)
+    except Exception:
+        pass
     db.delete(sub)
 
 

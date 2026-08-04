@@ -68,3 +68,26 @@ To avoid being billed while not actively working:
 **Do not Destroy** the instance unless you're fully done with it for the thesis — that wipes
 everything and the next session would need the full re-clone/upload/install/model-download setup
 from scratch.
+
+## Troubleshooting — a code fix doesn't seem to apply / weird silent errors
+
+If you restart the local backend after a code change and the bug still happens, but the
+PowerShell terminal you're watching shows nothing when you trigger it — you may have a second,
+stale `run_graid.ps1` still running in another window from earlier, and your browser is talking to
+that old process instead of the one you just restarted. Check for this before assuming the fix
+didn't work:
+
+```powershell
+Get-NetTCPConnection -LocalPort 8000 -State Listen | Select-Object OwningProcess
+```
+
+If this lists **more than one** process ID, you've found the problem. Check what each one is:
+```powershell
+Get-Process -Id <each-id-from-above>
+```
+Kill the stale one (keep the one matching the `Started server process [<id>]` line in the
+terminal you actually want):
+```powershell
+Stop-Process -Id <stale-id> -Force
+```
+Re-run the `Get-NetTCPConnection` check to confirm only one remains, then retry.
