@@ -180,7 +180,13 @@ def crop_lines(
 
 def qwen_ocr_lines(line_images: list[Image.Image]) -> list[str]:
     assert MODELS is not None
-    prompt = "Transcribe the handwritten text in this image line. Output only the text."
+    prompt = (
+        "Transcribe EXACTLY what is written in this image line, character-for-character. "
+        "Preserve all spelling errors, capitalization, and punctuation exactly as written. "
+        "Do not correct grammar or spelling. Do not add, remove, or rephrase any words. "
+        "If a word is illegible, transcribe your best visual guess — do not substitute a "
+        "real word. Output only the transcribed text, nothing else."
+    )
     texts: list[str] = []
     for img in line_images:
         messages = [
