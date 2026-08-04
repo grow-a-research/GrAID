@@ -4,7 +4,7 @@
 #
 # What it does:
 #   1. Checks for GROQ_API_KEY (needed for AI grading) - prompts once if missing.
-#   2. Asks for the current Colab REMOTE_OCR_URL (changes every Colab session).
+#   2. Asks for the current REMOTE_OCR_URL (the Vast.ai OCR server's address).
 #   3. Starts the backend, which also serves the built frontend at the same
 #      URL - one process, one browser tab, nothing else to juggle live.
 #
@@ -13,9 +13,9 @@
 #     so you never have to paste it live in front of panelists.
 #   - Rebuild the frontend if you've changed it since the last build:
 #       cd frontend; npm run build
-#   - Start the Colab notebook FIRST (Runtime > Run all, or reconnect if it
-#     was already running), get the fresh REMOTE_OCR_URL, THEN run this script.
-#   - Keep the Colab tab's keep-alive cell running throughout the demo.
+#   - Start the Vast.ai instance FIRST and confirm vast_ocr_server.py is
+#     running (see VAST_AI_DEMO_CHECKLIST.md), get its REMOTE_OCR_URL,
+#     THEN run this script.
 
 $RepoRoot = $PSScriptRoot
 Set-Location $RepoRoot
@@ -31,7 +31,7 @@ if (-not $env:GROQ_API_KEY) {
     Write-Host "GROQ_API_KEY already set for this session." -ForegroundColor Green
 }
 
-$RemoteUrl = Read-Host "Paste the current REMOTE_OCR_URL from your Colab notebook (leave blank to skip remote OCR)"
+$RemoteUrl = Read-Host "Paste the current REMOTE_OCR_URL from your Vast.ai OCR server (leave blank to skip remote OCR)"
 # Be forgiving if the whole printed line (including the "REMOTE_OCR_URL=" prefix) got pasted.
 if ($RemoteUrl -match '^REMOTE_OCR_URL=(.+)$') {
     $RemoteUrl = $Matches[1]

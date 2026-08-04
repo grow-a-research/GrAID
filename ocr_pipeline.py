@@ -29,9 +29,9 @@ from surya.detection import DetectionPredictor
 
 QWEN_MODEL_ID = os.getenv("QWEN_MODEL_ID", "Qwen/Qwen2.5-VL-7B-Instruct")
 
-# When set (e.g. to an ngrok URL pointing at a Colab notebook running
-# colab_ocr_server.ipynb), OCR is delegated to that remote server instead of
-# loading Surya/Qwen locally. Use this when the local GPU lacks enough VRAM.
+# When set (e.g. to a rented GPU instance running vast_ocr_server.py), OCR is
+# delegated to that remote server instead of loading Surya/Qwen locally. Use
+# this when the local GPU lacks enough VRAM.
 REMOTE_OCR_URL = os.getenv("REMOTE_OCR_URL", "").rstrip("/")
 
 
@@ -266,7 +266,7 @@ def run_ocr_pipeline(
 def _run_remote_ocr_pipeline(
     original: Image.Image,
 ) -> tuple[str, list[tuple[int, int, int, int]], Image.Image]:
-    """Send the image to the remote Colab OCR server and adapt its response
+    """Send the image to the remote OCR server and adapt its response
     to the same (full_text, boxes, boxed_image) shape as the local pipeline."""
     buf = io.BytesIO()
     original.convert("RGB").save(buf, format="PNG")

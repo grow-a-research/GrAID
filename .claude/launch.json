@@ -1,0 +1,27 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "backend-no-models",
+      "runtimeExecutable": "C:\\Users\\ASUS\\OneDrive\\Desktop\\Files\\John\\GrAID-Repo\\venv\\Scripts\\python.exe",
+      "runtimeArgs": [
+        "C:\\Users\\ASUS\\AppData\\Local\\Temp\\claude\\C--Users-ASUS-OneDrive-Desktop-Files-John-GrAID-Repo\\d9cf64ed-0851-440e-85b7-f6af19586c5f\\scratchpad\\run_dev_backend.py"
+      ],
+      "port": 8000
+    },
+    {
+      "name": "frontend-dev",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["run", "dev", "--prefix", "C:\\Users\\ASUS\\OneDrive\\Desktop\\Files\\John\\GrAID-Repo\\frontend"],
+      "port": 5173
+    },
+    {
+      "name": "backend-verify-8001",
+      "runtimeExecutable": "C:\\Users\\ASUS\\OneDrive\\Desktop\\Files\\John\\GrAID-Repo\\venv\\Scripts\\python.exe",
+      "runtimeArgs": [
+        "C:\\Users\\ASUS\\AppData\\Local\\Temp\\claude\\C--Users-ASUS-OneDrive-Desktop-Files-John-GrAID-Repo\\d9cf64ed-0851-440e-85b7-f6af19586c5f\\scratchpad\\run_dev_backend_8001.py"
+      ],
+      "port": 8001
+    }
+  ]
+}

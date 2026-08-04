@@ -1,16 +1,15 @@
 """
 vast_ocr_server.py — GrAId Remote OCR Server for a Vast.ai GPU instance.
 
-Serves the same /health and /ocr contract as colab_ocr_server.ipynb:
+Serves the /health and /ocr contract that ocr_pipeline.py's
+`_run_remote_ocr_pipeline()` expects from REMOTE_OCR_URL:
   - GET  /health -> 200 OK once models are loaded.
   - POST /ocr (multipart `file`) -> {"text": str, "boxes": [[x1,y1,x2,y2], ...],
                                       "boxed_image_png_base64": str}
-`ocr_pipeline.py`'s `_run_remote_ocr_pipeline()` is the client of this contract.
 
-Unlike the Colab notebook, this script runs from a full checkout of the repo
-on the Vast.ai instance, so it imports ocr_pipeline.py directly instead of
-duplicating its logic — behavior is guaranteed identical to the local-load
-path the thesis's CER/WER evaluation validates against.
+This script imports ocr_pipeline.py directly rather than duplicating its
+logic, so behavior is guaranteed identical to the local-load path the
+thesis's CER/WER evaluation validates against.
 
 Usage (on the Vast.ai instance, inside the repo checkout):
     pip install -r requirements.txt
