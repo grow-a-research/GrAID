@@ -15,7 +15,7 @@
 
 ## Phase 2 — OCR Pipeline ✅
 - Surya OCR for line/region detection
-- Qwen2.5-VL-7B-Instruct (4-bit quantization) for handwriting transcription
+- Qwen2.5-VL-7B-Instruct (8-bit quantization) for handwriting transcription
 - `SKIP_MODEL_LOAD=1` env var for fast data-platform-only startup
 - Legacy `/extract` endpoint — kept as a raw debug/test tool
 - Frontend: OCR Tool (under Tools menu)

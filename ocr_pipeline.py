@@ -81,16 +81,13 @@ def load_models() -> None:
         print("[Models] Surya CUDA move failed — running on CPU.")
 
     bnb_config = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_quant_type="nf4",
-        bnb_4bit_use_double_quant=True,
-        bnb_4bit_compute_dtype=torch.float16,
+        load_in_8bit=True,
     )
 
     print(f"[Models] Loading Qwen processor ({QWEN_MODEL_ID})...")
     qwen_processor = AutoProcessor.from_pretrained(QWEN_MODEL_ID, trust_remote_code=True)
 
-    print("[Models] Loading Qwen model in 4-bit (this may take several minutes)...")
+    print("[Models] Loading Qwen model in 8-bit (this may take several minutes)...")
     qwen_model = AutoModelForVision2Seq.from_pretrained(
         QWEN_MODEL_ID,
         quantization_config=bnb_config,
@@ -158,6 +155,92 @@ def _extract_surya_xyxy(pred: Any) -> list[tuple[int, int, int, int]]:
         x1, y1, x2, y2 = rect
         boxes.append((int(x1), int(y1), int(x2), int(y2)))
     return boxes
+
+
+def _vertical_overlap_ratio(
+    a: tuple[int, int, int, int], b: tuple[int, int, int, int]
+) -> float:
+    _, ay1, _, ay2 = a
+    _, by1, _, by2 = b
+    inter = min(ay2, by2) - max(ay1, by1)
+    if inter <= 0:
+        return 0.0
+    return inter / min(ay2 - ay1, by2 - by1)
+
+
+def merge_overlapping_boxes(
+    boxes: list[tuple[int, int, int, int]], overlap_thresh: float = 0.5
+) -> list[tuple[int, int, int, int]]:
+    """Merge line boxes whose vertical extents overlap significantly.
+
+    Surya occasionally emits multiple overlapping/partial detections for
+    the same physical line (denser handwriting, tight line spacing), which
+    then get OCR'd separately by Qwen as duplicate, partial reads of the
+    same text — each one incomplete, so the model fills gaps with guesses.
+    Merging them into a single full-width crop before OCR fixes this at
+    the source instead of downstream.
+    """
+    merged = list(boxes)
+    changed = True
+    while changed:
+        changed = False
+        merged.sort(key=lambda b: b[1])
+        next_merged: list[tuple[int, int, int, int]] = []
+        for box in merged:
+            for i, m in enumerate(next_merged):
+                if _vertical_overlap_ratio(box, m) > overlap_thresh:
+                    unioned = (
+                        min(m[0], box[0]), min(m[1], box[1]),
+                        max(m[2], box[2]), max(m[3], box[3]),
+                    )
+                    if unioned != m:
+                        changed = True
+                    next_merged[i] = unioned
+                    break
+            else:
+                next_merged.append(box)
+        merged = next_merged
+    return merged
+
+
+def _has_ink(
+    original_rgb: Image.Image,
+    box: tuple[int, int, int, int],
+    min_ink_ratio: float = 0.005,
+    min_row_spread: float = 0.2,
+) -> bool:
+    """Reject boxes over blank/near-blank regions (paper texture, faint
+    ruled lines, scan noise) before they reach Qwen. A crop with no real
+    content gives the model nothing to transcribe, so instead of
+    returning empty it hallucinates plausible-looking filler text.
+
+    A printed ruled line spans nearly the full crop width but only 1-3
+    pixel rows, so it can still pass a plain mean-darkness check (a thin
+    line across a wide crop adds up). Real handwriting has ink spread
+    across a meaningful fraction of the crop's height (ascenders,
+    x-height, descenders) — so require that shape too, not just a
+    darkness total.
+    """
+    w, h = original_rgb.size
+    x1, y1, x2, y2 = box
+    x1c, y1c = max(0, x1), max(0, y1)
+    x2c, y2c = min(w, x2), min(h, y2)
+    if x2c <= x1c or y2c <= y1c:
+        return False
+    crop = np.array(original_rgb.convert("L").crop((x1c, y1c, x2c, y2c)))
+    if crop.size == 0:
+        return False
+    dark_mask = crop < 180
+    dark_ratio = float(dark_mask.mean())
+    row_ink_ratio = dark_mask.mean(axis=1)
+    ink_rows = int((row_ink_ratio > 0.02).sum())
+    row_spread = ink_rows / crop.shape[0]
+    keep = dark_ratio >= min_ink_ratio and row_spread >= min_row_spread
+    print(
+        f"[InkFilter] box={box} dark_ratio={dark_ratio:.4f} "
+        f"row_spread={row_spread:.4f} keep={keep}"
+    )
+    return keep
 
 
 def crop_lines(
@@ -244,11 +327,16 @@ def run_ocr_pipeline(
     if REMOTE_OCR_URL:
         return _run_remote_ocr_pipeline(original)
 
-    det_img = preprocess_for_detection(original)
+    if os.getenv("SURYA_RAW_DETECT") == "1":
+        det_img = original.convert("RGB")
+    else:
+        det_img = preprocess_for_detection(original)
     preds = MODELS.surya_detector([det_img])
     pred0 = preds[0] if preds else None
     boxes = _extract_surya_xyxy(pred0)
+    boxes = merge_overlapping_boxes(boxes)
     boxes_sorted = sorted(boxes, key=lambda b: (b[1], b[0]))
+    boxes_sorted = [b for b in boxes_sorted if _has_ink(original, b)]
 
     boxed = draw_boxes(original, boxes_sorted)
 

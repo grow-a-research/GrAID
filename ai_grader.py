@@ -283,6 +283,9 @@ def correct_ocr_text(raw_text: str) -> str:
     """
     if not raw_text or not raw_text.strip():
         return raw_text
+    if os.getenv("SKIP_OCR_CORRECTION") == "1":
+        logger.info("OCR correction skipped (SKIP_OCR_CORRECTION=1) — using raw Qwen text.")
+        return raw_text
     try:
         corrected = _groq_call_with_retry(
             messages=[
