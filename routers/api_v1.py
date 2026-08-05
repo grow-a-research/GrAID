@@ -525,6 +525,29 @@ async def upload_submission_file(
     return row
 
 
+@router.delete("/submissions/{submission_id}/files/{file_id}", status_code=204)
+def delete_submission_file(
+    submission_id: int, file_id: int, db: Session = Depends(get_db)
+) -> None:
+    row = (
+        db.query(m.SubmissionFile)
+        .filter(
+            m.SubmissionFile.id == file_id,
+            m.SubmissionFile.submission_id == submission_id,
+        )
+        .first()
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="File not found")
+    abs_path = Path(__file__).resolve().parent.parent / row.stored_path
+    try:
+        abs_path.unlink(missing_ok=True)
+    except OSError:
+        pass
+    db.delete(row)
+    db.commit()
+
+
 # ---------------------------------------------------------------------------
 # OCR — run pipeline on all uploaded files for a submission
 # ---------------------------------------------------------------------------

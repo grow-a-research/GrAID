@@ -197,12 +197,24 @@ export default function SubmissionsPage() {
     if (!selectedSub || !uploadFile) return
     setUploading(true); setUploadErr('')
     try {
-      await api.submissions.uploadFile(selectedSub.id, uploadFile)
+      const existingPages = selectedSub.files?.map(f => f.page_number) ?? []
+      const nextPage = existingPages.length ? Math.max(...existingPages) + 1 : 1
+      await api.submissions.uploadFile(selectedSub.id, uploadFile, nextPage)
       mergeFullSubmission(await api.submissions.get(selectedSub.id))
       setUploadFile(null)
       if (selectedExam) setSubmissions(await api.exams.submissions(selectedExam.id))
     } catch (err) { setUploadErr(err.message) }
     setUploading(false)
+  }
+
+  async function deleteFile(f) {
+    if (!selectedSub) return
+    setUploadErr('')
+    try {
+      await api.submissions.deleteFile(selectedSub.id, f.id)
+      mergeFullSubmission(await api.submissions.get(selectedSub.id))
+      if (selectedExam) setSubmissions(await api.exams.submissions(selectedExam.id))
+    } catch (err) { setUploadErr(err.message) }
   }
 
   async function processPaper() {
@@ -600,7 +612,13 @@ export default function SubmissionsPage() {
                   {selectedSub.files.map(f => (
                     <div key={f.id} className="flex items-center gap-2 text-xs text-zinc-400">
                       <span className="text-emerald-400">✓</span>
-                      Page {f.page_number}: {f.original_filename}
+                      <span className="flex-1">Page {f.page_number}: {f.original_filename}</span>
+                      <button type="button"
+                        className="text-zinc-500 hover:text-red-400"
+                        title="Remove this page"
+                        onClick={() => deleteFile(f)}>
+                        ✕
+                      </button>
                     </div>
                   ))}
                 </div>

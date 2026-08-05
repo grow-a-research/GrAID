@@ -102,6 +102,7 @@ export const api = {
     delete: (id) => req('DELETE', `${V1}/submissions/${id}`),
     uploadFile: (id, file, page = 1) =>
       upload(`${V1}/submissions/${id}/files`, file, `?page_number=${page}`),
+    deleteFile: (id, fileId) => req('DELETE', `${V1}/submissions/${id}/files/${fileId}`),
     runOcr: (id) => req('POST', `${V1}/submissions/${id}/ocr`),
     grade: (id, params = {}) => {
       const qs = new URLSearchParams(params).toString()

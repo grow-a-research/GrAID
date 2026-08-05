@@ -26,6 +26,8 @@ from transformers import (
 )
 from surya.detection import DetectionPredictor
 
+from ocr_alignment import preprocess_crop
+
 
 QWEN_MODEL_ID = os.getenv("QWEN_MODEL_ID", "Qwen/Qwen2.5-VL-7B-Instruct")
 
@@ -208,18 +210,21 @@ def _has_ink(
     box: tuple[int, int, int, int],
     min_ink_ratio: float = 0.005,
     min_row_spread: float = 0.2,
+    min_sharpness: float = 150.0,
 ) -> bool:
     """Reject boxes over blank/near-blank regions (paper texture, faint
-    ruled lines, scan noise) before they reach Qwen. A crop with no real
-    content gives the model nothing to transcribe, so instead of
-    returning empty it hallucinates plausible-looking filler text.
+    ruled lines, scan noise, photographic shadows/folds) before they reach
+    Qwen. A crop with no real content gives the model nothing to
+    transcribe, so instead of returning empty it hallucinates
+    plausible-looking filler text.
 
     A printed ruled line spans nearly the full crop width but only 1-3
     pixel rows, so it can still pass a plain mean-darkness check (a thin
-    line across a wide crop adds up). Real handwriting has ink spread
-    across a meaningful fraction of the crop's height (ascenders,
-    x-height, descenders) — so require that shape too, not just a
-    darkness total.
+    line across a wide crop adds up) — reject those via row_spread. A
+    photographic shadow/fold can have real darkness spread across many
+    rows too (unlike a ruled line), so also require edge sharpness: ink
+    strokes are high-frequency/sharp, a shadow gradient is smooth/low-
+    frequency, even at similar darkness and row-spread.
     """
     w, h = original_rgb.size
     x1, y1, x2, y2 = box
@@ -235,12 +240,41 @@ def _has_ink(
     row_ink_ratio = dark_mask.mean(axis=1)
     ink_rows = int((row_ink_ratio > 0.02).sum())
     row_spread = ink_rows / crop.shape[0]
-    keep = dark_ratio >= min_ink_ratio and row_spread >= min_row_spread
+    sharpness = float(cv2.Laplacian(crop, cv2.CV_64F).var())
+    keep = (
+        dark_ratio >= min_ink_ratio
+        and row_spread >= min_row_spread
+        and sharpness >= min_sharpness
+    )
     print(
         f"[InkFilter] box={box} dark_ratio={dark_ratio:.4f} "
-        f"row_spread={row_spread:.4f} keep={keep}"
+        f"row_spread={row_spread:.4f} sharpness={sharpness:.2f} keep={keep}"
     )
     return keep
+
+
+def _trim_to_content(
+    img: Image.Image, ink_threshold: float = 0.02, margin_px: int = 40
+) -> Image.Image:
+    """Crop away large trailing blank margin BEFORE running line detection.
+
+    Answer boxes are drawn generously in the template to fit the longest
+    expected answer, so short answers leave a big blank region below them.
+    Handing Surya a mostly-blank crop makes faint scan artifacts (shadows,
+    folds) relatively prominent enough to be misdetected as text — the same
+    artifact is easily ignored in a full-page image where real content
+    dominates. Trimming to where content actually ends removes the false
+    signal at the source instead of trying to filter bad detections after
+    the fact.
+    """
+    gray = np.array(img.convert("L"))
+    ink_rows = np.where((gray < 180).mean(axis=1) > ink_threshold)[0]
+    if ink_rows.size == 0:
+        return img
+    cutoff = min(gray.shape[0], int(ink_rows.max()) + margin_px)
+    if cutoff >= gray.shape[0] - 5:
+        return img
+    return img.crop((0, 0, img.width, cutoff))
 
 
 def crop_lines(
@@ -327,6 +361,8 @@ def run_ocr_pipeline(
     if REMOTE_OCR_URL:
         return _run_remote_ocr_pipeline(original)
 
+    original = _trim_to_content(original)
+
     if os.getenv("SURYA_RAW_DETECT") == "1":
         det_img = original.convert("RGB")
     else:
@@ -344,6 +380,7 @@ def run_ocr_pipeline(
         return "", [], boxed
 
     line_crops = crop_lines(original, boxes_sorted)
+    line_crops = [preprocess_crop(c) for c in line_crops]
     line_texts = qwen_ocr_lines(line_crops)
     clean_lines = [" ".join(t.split()) for t in line_texts if t and t.strip()]
     full_text = "\n".join(clean_lines).strip()

@@ -300,8 +300,11 @@ def crop_region(
     y1  = max(0,             int(_mm_to_px(region["y1_mm"]    - top_padding_mm, dpi)))
     x2  = min(warped.width,  int(_mm_to_px(region["x2_mm"]    + padding_mm,     dpi)))
     y2  = min(warped.height, int(_mm_to_px(region["y2_mm"]    + padding_mm,     dpi)))
-    raw_crop = warped.crop((x1, y1, x2, y2))
-    return preprocess_crop(raw_crop)
+    # Deliberately NOT calling preprocess_crop() here — contrast/sharpen is now
+    # applied per detected line inside ocr_pipeline.py, after Surya has found
+    # real text. Enhancing the whole (often mostly-blank) answer box before
+    # detection amplifies scan artifacts (shadows, folds) into false "text".
+    return warped.crop((x1, y1, x2, y2)).convert("RGB")
 
 
 def crop_content_area(
