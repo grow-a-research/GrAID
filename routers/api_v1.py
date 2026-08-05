@@ -554,7 +554,7 @@ def delete_submission_file(
 
 
 @router.post("/submissions/{submission_id}/ocr", response_model=OcrResult)
-async def run_submission_ocr(
+def run_submission_ocr(
     submission_id: int,
     db: Session = Depends(get_db),
 ) -> OcrResult:
@@ -1323,7 +1323,7 @@ def grade_submission(
 
 
 @router.post("/exams/{exam_id}/submissions/process-all", response_model=BulkProcessResult)
-async def bulk_process_submissions(
+def bulk_process_submissions(
     exam_id: int,
     db: Session = Depends(get_db),
 ) -> BulkProcessResult:
