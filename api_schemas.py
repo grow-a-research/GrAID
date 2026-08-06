@@ -329,6 +329,10 @@ class BulkProcessResult(BaseModel):
     errors: list[str] = []
 
 
+class BulkProcessStatus(BaseModel):
+    processing: bool
+
+
 # --- Phase 21: Queue status ---
 class QueueCurrentJob(BaseModel):
     submission_id: int

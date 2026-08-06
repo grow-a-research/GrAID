@@ -93,6 +93,7 @@ export const api = {
       clear: (examId) => req('DELETE', `${V1}/exams/${examId}/rubrics`),
     },
     processAll: (examId) => req('POST', `${V1}/exams/${examId}/submissions/process-all`),
+    processAllStatus: (examId) => req('GET', `${V1}/exams/${examId}/submissions/process-all/status`),
   },
 
   // ── Submissions ────────────────────────────────────────────────────────────

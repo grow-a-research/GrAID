@@ -72,6 +72,7 @@ export default function SubmissionsPage() {
   // background queue
   const [queueStatus, setQueueStatus] = useState(null)
   const queuePollRef = useRef(null)
+  const bulkPollRef = useRef(null)
 
   useEffect(() => { api.exams.list().then(setExams).catch(() => {}) }, [])
 
@@ -80,6 +81,16 @@ export default function SubmissionsPage() {
   useEffect(() => {
     if (!selectedExam) { setSubmissions([]); return }
     api.exams.submissions(selectedExam.id).then(setSubmissions).catch(() => setSubmissions([]))
+  }, [selectedExam?.id])
+
+  // Bulk "process all" runs server-side and can outlive this component (e.g. you
+  // navigate away mid-batch and come back, or a groupmate started it on another
+  // machine) — check real server state on arrival instead of assuming idle.
+  useEffect(() => {
+    if (!selectedExam) return
+    api.exams.processAllStatus(selectedExam.id)
+      .then(s => { if (s.processing) { setBulkProcessing(true); startBulkPolling() } })
+      .catch(() => {})
   }, [selectedExam?.id])
 
   // Loads full submission detail (files, etc.) whenever the shared selected submission
@@ -121,9 +132,26 @@ export default function SubmissionsPage() {
     e.target.value = ''
   }
 
+  const startBulkPolling = useCallback(() => {
+    if (bulkPollRef.current) return   // already polling
+    bulkPollRef.current = setInterval(async () => {
+      try {
+        const s = await api.exams.processAllStatus(selectedExam.id)
+        if (!s.processing) {
+          clearInterval(bulkPollRef.current)
+          bulkPollRef.current = null
+          setBulkProcessing(false)
+          // Refresh submission list now that the batch has drained
+          try { setSubmissions(await api.exams.submissions(selectedExam.id)) } catch {}
+        }
+      } catch {}
+    }, 2000)
+  }, [selectedExam])
+
   async function bulkProcessAll() {
     if (!selectedExam) return
     setBulkProcessing(true); setBulkResult(null)
+    startBulkPolling()   // catches completion even if this tab navigates away and back
     try {
       const result = await api.exams.processAll(selectedExam.id)
       setBulkResult(result)
