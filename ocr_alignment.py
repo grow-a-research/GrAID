@@ -2,10 +2,17 @@
 ocr_alignment.py — Phase 5/8: Scan alignment, preprocessing, and per-question region cropping.
 
 Full pipeline for each uploaded scan:
-  1. preprocess_scan()  — denoise, deskew, contrast-enhance the raw image.
-  2. detect_and_warp()  — detect ArUco markers, compute RANSAC homography, warp to template space.
-  3. crop_region()      — crop each answer box using region_json (mm → pixels).
-  4. preprocess_crop()  — sharpen and enhance contrast on each cropped region before OCR.
+  1. detect_and_warp()  — detect ArUco markers on a cleaned-up throwaway copy,
+                          compute RANSAC homography, then warp the ORIGINAL
+                          (unedited) pixels to template space.
+  2. crop_region()      — crop each answer box using region_json (mm → pixels)
+                          from the warped-but-unedited image.
+
+Cleanup filters (denoise/deskew/CLAHE/sharpen) are only ever used to help
+marker detection or as a last-resort fallback crop — the pixels actually
+handed to OCR are always the real, unedited scan, since stacking multiple
+filters before Qwen sees the image was found to hurt transcription quality
+more than it helped.
 
 If fewer than 2 markers are detected, detect_and_warp() returns (preprocessed_image, False)
 and the caller should fall back to full-page OCR on the content area only.
@@ -168,6 +175,20 @@ def preprocess_scan(scan: Image.Image) -> Image.Image:
     return Image.fromarray(rgb)
 
 
+def _detection_copy(rgb: np.ndarray) -> np.ndarray:
+    """
+    Denoise + contrast-boost only — deliberately NOT deskewed, so pixel
+    positions stay identical to the original image. Used only to make ArUco
+    marker detection more reliable; the resulting homography is then applied
+    to the original, unedited pixels (see detect_and_warp), so denoise/CLAHE
+    artifacts never reach Qwen. If deskew ran here too, marker corners would
+    be found at rotated coordinates that no longer match the original image,
+    and warping the original with that homography would be wrong.
+    """
+    rgb = _denoise(rgb)
+    return _enhance_contrast(rgb)
+
+
 # ── Preprocessing — crop level (before OCR) ───────────────────────────────────
 
 def _sharpen(rgb: np.ndarray) -> np.ndarray:
@@ -203,8 +224,9 @@ def detect_and_warp(
 ) -> tuple[Image.Image, bool]:
     """
     Detect ArUco markers on *scan* and warp it to template coordinate space.
-    Preprocessing (denoise / deskew / CLAHE) is applied automatically before
-    marker detection to improve reliability on phone photos.
+    Marker detection runs on a denoise+contrast-boosted throwaway copy for
+    reliability on phone photos, but the perspective warp is applied to the
+    original, unedited pixels — see _detection_copy().
 
     Parameters
     ----------
@@ -221,10 +243,12 @@ def detect_and_warp(
     out_w = int(_mm_to_px(template_spec["page_width_mm"],  dpi))
     out_h = int(_mm_to_px(template_spec["page_height_mm"], dpi))
 
-    # Preprocess before detection
-    preprocessed = preprocess_scan(scan)
-    scan_rgb     = np.array(preprocessed)
-    gray         = cv2.cvtColor(scan_rgb, cv2.COLOR_RGB2GRAY)
+    # Detect markers on a cleaned-up throwaway copy (denoise + contrast only,
+    # no deskew — see _detection_copy), but warp the ORIGINAL pixels below.
+    # This keeps denoise/CLAHE/resample artifacts out of what Qwen sees.
+    original_rgb = np.array(scan.convert("RGB"))
+    detect_rgb   = _detection_copy(original_rgb)
+    gray         = cv2.cvtColor(detect_rgb, cv2.COLOR_RGB2GRAY)
 
     corners_list, ids, _ = _DETECTOR.detectMarkers(gray)
 
@@ -233,7 +257,7 @@ def detect_and_warp(
         logger.warning(
             "ArUco: only %d marker(s) detected — falling back to full-page OCR", n_found
         )
-        return preprocessed, False   # return preprocessed even on fallback
+        return preprocess_scan(scan), False
 
     template_corners = _template_marker_corners(template_spec)
     ids_flat = ids.flatten().tolist()
@@ -249,7 +273,7 @@ def detect_and_warp(
     matched = len(src_pts)
     if matched < 2:
         logger.warning("ArUco: %d matched marker(s) — need ≥2", matched)
-        return preprocessed, False
+        return preprocess_scan(scan), False
 
     src_all = np.concatenate(src_pts, axis=0)
     dst_all = np.concatenate(dst_pts, axis=0)
@@ -257,7 +281,7 @@ def detect_and_warp(
     H, mask = cv2.findHomography(src_all, dst_all, cv2.RANSAC, ransacReprojThreshold=5.0)
     if H is None:
         logger.warning("ArUco: findHomography returned None")
-        return preprocessed, False
+        return preprocess_scan(scan), False
 
     inliers = int(mask.sum()) if mask is not None else "?"
     logger.info(
@@ -266,7 +290,7 @@ def detect_and_warp(
     )
 
     warped_np = cv2.warpPerspective(
-        scan_rgb, H, (out_w, out_h),
+        original_rgb, H, (out_w, out_h),
         flags=cv2.INTER_LINEAR,
         borderMode=cv2.BORDER_CONSTANT,
         borderValue=(255, 255, 255),
@@ -282,8 +306,8 @@ def crop_region(
     top_padding_mm: float = 0.5,
 ) -> Image.Image:
     """
-    Crop a single answer region from a perspective-corrected image,
-    then apply crop-level preprocessing (CLAHE + sharpen) before returning.
+    Crop a single answer region from the perspective-corrected (but
+    otherwise unedited) image.
 
     Parameters
     ----------
@@ -300,8 +324,10 @@ def crop_region(
     y1  = max(0,             int(_mm_to_px(region["y1_mm"]    - top_padding_mm, dpi)))
     x2  = min(warped.width,  int(_mm_to_px(region["x2_mm"]    + padding_mm,     dpi)))
     y2  = min(warped.height, int(_mm_to_px(region["y2_mm"]    + padding_mm,     dpi)))
-    raw_crop = warped.crop((x1, y1, x2, y2))
-    return preprocess_crop(raw_crop)
+    # No preprocess_crop() here — hand OCR the real, unedited pixels (same as
+    # the OCR Tool's /extract path); run_ocr_pipeline does its own detection-
+    # only preprocessing internally without touching what Qwen sees.
+    return warped.crop((x1, y1, x2, y2)).convert("RGB")
 
 
 def crop_content_area(
@@ -313,7 +339,7 @@ def crop_content_area(
     area below the header line to exclude question prompts and header text.
 
     Uses HEADER_LINE_Y from the template spec (default 55mm) as the top boundary.
-    Returns the preprocessed content area as a PIL Image.
+    Returns the unedited content area as a PIL Image.
     """
     dpi          = float(template_spec.get("dpi", 300)) if template_spec else 300
     header_y_mm  = 55.0   # matches HEADER_LINE_Y in pdf_generator.py
@@ -329,4 +355,4 @@ def crop_content_area(
     y2    = min(img_h, int(y2 * scale))
 
     cropped = scan.crop((0, y1, img_w, y2))
-    return preprocess_crop(cropped)
+    return cropped.convert("RGB")
