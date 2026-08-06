@@ -117,7 +117,7 @@ def _process_job_sync(job: dict) -> None:
     from ai_grader import GradeResult, correct_ocr_text, grade_answer
     from ocr_alignment import crop_content_area, crop_region, detect_and_warp
     from omr_engine import LOW_CONFIDENCE_THRESHOLD, detect_omr
-    from PIL import Image
+    from PIL import Image, ImageOps
 
     from database import SessionLocal
     import db_models as m
@@ -146,6 +146,14 @@ def _process_job_sync(job: dict) -> None:
                 .all()
             )
 
+        # Fallback full-page OCR (question_id=None, from a failed alignment) can
+        # only be safely graded against a real question when the exam has
+        # exactly one non-MCQ/TF question — see the grading loop below.
+        gradable_questions = [
+            q for q in questions if (q.question_type or "essay") not in ("mcq", "tf")
+        ]
+        fallback_question = gradable_questions[0] if len(gradable_questions) == 1 else None
+
         has_non_omr = (not template_spec) or any(
             (q.question_type or "essay") not in ("mcq", "tf") for q in questions
         )
@@ -170,7 +178,12 @@ def _process_job_sync(job: dict) -> None:
         # ── OCR ──────────────────────────────────────────────────────────────
         for sf in files:
             img_path = project_root / sf.stored_path
-            image    = Image.open(img_path).convert("RGB")
+            # exif_transpose: phone photos often store pixels in the sensor's
+            # native orientation with an EXIF tag saying how to rotate them
+            # for display — apply that before any processing, or ArUco
+            # alignment maps to the wrong physical corners once markers ARE
+            # detected, even though detection itself is rotation-agnostic.
+            image    = ImageOps.exif_transpose(Image.open(img_path)).convert("RGB")
             aligned  = False
 
             if template_spec:
@@ -244,7 +257,9 @@ def _process_job_sync(job: dict) -> None:
         for ans in answers:
             if not ans.ocr_text:
                 continue
-            question = db.get(m.ExamQuestion, ans.question_id) if ans.question_id else None
+            question = (
+                db.get(m.ExamQuestion, ans.question_id) if ans.question_id else fallback_question
+            )
             qtype    = (question.question_type if question else "essay") or "essay"
 
             if qtype == "essay":
@@ -262,6 +277,9 @@ def _process_job_sync(job: dict) -> None:
                     _flag(ans, "essay_score_zero", db)
                 elif result.confidence < 0.4:
                     _flag(ans, "essay_low_confidence", db)
+                if ans.question_id is None and question is None:
+                    ans.status = "needs_review"
+                    _flag(ans, "fallback_ocr_ambiguous_question", db)
 
             elif qtype in ("mcq", "tf"):
                 correct     = (question.correct_answer or "").strip().upper()

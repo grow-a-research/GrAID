@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse, Response, StreamingResponse
-from PIL import Image
+from PIL import Image, ImageOps
 from sqlalchemy.orm import Session
 
 import db_models as m
@@ -25,6 +25,7 @@ from api_schemas import (
     BatchUploadResult,
     BulkEnrollResult,
     BulkProcessResult,
+    BulkProcessStatus,
     ClassAnalytics,
     QueueEnqueueResult,
     QueueStatus,
@@ -64,6 +65,14 @@ from database import get_db
 router = APIRouter(prefix="/api/v1", tags=["platform"])
 
 DATA_ROOT = Path(__file__).resolve().parent.parent / "data" / "submissions"
+
+# Exam IDs currently running through bulk_process_submissions. Guards against
+# a second bulk-process request for the same exam overlapping the first —
+# e.g. the frontend's "process all" button state lives only in that browser
+# tab and resets on navigation/remount, and the LAN-shared backend can have
+# multiple groupmates hitting it at once, so a frontend-only guard can't
+# prevent a duplicate concurrent run re-processing the same submissions.
+_BULK_PROCESSING_EXAMS: set[int] = set()
 
 
 def _ensure_data_root() -> None:
@@ -544,6 +553,23 @@ def delete_submission_file(
         abs_path.unlink(missing_ok=True)
     except OSError:
         pass
+
+    # Clean up any OCR/grading results already produced from this page —
+    # otherwise a stale SubmissionAnswer (and its flag) outlives the file it
+    # came from and keeps showing up / getting re-graded after "deletion".
+    stale_answers = (
+        db.query(m.SubmissionAnswer)
+        .filter(
+            m.SubmissionAnswer.submission_id == submission_id,
+            m.SubmissionAnswer.page_number == row.page_number,
+        )
+        .all()
+    )
+    for ans in stale_answers:
+        if ans.flag:
+            db.delete(ans.flag)
+        db.delete(ans)
+
     db.delete(row)
     db.commit()
 
@@ -624,7 +650,11 @@ def run_submission_ocr(
     for sf in files:
         img_path = project_root / sf.stored_path
         try:
-            image = Image.open(img_path).convert("RGB")
+            # exif_transpose: apply the phone photo's EXIF rotation before any
+            # processing, or ArUco alignment maps to the wrong physical
+            # corners once markers ARE detected (detection itself doesn't
+            # care about orientation, but the resulting warp does).
+            image = ImageOps.exif_transpose(Image.open(img_path)).convert("RGB")
         except Exception as e:
             raise HTTPException(
                 status_code=500, detail=f"Could not open page {sf.page_number}: {e}"
@@ -1218,11 +1248,29 @@ def grade_submission(
     exam = db.get(m.Exam, sub.exam_id)
     now  = datetime.now(timezone.utc)
 
+    # Fallback full-page OCR (question_id=None, from a failed alignment) can
+    # only be safely graded against a real question when the exam has
+    # exactly one non-MCQ/TF question — otherwise there's no way to know
+    # which question the full-page text is actually answering. Grading it
+    # against generic placeholders (wrong rubric, wrong max_points) instead
+    # of leaving it ambiguous silently produces a wrong score, so resolve it
+    # once here rather than defaulting blindly per-answer.
+    exam_questions = (
+        db.query(m.ExamQuestion).filter(m.ExamQuestion.exam_id == exam.id).all()
+        if exam else []
+    )
+    gradable_questions = [
+        q for q in exam_questions if (q.question_type or "essay") not in ("mcq", "tf")
+    ]
+    fallback_question = gradable_questions[0] if len(gradable_questions) == 1 else None
+
     for ans in answers:
         if not ans.ocr_text:
             continue
 
-        question = db.get(m.ExamQuestion, ans.question_id) if ans.question_id else None
+        question = (
+            db.get(m.ExamQuestion, ans.question_id) if ans.question_id else fallback_question
+        )
         qtype = (question.question_type if question else "essay") or "essay"
 
         if qtype == "essay":
@@ -1238,12 +1286,17 @@ def grade_submission(
                 ans.ai_feedback     = result.feedback
                 ans.groq_confidence = result.confidence
                 ans.status          = "graded"
-                # Auto-flag: zero score or low Groq confidence
-                max_pts_q = question.max_points if question else 10.0
                 if result.score == 0.0:
                     _auto_flag(ans, "essay_score_zero", db)
                 elif result.confidence < 0.4:
                     _auto_flag(ans, "essay_low_confidence", db)
+                # Fallback OCR that couldn't be matched to a single real
+                # question was graded against generic placeholders above —
+                # flag it so the teacher knows this score isn't against the
+                # real rubric, instead of it silently looking like a normal grade.
+                if ans.question_id is None and question is None:
+                    ans.status = "needs_review"
+                    _auto_flag(ans, "fallback_ocr_ambiguous_question", db)
             except Exception as e:
                 logger.error("Grading failed for answer %d: %s", ans.id, e)
                 ans.ai_feedback = f"[Grading error: {e}]"
@@ -1331,13 +1384,42 @@ def bulk_process_submissions(
     Phase 20: Run OCR + AI grading for every 'submitted' submission in an exam.
 
     Processes submissions sequentially; errors on individual submissions are
-    captured per-entry and do not abort the whole batch.
+    captured per-entry and do not abort the whole batch. Each submission gets
+    its own short-lived database session opened inside the loop, instead of
+    holding the request's one injected session for the whole batch — a batch
+    of several submissions can take minutes (remote OCR + Groq grading per
+    submission), and holding a single pooled connection that long starves
+    every other concurrent request (results pages, single-submission
+    processing) of connections from the same small pool.
     Uses default fuzzy thresholds (full=0.85, partial=0.60) for Identification.
     """
+    if exam_id in _BULK_PROCESSING_EXAMS:
+        raise HTTPException(
+            status_code=409,
+            detail="Bulk processing is already running for this exam — wait for it to finish.",
+        )
+    _BULK_PROCESSING_EXAMS.add(exam_id)
+    try:
+        return _run_bulk_process(exam_id, db)
+    finally:
+        _BULK_PROCESSING_EXAMS.discard(exam_id)
+
+
+@router.get("/exams/{exam_id}/submissions/process-all/status", response_model=BulkProcessStatus)
+def bulk_process_status(exam_id: int) -> BulkProcessStatus:
+    """Lets the frontend check whether a bulk-process batch is currently
+    running for this exam — from ANY browser tab/session, not just the one
+    that started it — so a loading indicator survives navigation/remount
+    instead of relying on local component state."""
+    return BulkProcessStatus(processing=exam_id in _BULK_PROCESSING_EXAMS)
+
+
+def _run_bulk_process(exam_id: int, db: Session) -> BulkProcessResult:
     import difflib
 
     import ocr_pipeline
     from ai_grader import GradeResult, correct_id_text, correct_ocr_text, grade_answer
+    from database import SessionLocal
     from ocr_alignment import crop_content_area, crop_region, detect_and_warp
     from omr_engine import LOW_CONFIDENCE_THRESHOLD, detect_omr
 
@@ -1354,6 +1436,15 @@ def bulk_process_submissions(
             .order_by(m.ExamQuestion.order_index)
             .all()
         )
+    questions_by_id = {q.id: q for q in questions}
+
+    # Fallback full-page OCR (question_id=None, from a failed alignment) can
+    # only be safely graded against a real question when the exam has
+    # exactly one non-MCQ/TF question — see _run_bulk_process's grading loop.
+    gradable_questions = [
+        q for q in questions if (q.question_type or "essay") not in ("mcq", "tf")
+    ]
+    fallback_question = gradable_questions[0] if len(gradable_questions) == 1 else None
 
     has_non_omr = (not template_spec) or any(
         (q.question_type or "essay") not in ("mcq", "tf") for q in questions
@@ -1361,30 +1452,39 @@ def bulk_process_submissions(
     if has_non_omr and ocr_pipeline.MODELS is None:
         raise HTTPException(status_code=503, detail="Models not loaded yet")
 
-    subs = (
-        db.query(m.Submission)
-        .filter(m.Submission.exam_id == exam_id, m.Submission.status == "submitted")
-        .all()
-    )
+    sub_ids = [
+        sid for (sid,) in (
+            db.query(m.Submission.id)
+            .filter(m.Submission.exam_id == exam_id, m.Submission.status == "submitted")
+            .all()
+        )
+    ]
 
     project_root = Path(__file__).resolve().parent.parent
     processed = 0
     failed    = 0
     errors: list[str] = []
 
-    for sub in subs:
-        files = (
-            db.query(m.SubmissionFile)
-            .filter(m.SubmissionFile.submission_id == sub.id)
-            .order_by(m.SubmissionFile.page_number)
-            .all()
-        )
-        if not files:
-            failed += 1
-            errors.append(f"Submission {sub.id} ({sub.student_id}): no files uploaded")
-            continue
-
+    for sub_id in sub_ids:
+        sub_db = SessionLocal()
         try:
+            sub = sub_db.get(m.Submission, sub_id)
+            if not sub:
+                failed += 1
+                errors.append(f"Submission {sub_id}: not found")
+                continue
+
+            files = (
+                sub_db.query(m.SubmissionFile)
+                .filter(m.SubmissionFile.submission_id == sub.id)
+                .order_by(m.SubmissionFile.page_number)
+                .all()
+            )
+            if not files:
+                failed += 1
+                errors.append(f"Submission {sub.id} ({sub.student_id}): no files uploaded")
+                continue
+
             dest_dir = DATA_ROOT / str(sub.id)
             dest_dir.mkdir(parents=True, exist_ok=True)
             now = datetime.now(timezone.utc)
@@ -1392,7 +1492,7 @@ def bulk_process_submissions(
             # ── OCR ──────────────────────────────────────────────────────────
             for sf in files:
                 img_path = project_root / sf.stored_path
-                image    = Image.open(img_path).convert("RGB")
+                image    = ImageOps.exif_transpose(Image.open(img_path)).convert("RGB")
                 aligned  = False
 
                 if template_spec:
@@ -1439,7 +1539,7 @@ def bulk_process_submissions(
                                 ans_status = "done"
 
                             existing = (
-                                db.query(m.SubmissionAnswer)
+                                sub_db.query(m.SubmissionAnswer)
                                 .filter(
                                     m.SubmissionAnswer.submission_id == sub.id,
                                     m.SubmissionAnswer.question_id  == q.id,
@@ -1453,7 +1553,7 @@ def bulk_process_submissions(
                                 existing.omr_confidence = omr_confidence
                                 existing.updated_at     = now
                             else:
-                                db.add(m.SubmissionAnswer(
+                                sub_db.add(m.SubmissionAnswer(
                                     submission_id=sub.id,
                                     question_id=q.id,
                                     page_number=sf.page_number,
@@ -1462,7 +1562,7 @@ def bulk_process_submissions(
                                     status=ans_status,
                                     omr_confidence=omr_confidence,
                                 ))
-                            db.commit()
+                            sub_db.commit()
 
                 if not aligned:
                     fallback = crop_content_area(image, template_spec)
@@ -1472,7 +1572,7 @@ def bulk_process_submissions(
                         [{"x1": b[0], "y1": b[1], "x2": b[2], "y2": b[3]} for b in boxes]
                     )
                     existing = (
-                        db.query(m.SubmissionAnswer)
+                        sub_db.query(m.SubmissionAnswer)
                         .filter(
                             m.SubmissionAnswer.submission_id == sub.id,
                             m.SubmissionAnswer.page_number  == sf.page_number,
@@ -1486,7 +1586,7 @@ def bulk_process_submissions(
                         existing.status     = "done"
                         existing.updated_at = now
                     else:
-                        db.add(m.SubmissionAnswer(
+                        sub_db.add(m.SubmissionAnswer(
                             submission_id=sub.id,
                             question_id=None,
                             page_number=sf.page_number,
@@ -1494,21 +1594,23 @@ def bulk_process_submissions(
                             boxes_json=boxes_data,
                             status="done",
                         ))
-                    db.commit()
+                    sub_db.commit()
 
             sub.status = "ocr_done"
-            db.commit()
+            sub_db.commit()
 
             # ── Grade ─────────────────────────────────────────────────────────
             answers = (
-                db.query(m.SubmissionAnswer)
+                sub_db.query(m.SubmissionAnswer)
                 .filter(m.SubmissionAnswer.submission_id == sub.id)
                 .all()
             )
             for ans in answers:
                 if not ans.ocr_text:
                     continue
-                question = db.get(m.ExamQuestion, ans.question_id) if ans.question_id else None
+                question = (
+                    questions_by_id.get(ans.question_id) if ans.question_id else fallback_question
+                )
                 qtype    = (question.question_type if question else "essay") or "essay"
 
                 if qtype == "essay":
@@ -1523,9 +1625,12 @@ def bulk_process_submissions(
                     ans.groq_confidence = result.confidence
                     ans.status          = "graded"
                     if result.score == 0.0:
-                        _auto_flag(ans, "essay_score_zero", db)
+                        _auto_flag(ans, "essay_score_zero", sub_db)
                     elif result.confidence < 0.4:
-                        _auto_flag(ans, "essay_low_confidence", db)
+                        _auto_flag(ans, "essay_low_confidence", sub_db)
+                    if ans.question_id is None and question is None:
+                        ans.status = "needs_review"
+                        _auto_flag(ans, "fallback_ocr_ambiguous_question", sub_db)
 
                 elif qtype in ("mcq", "tf"):
                     correct     = (question.correct_answer or "").strip().upper()
@@ -1542,10 +1647,10 @@ def bulk_process_submissions(
                     if ans.omr_confidence is not None and ans.omr_confidence < 0.30:
                         ans.ai_feedback += f" ⚠ Low OMR confidence ({ans.omr_confidence:.0%})."
                         ans.status = "needs_review"
-                        _auto_flag(ans, "omr_low_confidence", db)
+                        _auto_flag(ans, "omr_low_confidence", sub_db)
                     elif not ans.ocr_text.strip():
                         ans.status = "needs_review"
-                        _auto_flag(ans, "omr_no_detection", db)
+                        _auto_flag(ans, "omr_no_detection", sub_db)
                     else:
                         ans.status = "graded"
 
@@ -1571,18 +1676,20 @@ def bulk_process_submissions(
                     ans.ai_feedback = f"Expected: {correct}. Your answer: {given}. {verdict}"
                     ans.status      = "graded"
                     if score == 0.0:
-                        _auto_flag(ans, "identification_no_match", db)
+                        _auto_flag(ans, "identification_no_match", sub_db)
 
                 ans.updated_at = now
 
             sub.status = "graded"
-            db.commit()
+            sub_db.commit()
             processed += 1
 
         except Exception as exc:
-            logger.error("Bulk process: submission %d failed: %s", sub.id, exc)
+            logger.error("Bulk process: submission %d failed: %s", sub_id, exc)
             failed += 1
-            errors.append(f"Submission {sub.id}: {exc}")
+            errors.append(f"Submission {sub_id}: {exc}")
+        finally:
+            sub_db.close()
 
     return BulkProcessResult(processed=processed, failed=failed, errors=errors)
 

@@ -8,7 +8,7 @@ from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from PIL import Image
+from PIL import Image, ImageOps
 from pydantic import BaseModel
 
 import ocr_pipeline
@@ -81,7 +81,7 @@ async def extract(file: UploadFile = File(...)) -> ExtractResponse:
 
     raw = await file.read()
     try:
-        original = Image.open(io.BytesIO(raw)).convert("RGB")
+        original = ImageOps.exif_transpose(Image.open(io.BytesIO(raw))).convert("RGB")
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Could not decode image: {e}") from e
 
