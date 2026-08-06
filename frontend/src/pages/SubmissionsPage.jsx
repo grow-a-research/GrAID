@@ -58,7 +58,6 @@ export default function SubmissionsPage() {
   const [processing, setProcessing] = useState(false)
   const [processStep, setProcessStep] = useState('')   // 'ocr' | 'grade' | ''
   const [processErr, setProcessErr] = useState('')
-  const [qualityWarnings, setQualityWarnings] = useState([])
 
   // batch upload
   const batchRef = useRef(null)
@@ -219,13 +218,10 @@ export default function SubmissionsPage() {
 
   async function processPaper() {
     if (!selectedSub) return
-    setProcessing(true); setProcessErr(''); setQualityWarnings([])
+    setProcessing(true); setProcessErr('')
     try {
       setProcessStep('ocr')
-      const ocrResult = await api.submissions.runOcr(selectedSub.id)
-      if (ocrResult?.quality_warnings?.length) {
-        setQualityWarnings(ocrResult.quality_warnings)
-      }
+      await api.submissions.runOcr(selectedSub.id)
       setProcessStep('grade')
       await api.submissions.grade(selectedSub.id)
       mergeFullSubmission(await api.submissions.get(selectedSub.id))
@@ -646,13 +642,6 @@ export default function SubmissionsPage() {
                 )}
               </div>
               <ErrorBox msg={processErr} />
-              {qualityWarnings.length > 0 && (
-                <div className="mt-2 rounded border border-amber-500/40 bg-amber-950/40 p-2 text-xs text-amber-300">
-                  <p className="font-semibold mb-1">Scan quality warning</p>
-                  {qualityWarnings.map((w, i) => <p key={i}>{w}</p>)}
-                  <p className="mt-1 text-amber-400/70">OCR was still attempted — consider retaking the scan for better accuracy.</p>
-                </div>
-              )}
             </div>
           </>
         }
