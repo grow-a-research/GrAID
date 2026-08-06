@@ -200,36 +200,40 @@ def _parse_response(raw: str, max_points: float) -> tuple[float, str, float]:
 # ── Post-OCR correction ───────────────────────────────────────────────────────
 
 _OCR_CORRECTION_SYSTEM = """\
-You are an OCR post-processor for handwritten exam answers.
-The input is raw text extracted by an OCR model from a scanned answer box.
-It may contain artefacts from imperfect cropping or line detection.
+You are a text LAYOUT cleaner for OCR output of handwritten exam answers.
+You do not have access to the original image — only the raw transcribed
+text — so you have no way to tell whether an odd spelling is a genuine
+mistake the student made or a misread by the OCR model. Since grading may
+score spelling/grammar as part of the rubric, you must never guess at
+content: treat every word exactly as transcribed, right or wrong.
 
-Step 1 — STRIP any printed question text:
-  - Remove any leading line that looks like a printed question prompt
-    (e.g. lines starting with "Q1.", "Q2.", "Question", or ending with "?")
-  - The student's answer begins after the question prompt; keep only the answer.
+Your ONLY job is to fix how the text is LAID OUT, never what it says:
 
-Step 2 — FIX transcription errors caused by ambiguous handwriting:
-  - Misread letters (e.g. 'rn' → 'm', '0' vs 'O', '1' vs 'l', 'u' vs 'n')
-  - Garbled or missing special symbols
-  - Run-together words caused by unclear spacing
+1. STRIP a leading printed question line, if present:
+   - Remove a leading line that looks like a printed question prompt
+     (e.g. starts with "Q1.", "Question", or ends with "?")
+   - Keep only the student's answer text.
 
-Step 3 — RECONSTRUCT fragmented paragraphs:
-  - OCR line detection may have split one continuous paragraph into many short lines.
-  - Merge lines that are part of the same sentence or thought into one continuous paragraph.
-  - Only preserve a line break when it clearly marks the start of a new idea or paragraph.
-  - Do NOT split sentences that belong together just because they appeared on separate OCR lines.
+2. MERGE fragmented lines into paragraphs:
+   - OCR line detection may have split one continuous paragraph into many
+     short lines. Merge lines that are part of the same sentence/thought
+     into one continuous paragraph.
+   - Only keep a line break where it clearly marks the start of a new
+     paragraph.
 
-Step 4 — RESTRUCTURE into proper essay form:
-  - Capitalize the first letter of each sentence
-  - End sentences with appropriate punctuation (. ? !)
-  - Separate distinct paragraphs with a blank line
+3. Separate distinct paragraphs with a blank line.
 
-Rules (non-negotiable):
-- Do NOT add new content, expand ideas, or rephrase meaning
-- Do NOT remove content that belongs to the student's answer
-- Preserve the student's own words and vocabulary
-- Return ONLY the corrected and restructured answer text — no labels, no explanation"""
+Absolutely forbidden, even if it looks like an "obvious" fix:
+- Do NOT fix spelling — a misspelled word must stay exactly as transcribed
+- Do NOT fix grammar or word choice
+- Do NOT add, remove, or change any punctuation as a "correction" (only the
+  paragraph-break blank lines from rule 3 above are allowed)
+- Do NOT change, merge, or split any letters/words, even if the result
+  looks like a typo — an accidental "fix" here can erase a genuine student
+  mistake the rubric is meant to grade
+- Do NOT rephrase, expand, add content, or interpret meaning
+
+Return ONLY the cleaned-up text — no labels, no explanation."""
 
 _ID_CORRECTION_SYSTEM = """\
 You are an OCR post-processor for short handwritten identification answers.
