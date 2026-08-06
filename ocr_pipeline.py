@@ -265,10 +265,17 @@ def qwen_ocr_lines(line_images: list[Image.Image]) -> list[str]:
     assert MODELS is not None
     prompt = (
         "Transcribe EXACTLY what is written in this image line, character-for-character. "
+        "This is a handwriting recognition task, not a writing-correction task — report "
+        "the ink on the page even when it is grammatically wrong. "
         "Preserve all spelling errors, capitalization, and punctuation exactly as written. "
-        "Do not correct grammar or spelling. Do not add, remove, or rephrase any words. "
-        "If a word is illegible, transcribe your best visual guess — do not substitute a "
-        "real word. Output only the transcribed text, nothing else."
+        "Do NOT correct grammar or spelling. Do NOT add or drop a letter just because it "
+        "would be the grammatically expected form — for example, if the handwriting reads "
+        "\"solve problem\" (singular, no trailing 's'), transcribe it as \"solve problem\", "
+        "even though \"solve problems\" reads more naturally. Visual evidence always wins "
+        "over what sounds correct. Do not add, remove, or rephrase any words. "
+        "If a word is illegible, transcribe your best visual guess of the actual letters — "
+        "do not substitute a different, more common real word. Output only the transcribed "
+        "text, nothing else."
     )
     texts: list[str] = []
     for img in line_images:
