@@ -48,11 +48,12 @@ function downloadRubricsCsvTemplate() {
 }
 
 export default function ExamsPage() {
-  const { selectedExam: selected, selectExam: pickExam, updateSelectedExam: setSelected, clearWorkflow }
-    = useWorkflow()
+  const {
+    selectedClass, selectClass,
+    selectedExam: selected, selectExam: pickExam, updateSelectedExam: setSelected, clearWorkflow,
+  } = useWorkflow()
   const [classes, setClasses] = useState([])
   const [exams, setExams] = useState([])
-  const [filterClass, setFilterClass] = useState('')
   const [questions, setQuestions] = useState([])
 
   // create exam form
@@ -106,7 +107,7 @@ export default function ExamsPage() {
   const [savingQ, setSavingQ] = useState(false)
   const [saveQErr, setSaveQErr] = useState('')
 
-  useEffect(() => { loadClasses(); loadExams() }, [])
+  useEffect(() => { loadClasses(); loadExams(selectedClass?.id) }, [])
 
   // Loads question/template state for whichever exam is selected — runs on explicit
   // selection here, and also when arriving on this tab with an exam already picked
@@ -304,8 +305,8 @@ export default function ExamsPage() {
     } catch (err) { alert(`Delete failed: ${err.message}`) }
   }
 
-  const filteredExams = filterClass
-    ? exams.filter(ex => ex.class_id === parseInt(filterClass))
+  const filteredExams = selectedClass
+    ? exams.filter(ex => ex.class_id === selectedClass.id)
     : exams
 
   return (
@@ -333,8 +334,12 @@ export default function ExamsPage() {
         </form>
 
         <div className="flex flex-col gap-2">
-          <select className={tw.select} value={filterClass}
-            onChange={e => { setFilterClass(e.target.value); loadExams(e.target.value) }}>
+          <select className={tw.select} value={selectedClass?.id ?? ''}
+            onChange={e => {
+              const cls = classes.find(c => c.id === parseInt(e.target.value)) ?? null
+              selectClass(cls)
+              loadExams(cls?.id)
+            }}>
             <option value="">All classes</option>
             {classes.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
           </select>

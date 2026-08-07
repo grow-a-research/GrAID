@@ -200,6 +200,22 @@ def list_enrolled_students(class_id: int, db: Session = Depends(get_db)) -> list
     )
 
 
+@router.delete("/classes/{class_id}/enrollments/{student_id}", status_code=204)
+def unenroll_student(class_id: int, student_id: str, db: Session = Depends(get_db)) -> None:
+    student = db.query(m.Student).filter(m.Student.student_id == student_id.strip()).first()
+    if not student:
+        raise HTTPException(status_code=404, detail=f"Student not found: {student_id}")
+    row = (
+        db.query(m.Enrollment)
+        .filter(m.Enrollment.class_id == class_id, m.Enrollment.student_id == student.id)
+        .first()
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="Student is not enrolled in this class")
+    db.delete(row)
+    db.commit()
+
+
 @router.post("/classes/{class_id}/enrollments/bulk", response_model=BulkEnrollResult)
 def bulk_enroll_students(
     class_id: int,

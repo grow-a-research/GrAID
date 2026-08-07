@@ -27,9 +27,11 @@ function StatusBar({ status }) {
 
 export default function SubmissionsPage() {
   const {
+    selectedClass, selectClass,
     selectedExam, selectExam: pickExam,
     selectedSubmission: selectedSub, selectSubmission: pickSub, updateSelectedSubmission: setSelectedSub,
   } = useWorkflow()
+  const [classes, setClasses] = useState([])
   const [exams, setExams] = useState([])
   const [submissions, setSubmissions] = useState([])
 
@@ -74,7 +76,13 @@ export default function SubmissionsPage() {
   const queuePollRef = useRef(null)
   const bulkPollRef = useRef(null)
 
-  useEffect(() => { api.exams.list().then(setExams).catch(() => {}) }, [])
+  useEffect(() => { api.classes.list().then(setClasses).catch(() => {}) }, [])
+
+  // Re-loads the exam list whenever the shared selected class changes (including
+  // arriving here with a class already picked from Exams/Results).
+  useEffect(() => {
+    api.exams.list(selectedClass?.id).then(setExams).catch(() => setExams([]))
+  }, [selectedClass?.id])
 
   // Loads the submission list whenever the shared selected exam changes — covers both
   // an explicit pick here and arriving with an exam already selected from Exams/Results.
@@ -324,6 +332,16 @@ export default function SubmissionsPage() {
       <div className="flex flex-col gap-4">
         <h2 className={tw.heading}>Submissions</h2>
 
+        {/* Class filter — scopes both the create-form exam picker and the browse list below */}
+        <select className={tw.select} value={selectedClass?.id ?? ''}
+          onChange={e => {
+            const cls = classes.find(c => c.id === parseInt(e.target.value)) ?? null
+            selectClass(cls)
+          }}>
+          <option value="">All classes</option>
+          {classes.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
+        </select>
+
         {/* Create */}
         <form onSubmit={createSubmission} className={`${tw.card} flex flex-col gap-3`}>
           <div className={tw.label}>New submission</div>
@@ -343,15 +361,17 @@ export default function SubmissionsPage() {
 
         {/* Browse by exam */}
         <div className="flex flex-col gap-2">
-          <div className={tw.label}>Browse by exam</div>
-          {exams.map(ex => (
-            <button key={ex.id} type="button"
-              className={selectedExam?.id === ex.id ? tw.rowActive : tw.row}
-              onClick={() => pickExam(ex)}>
-              <div className="text-sm text-zinc-100">{ex.title}</div>
-              <span className="text-xs text-zinc-500">{ex.exam_code}</span>
-            </button>
-          ))}
+          <div className={tw.label}>Browse by exam{selectedClass ? ` — ${selectedClass.name}` : ''}</div>
+          {exams.length === 0
+            ? <Empty text="No exams in this class yet." />
+            : exams.map(ex => (
+              <button key={ex.id} type="button"
+                className={selectedExam?.id === ex.id ? tw.rowActive : tw.row}
+                onClick={() => pickExam(ex)}>
+                <div className="text-sm text-zinc-100">{ex.title}</div>
+                <span className="text-xs text-zinc-500">{ex.exam_code}</span>
+              </button>
+            ))}
         </div>
 
         {/* Submission list */}

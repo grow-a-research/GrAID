@@ -42,6 +42,8 @@ export const api = {
       req('POST', `${V1}/classes/${classId}/enrollments`, { student_id: studentId }),
     enrollBulk: (classId, studentIds) =>
       req('POST', `${V1}/classes/${classId}/enrollments/bulk`, { student_ids: studentIds }),
+    unenroll: (classId, studentId) =>
+      req('DELETE', `${V1}/classes/${classId}/enrollments/${studentId}`),
     analytics: (classId) => req('GET', `${V1}/classes/${classId}/analytics`),
   },
 

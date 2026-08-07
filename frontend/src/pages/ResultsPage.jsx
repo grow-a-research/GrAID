@@ -630,9 +630,11 @@ function AnswerCard({ answer, question, flag, onOverrideSaved, onFlagChange }) {
 
 export default function ResultsPage() {
   const {
+    selectedClass, selectClass,
     selectedExam, selectExam: pickExam,
     selectedSubmission: selectedSub, selectSubmission: pickSub, updateSelectedSubmission: setSelectedSub,
   } = useWorkflow()
+  const [classes, setClasses]           = useState([])
   const [exams, setExams]               = useState([])
   const [submissions, setSubmissions]   = useState([])
   const [answers, setAnswers]           = useState([])
@@ -642,7 +644,13 @@ export default function ResultsPage() {
   const [grading, setGrading]           = useState(false)
   const [gradeErr, setGradeErr]         = useState('')
 
-  useEffect(() => { api.exams.list().then(setExams).catch(() => {}) }, [])
+  useEffect(() => { api.classes.list().then(setClasses).catch(() => {}) }, [])
+
+  // Re-loads the exam list whenever the shared selected class changes (including
+  // arriving here with a class already picked from Exams/Submissions).
+  useEffect(() => {
+    api.exams.list(selectedClass?.id).then(setExams).catch(() => setExams([]))
+  }, [selectedClass?.id])
 
   // Loads exam-level data (submission list, questions, flag stats) whenever the shared
   // selected exam changes — covers both an explicit pick here and arriving with an exam
@@ -719,10 +727,20 @@ export default function ResultsPage() {
       <div className="flex flex-col gap-4">
         <h2 className={tw.heading}>Results</h2>
 
+        {/* Class filter — scopes the exam list below */}
+        <select className={tw.select} value={selectedClass?.id ?? ''}
+          onChange={e => {
+            const cls = classes.find(c => c.id === parseInt(e.target.value)) ?? null
+            selectClass(cls)
+          }}>
+          <option value="">All classes</option>
+          {classes.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
+        </select>
+
         <div className="flex flex-col gap-2">
-          <div className={tw.label}>Select exam</div>
+          <div className={tw.label}>Select exam{selectedClass ? ` — ${selectedClass.name}` : ''}</div>
           {exams.length === 0
-            ? <Empty text="No exams yet." />
+            ? <Empty text="No exams in this class yet." />
             : exams.map(ex => (
               <button key={ex.id} type="button"
                 className={selectedExam?.id === ex.id ? tw.rowActive : tw.row}

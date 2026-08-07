@@ -24,6 +24,11 @@ export default function ClassesPage() {
   const [bulkSelected, setBulkSelected] = useState(new Set())
   const [bulking, setBulking] = useState(false)
   const [bulkResult, setBulkResult] = useState(null)
+  const [bulkFilter, setBulkFilter] = useState('')
+
+  // enrolled list search + unenroll
+  const [enrolledFilter, setEnrolledFilter] = useState('')
+  const [unenrollingId, setUnenrollingId] = useState(null)
 
   // bulk enroll via CSV
   const csvRef = useRef(null)
@@ -42,6 +47,7 @@ export default function ClassesPage() {
   async function selectClass(cls) {
     setSelected(cls); setEnrollErr(''); setEnrollId('')
     setBulkSelected(new Set()); setBulkResult(null); setCsvBulkResult(null); setCsvToolsOpen(false)
+    setBulkFilter(''); setEnrolledFilter('')
     setLoadingEnrolled(true)
     try { setEnrolled(await api.classes.enrolled(cls.id)) } catch { setEnrolled([]) }
     setLoadingEnrolled(false)
@@ -69,6 +75,17 @@ export default function ClassesPage() {
     setEnrolling(false)
   }
 
+  async function unenrollStudent(studentId) {
+    if (!selected) return
+    if (!window.confirm(`Unenroll ${studentId} from ${selected.name}?`)) return
+    setUnenrollingId(studentId)
+    try {
+      await api.classes.unenroll(selected.id, studentId)
+      setEnrolled(prev => prev.filter(s => s.student_id !== studentId))
+    } catch (err) { alert(`Unenroll failed: ${err.message}`) }
+    setUnenrollingId(null)
+  }
+
   async function deleteClass(cls) {
     if (!window.confirm(`Delete class "${cls.name}" (${cls.code})?\n\nThis will also delete all its exams, submissions, and uploaded scans. This cannot be undone.`)) return
     try {
@@ -81,6 +98,18 @@ export default function ClassesPage() {
   // multi-select bulk enroll
   const enrolledIds = new Set(enrolled.map(s => s.student_id))
   const notEnrolled = students.filter(s => !enrolledIds.has(s.student_id))
+  const bulkFilterLower = bulkFilter.trim().toLowerCase()
+  const notEnrolledFiltered = bulkFilterLower
+    ? notEnrolled.filter(s =>
+        s.full_name.toLowerCase().includes(bulkFilterLower) ||
+        s.student_id.toLowerCase().includes(bulkFilterLower))
+    : notEnrolled
+  const enrolledFilterLower = enrolledFilter.trim().toLowerCase()
+  const enrolledFiltered = enrolledFilterLower
+    ? enrolled.filter(s =>
+        s.full_name.toLowerCase().includes(enrolledFilterLower) ||
+        s.student_id.toLowerCase().includes(enrolledFilterLower))
+    : enrolled
 
   function toggleBulk(studentId) {
     setBulkSelected(prev => {
@@ -90,10 +119,10 @@ export default function ClassesPage() {
     })
   }
   function toggleAllBulk() {
-    if (bulkSelected.size === notEnrolled.length) {
+    if (bulkSelected.size === notEnrolledFiltered.length) {
       setBulkSelected(new Set())
     } else {
-      setBulkSelected(new Set(notEnrolled.map(s => s.student_id)))
+      setBulkSelected(new Set(notEnrolledFiltered.map(s => s.student_id)))
     }
   }
 
@@ -124,15 +153,44 @@ export default function ClassesPage() {
     URL.revokeObjectURL(url)
   }
 
+  // Shared by both CSV and Excel import: given rows of cells, locates the ID
+  // column via its header ("student_id" / "id", case-insensitive, any
+  // position) — falls back to the first column when no header matches. Works
+  // for a bare single-column list of IDs or a multi-column sheet (e.g.
+  // student_id, full_name, email — extra columns are simply ignored).
+  function extractStudentIds(rows) {
+    const clean = (v) => (v === null || v === undefined) ? '' : String(v).trim()
+    const cleanRows = rows.map(r => r.map(clean)).filter(r => r.some(c => c !== ''))
+    if (cleanRows.length === 0) return []
+    const header = cleanRows[0].map(c => c.toLowerCase())
+    const idCol = header.findIndex(c => c === 'student_id' || c === 'id' || c === 'studentid')
+    const dataRows = idCol !== -1 ? cleanRows.slice(1) : cleanRows
+    const col = idCol !== -1 ? idCol : 0
+    return dataRows.map(r => r[col]).filter(Boolean)
+  }
+
+  function parseCsvStudentIds(text) {
+    const splitRow = (line) => line.split(',').map(cell => cell.trim().replace(/^"(.*)"$/, '$1'))
+    const lines = text.split(/\r?\n/).map(l => l.trim()).filter(Boolean)
+    return extractStudentIds(lines.map(splitRow))
+  }
+
+  async function parseExcelStudentIds(file) {
+    const XLSX = await import('xlsx')
+    const buf = await file.arrayBuffer()
+    const workbook = XLSX.read(buf, { type: 'array' })
+    const sheet = workbook.Sheets[workbook.SheetNames[0]]
+    const rows = XLSX.utils.sheet_to_json(sheet, { header: 1, raw: false, defval: '' })
+    return extractStudentIds(rows)
+  }
+
   async function importEnrollCsv(e) {
     const file = e.target.files?.[0]
     if (!file || !selected) return
     setCsvBulking(true); setCsvBulkResult(null)
     try {
-      const text = await file.text()
-      const lines = text.split(/\r?\n/).map(l => l.trim()).filter(Boolean)
-      // skip header row if it says "student_id"
-      const ids = lines[0]?.toLowerCase() === 'student_id' ? lines.slice(1) : lines
+      const isExcel = /\.(xlsx|xls)$/i.test(file.name)
+      const ids = isExcel ? await parseExcelStudentIds(file) : parseCsvStudentIds(await file.text())
       const result = await api.classes.enrollBulk(selected.id, ids)
       setCsvBulkResult(result)
       if (result.enrolled > 0) setEnrolled(await api.classes.enrolled(selected.id))
@@ -207,59 +265,73 @@ export default function ClassesPage() {
               <ErrorBox msg={enrollErr} />
             </form>
 
-            {/* Bulk enroll: multi-select */}
-            {notEnrolled.length > 0 && (
-              <div className={`${tw.card} flex flex-col gap-3`}>
-                <div className="flex items-center justify-between">
-                  <div className={tw.label}>Bulk enroll ({notEnrolled.length} not yet enrolled)</div>
-                  <button type="button"
-                    className="text-xs text-zinc-500 hover:text-zinc-300 underline underline-offset-2"
-                    onClick={() => setCsvToolsOpen(o => !o)}>
-                    {csvToolsOpen ? 'Hide CSV import' : 'Use CSV instead'}
-                  </button>
-                </div>
+            {/* Bulk enroll: multi-select + CSV — always available, independent of whether
+                anyone is currently unenrolled, since CSV import shouldn't disappear
+                just because the roster you already loaded happens to be fully enrolled. */}
+            <div className={`${tw.card} flex flex-col gap-3`}>
+              <div className="flex items-center justify-between">
+                <div className={tw.label}>Bulk enroll ({notEnrolled.length} not yet enrolled)</div>
+                <button type="button"
+                  className="text-xs text-zinc-500 hover:text-zinc-300 underline underline-offset-2"
+                  onClick={() => setCsvToolsOpen(o => !o)}>
+                  {csvToolsOpen ? 'Hide CSV import' : 'Use CSV instead'}
+                </button>
+              </div>
 
-                {csvToolsOpen && (
-                  <div className="flex flex-col gap-2 rounded-lg border border-zinc-800 bg-zinc-950/40 p-3">
-                    <div className="flex gap-2 flex-wrap">
-                      <button type="button" className={tw.btnSm} onClick={downloadEnrollTemplate}>
-                        Download CSV template
-                      </button>
-                      <label className={`${tw.btnSm} cursor-pointer`}>
-                        {csvBulking ? 'Importing…' : 'Upload CSV'}
-                        <input ref={csvRef} type="file" accept=".csv,text/csv" className="hidden"
-                          onChange={importEnrollCsv} disabled={csvBulking} />
-                      </label>
-                    </div>
-                    {csvBulkResult && !csvBulkResult.error && (
-                      <div className="text-xs text-emerald-400">
-                        {csvBulkResult.enrolled} enrolled · {csvBulkResult.skipped} skipped
-                        {csvBulkResult.errors?.length > 0 && (
-                          <div className="text-red-400 mt-0.5">{csvBulkResult.errors.join(' · ')}</div>
-                        )}
-                      </div>
-                    )}
-                    {csvBulkResult?.error && <div className="text-xs text-red-400">{csvBulkResult.error}</div>}
+              {csvToolsOpen && (
+                <div className="flex flex-col gap-2 rounded-lg border border-zinc-800 bg-zinc-950/40 p-3">
+                  <div className="flex gap-2 flex-wrap">
+                    <button type="button" className={tw.btnSm} onClick={downloadEnrollTemplate}>
+                      Download CSV template
+                    </button>
+                    <label className={`${tw.btnSm} cursor-pointer`}>
+                      {csvBulking ? 'Importing…' : 'Upload CSV / Excel'}
+                      <input ref={csvRef} type="file"
+                        accept=".csv,.xlsx,.xls,text/csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel"
+                        className="hidden"
+                        onChange={importEnrollCsv} disabled={csvBulking} />
+                    </label>
                   </div>
-                )}
+                  <div className="text-xs text-zinc-500">
+                    Accepts .csv or .xlsx/.xls — a bare list of IDs, or a sheet with a{' '}
+                    <code>student_id</code> column (extra columns like name are fine and ignored).
+                  </div>
+                  {csvBulkResult && !csvBulkResult.error && (
+                    <div className="text-xs text-emerald-400">
+                      {csvBulkResult.enrolled} enrolled · {csvBulkResult.skipped} skipped
+                      {csvBulkResult.errors?.length > 0 && (
+                        <div className="text-red-400 mt-0.5">{csvBulkResult.errors.join(' · ')}</div>
+                      )}
+                    </div>
+                  )}
+                  {csvBulkResult?.error && <div className="text-xs text-red-400">{csvBulkResult.error}</div>}
+                </div>
+              )}
 
-                {/* Checkbox list */}
+              {notEnrolled.length === 0
+                ? <div className="text-xs text-zinc-500">Every known student is already enrolled in this class.</div>
+                : <>
+                {/* Search + checkbox list */}
+                <input className={tw.input} placeholder="Search by name or ID…"
+                  value={bulkFilter} onChange={e => setBulkFilter(e.target.value)} />
                 <div className="max-h-48 overflow-y-auto flex flex-col gap-1 pr-1">
                   <label className="flex items-center gap-2 text-xs text-zinc-400 cursor-pointer select-none pb-1 border-b border-zinc-800">
                     <input type="checkbox" className="accent-emerald-500"
-                      checked={bulkSelected.size === notEnrolled.length && notEnrolled.length > 0}
+                      checked={bulkSelected.size === notEnrolledFiltered.length && notEnrolledFiltered.length > 0}
                       onChange={toggleAllBulk} />
-                    Select all
+                    Select all{bulkFilterLower ? ` (${notEnrolledFiltered.length} match)` : ''}
                   </label>
-                  {notEnrolled.map(s => (
-                    <label key={s.id} className="flex items-center gap-2 text-xs text-zinc-300 cursor-pointer select-none hover:text-zinc-100">
-                      <input type="checkbox" className="accent-emerald-500"
-                        checked={bulkSelected.has(s.student_id)}
-                        onChange={() => toggleBulk(s.student_id)} />
-                      <span className="font-medium">{s.student_id}</span>
-                      <span className="text-zinc-500">{s.full_name}</span>
-                    </label>
-                  ))}
+                  {notEnrolledFiltered.length === 0
+                    ? <div className="py-2 text-xs text-zinc-500">No matching students.</div>
+                    : notEnrolledFiltered.map(s => (
+                      <label key={s.id} className="flex items-center gap-2 text-xs text-zinc-300 cursor-pointer select-none hover:text-zinc-100">
+                        <input type="checkbox" className="accent-emerald-500"
+                          checked={bulkSelected.has(s.student_id)}
+                          onChange={() => toggleBulk(s.student_id)} />
+                        <span className="font-medium">{s.student_id}</span>
+                        <span className="text-zinc-500">{s.full_name}</span>
+                      </label>
+                    ))}
                 </div>
 
                 <div className="flex items-center gap-3">
@@ -276,23 +348,37 @@ export default function ClassesPage() {
                   )}
                   {bulkResult?.error && <span className="text-xs text-red-400">{bulkResult.error}</span>}
                 </div>
-              </div>
-            )}
+                </>
+              }
+            </div>
 
             {/* Enrolled list */}
             <div className={tw.label}>Enrolled ({enrolled.length})</div>
+            {enrolled.length > 0 && (
+              <input className={tw.input} placeholder="Search by name or ID…"
+                value={enrolledFilter} onChange={e => setEnrolledFilter(e.target.value)} />
+            )}
             {loadingEnrolled
               ? <div className={tw.muted}>Loading…</div>
               : enrolled.length === 0
                 ? <Empty text="No students enrolled." />
-                : <div className="flex flex-col gap-2">
-                    {enrolled.map(s => (
-                      <div key={s.id} className={tw.card}>
-                        <div className="text-sm text-zinc-100">{s.full_name}</div>
-                        <div className={tw.muted}>{s.student_id}</div>
-                      </div>
-                    ))}
-                  </div>
+                : enrolledFiltered.length === 0
+                  ? <div className="py-2 text-xs text-zinc-500">No matching students.</div>
+                  : <div className="flex flex-col gap-2">
+                      {enrolledFiltered.map(s => (
+                        <div key={s.id} className={`${tw.card} flex items-center justify-between gap-2`}>
+                          <div>
+                            <div className="text-sm text-zinc-100">{s.full_name}</div>
+                            <div className={tw.muted}>{s.student_id}</div>
+                          </div>
+                          <button type="button" onClick={() => unenrollStudent(s.student_id)}
+                            disabled={unenrollingId === s.student_id}
+                            className="text-xs text-zinc-600 hover:text-red-400 transition shrink-0 px-1">
+                            {unenrollingId === s.student_id ? '…' : '✕'}
+                          </button>
+                        </div>
+                      ))}
+                    </div>
             }
           </>
         }
