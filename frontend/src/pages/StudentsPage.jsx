@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { api } from '../api'
 import { tw, ErrorBox, Empty } from '../ui'
+import { toCsvFile } from '../lib/excelImport'
 
 function downloadCsvTemplate() {
   const csv = 'student_id,full_name,email\n2024-0001,Juan Dela Cruz,juan@example.com\n'
@@ -32,6 +33,10 @@ export default function StudentsPage() {
   const [editEmail, setEditEmail] = useState('')
   const [saving, setSaving] = useState(false)
 
+  // Bulk delete
+  const [selectedIds, setSelectedIds] = useState(new Set())
+  const [bulkDeleting, setBulkDeleting] = useState(false)
+
   useEffect(() => { loadStudents() }, [])
 
   async function loadStudents() {
@@ -59,7 +64,46 @@ export default function StudentsPage() {
     try {
       await api.students.delete(s.student_id)
       setStudents(prev => prev.filter(x => x.id !== s.id))
+      setSelectedIds(prev => { const next = new Set(prev); next.delete(s.student_id); return next })
     } catch (err) { alert(`Delete failed: ${err.message}`) }
+  }
+
+  function toggleSelect(studentId) {
+    setSelectedIds(prev => {
+      const next = new Set(prev)
+      if (next.has(studentId)) next.delete(studentId); else next.add(studentId)
+      return next
+    })
+  }
+
+  function toggleSelectAllVisible(visible) {
+    setSelectedIds(prev => {
+      const allSelected = visible.length > 0 && visible.every(s => prev.has(s.student_id))
+      if (allSelected) {
+        const next = new Set(prev)
+        visible.forEach(s => next.delete(s.student_id))
+        return next
+      }
+      const next = new Set(prev)
+      visible.forEach(s => next.add(s.student_id))
+      return next
+    })
+  }
+
+  async function bulkDeleteSelected() {
+    const ids = [...selectedIds]
+    if (ids.length === 0) return
+    if (!window.confirm(`Delete ${ids.length} selected student(s)?\n\nThis will also delete all their submissions. This cannot be undone.`)) return
+    setBulkDeleting(true)
+    try {
+      const result = await api.students.bulkDelete(ids)
+      await loadStudents()
+      setSelectedIds(new Set())
+      if (result.errors?.length > 0) {
+        alert(`${result.deleted} deleted. ${result.errors.length} error(s):\n${result.errors.join('\n')}`)
+      }
+    } catch (err) { alert(`Bulk delete failed: ${err.message}`) }
+    setBulkDeleting(false)
   }
 
   function startEdit(s) {
@@ -90,7 +134,8 @@ export default function StudentsPage() {
     if (!file) return
     setImporting(true); setImportResult(null)
     try {
-      const result = await api.students.import(file)
+      const csvFile = await toCsvFile(file)
+      const result = await api.students.import(csvFile)
       setImportResult(result)
       if (result.created > 0) await loadStudents()
     } catch (err) { setImportResult({ error: err.message }) }
@@ -125,19 +170,19 @@ export default function StudentsPage() {
           </button>
         </form>
 
-        {/* CSV import */}
+        {/* CSV / XLSX import */}
         <div className={`${tw.card} flex flex-col gap-2`}>
-          <div className={tw.label}>Bulk import via CSV</div>
+          <div className={tw.label}>Bulk import via CSV or Excel</div>
           <p className={tw.muted}>
-            CSV columns: <span className="font-mono text-zinc-300">student_id</span>,{' '}
+            Columns: <span className="font-mono text-zinc-300">student_id</span>,{' '}
             <span className="font-mono text-zinc-300">full_name</span>,{' '}
             <span className="font-mono text-zinc-300">email</span> (optional).
             Duplicate IDs are skipped.
           </p>
           <div className="flex gap-2 flex-wrap">
             <label className={`${tw.btnSm} cursor-pointer`}>
-              {importing ? 'Importing…' : 'Choose CSV file'}
-              <input ref={csvRef} type="file" accept=".csv,text/csv" className="hidden"
+              {importing ? 'Importing…' : 'Choose CSV/XLSX file'}
+              <input ref={csvRef} type="file" accept=".csv,.xlsx,text/csv" className="hidden"
                 onChange={importCsv} disabled={importing} />
             </label>
             <button type="button" className={tw.btnSm} onClick={downloadCsvTemplate}>
@@ -166,6 +211,23 @@ export default function StudentsPage() {
           <span className={tw.muted} style={{whiteSpace:'nowrap'}}>{filtered.length} / {students.length}</span>
         </div>
 
+        {filtered.length > 0 && (
+          <div className="flex items-center justify-between gap-3">
+            <label className="flex items-center gap-2 text-xs text-zinc-400 cursor-pointer select-none">
+              <input type="checkbox" className="accent-emerald-500"
+                checked={filtered.length > 0 && filtered.every(s => selectedIds.has(s.student_id))}
+                onChange={() => toggleSelectAllVisible(filtered)} />
+              Select all{search.trim() ? ` (${filtered.length} match)` : ''}
+            </label>
+            {selectedIds.size > 0 && (
+              <button type="button" className={tw.btnSm} onClick={bulkDeleteSelected} disabled={bulkDeleting}
+                style={{ color: '#f87171' }}>
+                {bulkDeleting ? 'Deleting…' : `Delete selected (${selectedIds.size})`}
+              </button>
+            )}
+          </div>
+        )}
+
         {filtered.length === 0
           ? <Empty text={students.length === 0 ? 'No students yet.' : 'No matches.'} />
           : <div className="flex flex-col gap-2">
@@ -192,6 +254,9 @@ export default function StudentsPage() {
                   ) : (
                     /* ── normal row ── */
                     <div className="flex items-center justify-between gap-3">
+                      <input type="checkbox" className="accent-emerald-500 shrink-0"
+                        checked={selectedIds.has(s.student_id)}
+                        onChange={() => toggleSelect(s.student_id)} />
                       <div className="flex-1">
                         <div className="text-sm font-medium text-zinc-100">{s.full_name}</div>
                         <div className={tw.muted}>ID: {s.student_id}</div>

@@ -38,6 +38,12 @@ MIN_FILL_RATIO: float = 0.12
 # Below this gap-based confidence the result is flagged for review
 LOW_CONFIDENCE_THRESHOLD: float = 0.30
 
+# Returned as the detected label when 2+ bubbles clear MIN_FILL_RATIO — a
+# student who marks more than one option has given an invalid answer
+# regardless of which mark is darkest, so callers should score this as
+# automatically wrong rather than picking a "winner" by fill amount.
+MULTIPLE_MARKS_LABEL: str = "Multiple bubbles marked"
+
 
 def _mm_to_px(mm: float, dpi: float) -> float:
     return mm * dpi / MM_PER_INCH
@@ -158,6 +164,14 @@ def detect_omr(
 
     if not fill_ratios:
         return None, 0.0, fill_ratios
+
+    # Two or more bubbles filled (e.g. a genuine double-mark, not a single
+    # fill plus a faint stray pen mark) is an invalid answer on any real
+    # answer sheet — don't let the highest fill ratio silently "win" a score.
+    filled = [label for label, ratio in fill_ratios.items() if ratio >= MIN_FILL_RATIO]
+    if len(filled) >= 2:
+        logger.info("OMR: %d bubbles filled (%s) — invalid multi-mark answer", len(filled), filled)
+        return MULTIPLE_MARKS_LABEL, 0.0, fill_ratios
 
     sorted_labels = sorted(fill_ratios, key=lambda l: fill_ratios[l], reverse=True)
     best   = sorted_labels[0]

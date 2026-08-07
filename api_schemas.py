@@ -79,11 +79,30 @@ class ExamRead(BaseModel):
 
 # --- Question ---
 # question_type: "essay" | "mcq" | "tf" | "identification"
+
+
+# --- Structured rubric (criteria x performance levels) ---
+class RubricLevel(BaseModel):
+    label: str = Field(..., min_length=1, max_length=128)
+    points: float = Field(..., ge=0)
+    description: str = Field(default="", max_length=2000)
+
+
+class RubricCriterion(BaseModel):
+    name: str = Field(..., min_length=1, max_length=255)
+    max_points: float = Field(..., ge=0)
+    levels: list[RubricLevel] = Field(default_factory=list)
+
+
 class ExamQuestionCreate(BaseModel):
     order_index: int = Field(default=1, ge=1)
     prompt: str = Field(..., min_length=1)
     question_type: str = Field(default="essay", max_length=32)
     rubric_text: str | None = Field(None)          # required for essay, optional otherwise
+    # Structured rubric — JSON-encoded list[RubricCriterion]. When present,
+    # takes over from rubric_text for grading/PDF export; max_points is
+    # recomputed server-side as the sum of criteria max_points.
+    rubric_criteria_json: str | None = None
     max_points: float = Field(default=10.0, ge=0)
     choices_json: str | None = None                 # MCQ only — JSON list of strings
     correct_answer: str | None = None               # MCQ letter, "True"/"False", or id string
@@ -93,6 +112,7 @@ class ExamQuestionUpdate(BaseModel):
     prompt: str | None = Field(None, min_length=1)
     question_type: str | None = Field(None, max_length=32)
     rubric_text: str | None = None
+    rubric_criteria_json: str | None = None
     max_points: float | None = Field(None, ge=0)
     choices_json: str | None = None
     correct_answer: str | None = None
@@ -108,6 +128,7 @@ class ExamQuestionRead(BaseModel):
     prompt: str
     question_type: str
     rubric_text: str | None
+    rubric_criteria_json: str | None
     max_points: float
     choices_json: str | None
     correct_answer: str | None
@@ -263,6 +284,12 @@ class BulkEnrollResult(BaseModel):
     errors: list[str]
 
 
+# --- Bulk delete students ---
+class BulkDeleteResult(BaseModel):
+    deleted: int
+    errors: list[str]
+
+
 # --- Phase 10: Question CSV import ---
 class QuestionImportResult(BaseModel):
     created: int
@@ -272,6 +299,12 @@ class QuestionImportResult(BaseModel):
 # --- Phase 15: Rubric CSV import ---
 class RubricImportResult(BaseModel):
     updated: int
+    errors: list[str]
+
+
+# --- Structured rubric CSV/XLSX parse (in-memory, no DB write) ---
+class RubricCriteriaParseResult(BaseModel):
+    criteria: list[RubricCriterion]
     errors: list[str]
 
 

@@ -9,6 +9,9 @@ Model used: llama-3.3-70b-versatile  (free tier, fast, strong reasoning)
 Public API
 ----------
 grade_answer(prompt, rubric, max_points, ocr_text) -> GradeResult
+grade_essay(prompt, rubric_text, rubric_criteria_json, max_points, ocr_text) -> EssayGradeResult
+    Dispatcher call sites should use — grades per-criterion when a structured
+    rubric is present, else falls back to the legacy holistic grade_answer() path.
 compute_cer(reference, hypothesis) -> float
 compute_wer(reference, hypothesis) -> float
 """
@@ -19,7 +22,7 @@ import logging
 import os
 import re
 import time
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 
 logger = logging.getLogger(__name__)
 
@@ -197,7 +200,334 @@ def _parse_response(raw: str, max_points: float) -> tuple[float, str, float]:
     return score, feedback, confidence
 
 
+# ── Structured (per-criterion) rubric grading ──────────────────────────────────
+
+@dataclass
+class CriterionScore:
+    criterion: str
+    max_points: float
+    score: float
+    justification: str
+    level: str = ""   # label of the rubric level band the final score falls in
+
+
+@dataclass
+class StructuredGradeResult:
+    criteria_scores: list[CriterionScore]
+    score: float            # Python-computed sum of criteria_scores, clamped to [0, max_points]
+    feedback: str           # synthesized summary, for callers that only read one feedback string
+    confidence: float
+    model: str = _GROQ_MODEL
+
+
+@dataclass
+class EssayGradeResult:
+    """Common return type for grade_essay() — the structured/legacy dispatcher."""
+    score: float
+    feedback: str
+    confidence: float
+    criteria_scores_json: str | None = None   # None for the legacy free-text path
+
+
+_STRUCTURED_SYSTEM_PROMPT = """\
+You are an experienced teacher grading a handwritten essay answer against a
+rubric with multiple criteria. Score EACH criterion independently and fairly.
+
+Each rubric level below defines a NUMERIC BAND (e.g. "Excellent: score 8-10
+pts"). For each criterion: first decide which level's description best
+matches the answer, then pick a score WITHIN that level's band — the top of
+the band for a strong match to that level's description, the bottom of the
+band for a weaker-but-still-that-level match. Never pick a score outside the
+band of the level you judged the answer to match.
+
+Do NOT compute or report a total/overall score — only per-criterion scores.
+Always respond with valid JSON only — no extra text before or after."""
+
+_STRUCTURED_USER_TEMPLATE = """\
+## Question
+{question_prompt}
+
+## Rubric — grade each criterion below independently
+{criteria_block}
+
+## Student's Answer (extracted via OCR — may contain minor transcription errors)
+{ocr_text}
+
+---
+
+Grade this answer against EACH criterion above. Return ONLY a JSON array, one
+object per criterion, in the same order as listed, in this exact format:
+[
+  {{
+    "criterion": "<criterion name, exactly as given above>",
+    "score": <number between 0 and that criterion's max points>,
+    "confidence": <number between 0.0 and 1.0 — how certain you are about this criterion's score given OCR quality>,
+    "justification": "<1-2 sentences: quote specific parts of the answer relevant to this criterion, note what is present or missing>"
+  }},
+  ...
+]
+Do NOT include a total or overall score anywhere in your response.
+"""
+
+
+def _compute_level_bands(levels: list[dict], max_points: float) -> list[dict]:
+    """
+    Derive non-overlapping numeric score bands from a criterion's performance
+    levels, so a continuous score can be explained in terms of which
+    qualitative level it falls under.
+
+    Levels are sorted by points descending. Each band's lower boundary is the
+    midpoint between its own points and the next-lower level's points; the
+    top band's ceiling is max_points and the bottom band's floor is 0 — the
+    bands partition [0, max_points] with no gaps or overlaps. Returns [] if
+    there are no levels (nothing to band).
+    """
+    sorted_levels = sorted(levels, key=lambda lv: float(lv.get("points", 0) or 0), reverse=True)
+    bands: list[dict] = []
+    for i, lvl in enumerate(sorted_levels):
+        upper = float(max_points) if i == 0 else bands[i - 1]["lower"]
+        if i < len(sorted_levels) - 1:
+            next_points = float(sorted_levels[i + 1].get("points", 0) or 0)
+            lower = (float(lvl.get("points", 0) or 0) + next_points) / 2.0
+        else:
+            lower = 0.0
+        bands.append({
+            "label": lvl.get("label", ""),
+            "description": lvl.get("description", ""),
+            "upper": upper,
+            "lower": lower,
+        })
+    return bands
+
+
+def _level_for_score(score: float, bands: list[dict]) -> str:
+    """Label of the band containing `score` (bands fully partition [0, max_points])."""
+    for b in bands:
+        if b["lower"] - 1e-9 <= score <= b["upper"] + 1e-9:
+            return b["label"]
+    return bands[-1]["label"] if bands else ""
+
+
+def _render_criteria_for_prompt(criteria: list[dict]) -> str:
+    """Render structured rubric criteria — with computed score bands — for the grading prompt."""
+    lines: list[str] = []
+    for c in criteria:
+        c_max = float(c.get("max_points", 0) or 0)
+        bands = _compute_level_bands(c.get("levels", []) or [], c_max)
+        lines.append(f"### {c.get('name', 'Criterion')} (score 0–{c_max:g} pts)")
+        for b in bands:
+            lines.append(
+                f"- {b['label']}: score {b['lower']:g}-{b['upper']:g} pts — {b['description']}"
+            )
+    return "\n".join(lines)
+
+
+def _parse_structured_response(raw: str, criteria: list[dict]) -> list[dict]:
+    """
+    Parse the model's per-criterion JSON array, tolerant of formatting issues.
+
+    Returns one dict per input criterion (same order), each with
+    {criterion, max_points, score, confidence, justification}. Any criterion
+    the model didn't return a usable object for gets a zero score and a
+    "no response" justification rather than being dropped.
+    """
+    clean = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.MULTILINE).strip()
+    parsed_items: list[dict] = []
+    try:
+        data = json.loads(clean)
+        if isinstance(data, list):
+            parsed_items = [item for item in data if isinstance(item, dict)]
+    except Exception:
+        pass
+
+    if not parsed_items:
+        for m in re.finditer(r'\{[^{}]*"criterion"[^{}]*\}', raw, re.DOTALL):
+            try:
+                parsed_items.append(json.loads(m.group(0)))
+            except Exception:
+                continue
+        if parsed_items:
+            logger.warning("Used regex fallback to parse structured Groq response.")
+
+    by_name = {
+        str(item.get("criterion", "")).strip().lower(): item
+        for item in parsed_items
+        if str(item.get("criterion", "")).strip()
+    }
+
+    results: list[dict] = []
+    for idx, c in enumerate(criteria):
+        c_name = str(c.get("name") or f"Criterion {idx + 1}")
+        c_max = float(c.get("max_points", 0) or 0)
+        bands = _compute_level_bands(c.get("levels", []) or [], c_max)
+        item = by_name.get(c_name.strip().lower())
+        if item is None and idx < len(parsed_items):
+            item = parsed_items[idx]  # positional fallback if names don't match
+
+        if item is None:
+            results.append({
+                "criterion": c_name,
+                "max_points": c_max,
+                "score": 0.0,
+                "confidence": 0.0,
+                "justification": "(no response for this criterion — review manually)",
+                "level": bands[-1]["label"] if bands else "",
+            })
+            continue
+
+        try:
+            score = max(0.0, min(c_max, float(item.get("score", 0))))
+        except Exception:
+            score = 0.0
+        try:
+            confidence = max(0.0, min(1.0, float(item.get("confidence", 1.0))))
+        except Exception:
+            confidence = 1.0
+        justification = str(item.get("justification") or "").strip() or "(no justification provided)"
+
+        results.append({
+            "criterion": c_name,
+            "max_points": c_max,
+            "score": score,
+            "confidence": confidence,
+            "justification": justification,
+            # Derived from the final (clamped) score, not asked of the model —
+            # keeps "which level" consistent with "what score" by construction.
+            "level": _level_for_score(score, bands) if bands else "",
+        })
+
+    return results
+
+
+def grade_answer_structured(
+    question_prompt: str,
+    criteria: list[dict],
+    max_points: float,
+    ocr_text: str,
+) -> StructuredGradeResult:
+    """
+    Grade an essay answer criterion-by-criterion in a single Groq call.
+
+    The model scores each criterion independently and is explicitly told not
+    to compute a total; the total returned here is always summed in Python
+    from the per-criterion scores, never trusted from the model's output.
+    """
+    criteria_block = _render_criteria_for_prompt(criteria)
+    user_msg = _STRUCTURED_USER_TEMPLATE.format(
+        question_prompt=question_prompt,
+        criteria_block=criteria_block,
+        ocr_text=ocr_text.strip() or "(no answer written)",
+    )
+
+    raw = _groq_call_with_retry(
+        messages=[
+            {"role": "system", "content": _STRUCTURED_SYSTEM_PROMPT},
+            {"role": "user",   "content": user_msg},
+        ],
+        max_tokens=min(2048, 300 + 200 * max(1, len(criteria))),
+        temperature=0.2,
+    )
+    logger.debug("Groq raw structured response: %s", raw)
+
+    items = _parse_structured_response(raw, criteria)
+    criteria_scores = [
+        CriterionScore(
+            criterion=i["criterion"], max_points=i["max_points"],
+            score=i["score"], justification=i["justification"], level=i.get("level", ""),
+        )
+        for i in items
+    ]
+    total = max(0.0, min(float(max_points), sum(cs.score for cs in criteria_scores)))
+    confidences = [i["confidence"] for i in items]
+    avg_confidence = sum(confidences) / len(confidences) if confidences else 1.0
+
+    feedback = "; ".join(
+        f"{cs.criterion}: {cs.score:g}/{cs.max_points:g}"
+        f"{f' ({cs.level})' if cs.level else ''} — {cs.justification}"
+        for cs in criteria_scores
+    )
+    if len(feedback) > 1500:
+        feedback = feedback[:1497] + "..."
+
+    return StructuredGradeResult(
+        criteria_scores=criteria_scores, score=total, feedback=feedback, confidence=avg_confidence,
+    )
+
+
+def grade_essay(
+    question_prompt: str,
+    rubric_text: str | None,
+    rubric_criteria_json: str | None,
+    max_points: float,
+    ocr_text: str,
+) -> EssayGradeResult:
+    """
+    Single entry point essay-grading call sites should use in place of
+    grade_answer() directly. Grades per-criterion when a structured rubric
+    is available and parses cleanly; otherwise falls back to the legacy
+    holistic rubric_text prompt, and finally to a generic instruction if
+    neither is present — the same three-level fallback the call sites
+    already relied on implicitly before this feature existed.
+    """
+    criteria: list[dict] | None = None
+    if rubric_criteria_json:
+        try:
+            parsed = json.loads(rubric_criteria_json)
+            if isinstance(parsed, list) and parsed:
+                criteria = parsed
+        except Exception:
+            logger.warning("rubric_criteria_json failed to parse — falling back to rubric_text")
+
+    if criteria:
+        try:
+            r = grade_answer_structured(question_prompt, criteria, max_points, ocr_text)
+            return EssayGradeResult(
+                score=r.score,
+                feedback=r.feedback,
+                confidence=r.confidence,
+                criteria_scores_json=json.dumps([asdict(cs) for cs in r.criteria_scores]),
+            )
+        except Exception as e:
+            logger.error("Structured grading failed (%s) — falling back to flattened rubric text", e)
+            rubric_text = rubric_text or _render_criteria_for_prompt(criteria)
+
+    r = grade_answer(
+        question_prompt, rubric_text or "Grade for content and clarity.", max_points, ocr_text,
+    )
+    return EssayGradeResult(score=r.score, feedback=r.feedback, confidence=r.confidence, criteria_scores_json=None)
+
+
 # ── Post-OCR correction ───────────────────────────────────────────────────────
+
+# Phrases that only show up when the correction model narrates its own output
+# instead of just returning it (a known llama-3.3-70b failure mode on messy
+# handwriting input) — e.g. "However, the above response still has run-on
+# lines. Here is the reformatted text:" or "Treaty of Maastricht does not
+# match, however a possible correction is: ...". If any of these leak through,
+# the "corrected" text is unusable and unsafe to grade against.
+_RUNAWAY_MARKERS = (
+    "here is the reformatted",
+    "the above response",
+    "does not match",
+    "does not seem correct",
+    "a possible correction is",
+    "let me",
+    "as an ai",
+    "i apologize",
+)
+
+
+def _looks_like_runaway_correction(raw_text: str, corrected: str) -> bool:
+    """Detect a Groq correction response that leaked meta-commentary/self-critique
+    instead of a clean corrected answer, so callers can fall back to raw OCR text."""
+    lowered = corrected.lower()
+    if any(marker in lowered for marker in _RUNAWAY_MARKERS):
+        return True
+    # A layout/character-level cleanup pass should never balloon the text —
+    # runaway generations repeat the answer across several restated drafts.
+    if len(corrected) > max(200, len(raw_text) * 3):
+        return True
+    return False
 
 _OCR_CORRECTION_SYSTEM = """\
 You are a text LAYOUT cleaner for OCR output of handwritten exam answers.
@@ -232,8 +562,13 @@ Absolutely forbidden, even if it looks like an "obvious" fix:
   looks like a typo — an accidental "fix" here can erase a genuine student
   mistake the rubric is meant to grade
 - Do NOT rephrase, expand, add content, or interpret meaning
+- Do NOT talk about your own output. Never write things like "here is the
+  reformatted text", "however, the above still has...", or any other
+  narration about what you just did or are about to do — you have exactly
+  ONE attempt, output the answer and stop.
 
-Return ONLY the cleaned-up text — no labels, no explanation."""
+Return ONLY the cleaned-up text itself — nothing else. No labels, no
+explanation, no meta-commentary, no multiple drafts."""
 
 _ID_CORRECTION_SYSTEM = """\
 You are an OCR post-processor for short handwritten identification answers.
@@ -249,6 +584,9 @@ Rules (non-negotiable):
 - Do NOT reconstruct paragraphs or add punctuation beyond what is handwritten
 - Do NOT rephrase, expand, or interpret the answer
 - Do NOT remove words that appear to be part of the answer
+- Do NOT talk about your own output. Never write things like "does not
+  match", "a possible correction is", or any other narration about what
+  you're doing — you have exactly ONE attempt, output the answer and stop.
 - Return ONLY the corrected short answer text — no labels, no explanation
 - If the input looks completely garbled and unrecoverable, return it unchanged"""
 
@@ -270,6 +608,12 @@ def correct_id_text(raw_text: str) -> str:
             temperature=0.1,
             max_tokens=100,
         )
+        if _looks_like_runaway_correction(raw_text, corrected):
+            logger.warning(
+                "ID OCR correction looked like a runaway/self-narrating response "
+                "(using raw text instead): %r", corrected,
+            )
+            return raw_text
         logger.info("ID OCR correction: %d → %d chars", len(raw_text), len(corrected))
         return corrected
     except Exception as e:
@@ -299,6 +643,12 @@ def correct_ocr_text(raw_text: str) -> str:
             temperature=0.1,
             max_tokens=min(2048, len(raw_text) * 2 + 200),
         )
+        if _looks_like_runaway_correction(raw_text, corrected):
+            logger.warning(
+                "OCR correction looked like a runaway/self-narrating response "
+                "(using raw text instead): %r", corrected[:200],
+            )
+            return raw_text
         logger.info("OCR correction: %d → %d chars", len(raw_text), len(corrected))
         return corrected
     except Exception as e:

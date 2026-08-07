@@ -114,9 +114,9 @@ def _process_job_sync(job: dict) -> None:
     import cv2
     import numpy as np
     import ocr_pipeline
-    from ai_grader import GradeResult, correct_ocr_text, grade_answer
+    from ai_grader import EssayGradeResult, correct_ocr_text, grade_essay
     from ocr_alignment import crop_content_area, crop_region, detect_and_warp
-    from omr_engine import LOW_CONFIDENCE_THRESHOLD, detect_omr
+    from omr_engine import LOW_CONFIDENCE_THRESHOLD, MULTIPLE_MARKS_LABEL, detect_omr
     from PIL import Image, ImageOps
 
     from database import SessionLocal
@@ -263,16 +263,18 @@ def _process_job_sync(job: dict) -> None:
             qtype    = (question.question_type if question else "essay") or "essay"
 
             if qtype == "essay":
-                result: GradeResult = grade_answer(
-                    question_prompt=question.prompt      if question else "General answer",
-                    rubric=         question.rubric_text if question else "Grade for content and clarity.",
-                    max_points=     question.max_points  if question else 10.0,
-                    ocr_text=       ans.ocr_text,
+                result: EssayGradeResult = grade_essay(
+                    question_prompt=         question.prompt                if question else "General answer",
+                    rubric_text=             question.rubric_text           if question else "Grade for content and clarity.",
+                    rubric_criteria_json=    question.rubric_criteria_json  if question else None,
+                    max_points=              question.max_points           if question else 10.0,
+                    ocr_text=                ans.ocr_text,
                 )
-                ans.ai_score        = result.score
-                ans.ai_feedback     = result.feedback
-                ans.groq_confidence = result.confidence
-                ans.status          = "graded"
+                ans.ai_score                = result.score
+                ans.ai_feedback             = result.feedback
+                ans.groq_confidence         = result.confidence
+                ans.ai_criteria_scores_json = result.criteria_scores_json
+                ans.status                  = "graded"
                 if result.score == 0.0:
                     _flag(ans, "essay_score_zero", db)
                 elif result.confidence < 0.4:
@@ -282,11 +284,24 @@ def _process_job_sync(job: dict) -> None:
                     _flag(ans, "fallback_ocr_ambiguous_question", db)
 
             elif qtype in ("mcq", "tf"):
+                max_pts = question.max_points if question else 1.0
+                if ans.ocr_text.strip() == MULTIPLE_MARKS_LABEL:
+                    # Two or more bubbles were filled — invalid regardless of
+                    # which mark is darkest, so it's an automatic zero.
+                    ans.ai_score    = 0.0
+                    ans.ai_feedback = (
+                        f"Correct: {question.correct_answer}. "
+                        "Detected: multiple bubbles marked. "
+                        "Incorrect — more than one option was filled in, so no "
+                        "single answer can be credited. ⚠ Please verify on the original scan."
+                    )
+                    ans.status = "needs_review"
+                    _flag(ans, "omr_multiple_marks", db)
+                    continue
                 correct     = (question.correct_answer or "").strip().upper()
                 given       = ans.ocr_text.strip().upper()
                 given_first = given.split()[0] if given else ""
                 match       = (given_first == correct) or (given == correct)
-                max_pts     = question.max_points if question else 1.0
                 ans.ai_score    = max_pts if match else 0.0
                 ans.ai_feedback = (
                     f"Correct: {question.correct_answer}. "

@@ -569,3 +569,123 @@ def generate_questionnaire(
         pdf.set_xy(MARGIN, pdf.get_y() + 4)
 
     return bytes(pdf.output())
+
+
+# ── Rubric PDF — whole-exam structured rubric export ──────────────────────────
+
+@dataclass
+class RubricQuestionInput:
+    order_index: int
+    prompt: str
+    criteria: list[dict]   # parsed rubric_criteria_json — see ai_grader.py for the shape
+
+
+def generate_rubric_pdf(
+    exam_title: str,
+    exam_code: str,
+    class_code: str,
+    questions: list[RubricQuestionInput],
+) -> bytes:
+    """
+    Whole-exam PDF listing every essay question's structured rubric. Landscape
+    (tables are wide). Because the number and point values of performance
+    levels vary per criterion (by design — see ExamQuestion.rubric_criteria_json),
+    each criterion gets its own small table rather than one shared grid that
+    assumes uniform levels across criteria. Never disk-cached — regenerated
+    fresh from current data on every request, same as generate_questionnaire.
+    """
+    pdf = FPDF(orientation="L", unit="mm", format="A4")
+    pdf.set_margins(left=MARGIN, top=MARGIN, right=MARGIN)
+    pdf.set_auto_page_break(auto=True, margin=MARGIN)
+    pdf.add_page()
+
+    width = pdf.w - 2.0 * MARGIN
+
+    pdf.set_font("helvetica", "B", 16)
+    pdf.set_xy(MARGIN, pdf.get_y())
+    pdf.multi_cell(width, 8, _safe(exam_title[:80]), align="C")
+
+    pdf.set_font("helvetica", "", 10)
+    pdf.set_xy(MARGIN, pdf.get_y())
+    pdf.multi_cell(
+        width, 6, _safe(f"Class: {class_code}    Exam: {exam_code}    Grading Rubric"), align="C",
+    )
+
+    y = pdf.get_y() + 4
+    pdf.set_draw_color(0, 0, 0)
+    pdf.set_line_width(0.4)
+    pdf.line(MARGIN, y, pdf.w - MARGIN, y)
+    pdf.set_xy(MARGIN, y + 6)
+
+    # Mini-table column widths: Level | Points | Description
+    LEVEL_W    = 45.0
+    POINTS_W   = 20.0
+    DESC_W     = width - LEVEL_W - POINTS_W
+    ROW_LINE_H = 4.5
+    HEADER_H   = 6.0
+    CELL_PAD   = 1.5
+
+    for q in sorted(questions, key=lambda x: x.order_index):
+        pdf.set_font("helvetica", "B", 12)
+        pdf.set_x(MARGIN)
+        pdf.multi_cell(width, 6, _safe(f"Q{q.order_index}. {q.prompt}"), align="L")
+        pdf.ln(1)
+
+        for crit in (q.criteria or []):
+            name    = crit.get("name", "Criterion")
+            c_max   = crit.get("max_points", 0)
+            levels  = crit.get("levels", []) or []
+
+            if pdf.get_y() + HEADER_H + 8 > pdf.h - MARGIN:
+                pdf.add_page()
+
+            pdf.set_font("helvetica", "B", 10)
+            pdf.set_x(MARGIN)
+            pdf.cell(width, 5.5, _safe(f"{name}  ({c_max:g} pts)"), align="L")
+            pdf.ln(6)
+
+            # Header row
+            x0, y0 = MARGIN, pdf.get_y()
+            pdf.set_font("helvetica", "B", 8)
+            pdf.set_fill_color(235, 235, 235)
+            pdf.set_xy(x0, y0)
+            pdf.cell(LEVEL_W, HEADER_H, "Level", border=1, align="L", fill=True)
+            pdf.cell(POINTS_W, HEADER_H, "Points", border=1, align="C", fill=True)
+            pdf.cell(DESC_W, HEADER_H, "Description", border=1, align="L", fill=True)
+            pdf.ln(HEADER_H)
+
+            pdf.set_font("helvetica", "", 8)
+            for lvl in levels:
+                label  = _safe(str(lvl.get("label", "")))
+                points = lvl.get("points", 0)
+                desc   = _safe(str(lvl.get("description", "")))
+
+                desc_lines = pdf.multi_cell(
+                    DESC_W - 2 * CELL_PAD, ROW_LINE_H, desc, dry_run=True, output="LINES",
+                ) or [""]
+                row_h = max(len(desc_lines), 1) * ROW_LINE_H + 2 * CELL_PAD
+
+                if pdf.get_y() + row_h > pdf.h - MARGIN:
+                    pdf.add_page()
+
+                rx, ry = MARGIN, pdf.get_y()
+                pdf.rect(rx, ry, LEVEL_W, row_h, style="D")
+                pdf.rect(rx + LEVEL_W, ry, POINTS_W, row_h, style="D")
+                pdf.rect(rx + LEVEL_W + POINTS_W, ry, DESC_W, row_h, style="D")
+
+                pdf.set_xy(rx + CELL_PAD, ry + CELL_PAD)
+                pdf.multi_cell(LEVEL_W - 2 * CELL_PAD, ROW_LINE_H, label, align="L")
+
+                pdf.set_xy(rx + LEVEL_W, ry + CELL_PAD)
+                pdf.cell(POINTS_W, ROW_LINE_H, f"{points:g}", align="C")
+
+                pdf.set_xy(rx + LEVEL_W + POINTS_W + CELL_PAD, ry + CELL_PAD)
+                pdf.multi_cell(DESC_W - 2 * CELL_PAD, ROW_LINE_H, desc, align="L")
+
+                pdf.set_xy(MARGIN, ry + row_h)
+
+            pdf.ln(3)
+
+        pdf.ln(4)
+
+    return bytes(pdf.output())

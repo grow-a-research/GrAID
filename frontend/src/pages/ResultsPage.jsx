@@ -232,6 +232,25 @@ function FlagBadge({ flag, answerId, submissionId, onFlagChange }) {
   )
 }
 
+// Backend sends identification results as one sentence, e.g.
+// "Expected: Lapulapu. Your answer: Lapu Lapu. Accepted (fuzzy match 94%)."
+// Parse it back into parts so the UI can show a scannable layout instead of
+// a wall of text. Returns null (caller falls back to the raw sentence) if
+// the format doesn't match what the backend currently produces.
+function parseIdentificationResult(feedback) {
+  if (!feedback) return null
+  const m = feedback.match(/^Expected:\s*(.*?)\.\s*Your answer:\s*(.*?)\.\s*(.*)$/s)
+  if (!m) return null
+  const [, expected, given, verdict] = m
+  const pctMatch = verdict.match(/(\d+)%/)
+  const percent = pctMatch ? parseInt(pctMatch[1], 10) : null
+  let kind = 'incorrect'
+  if (/^exact match/i.test(verdict))        kind = 'exact'
+  else if (/^accepted/i.test(verdict))      kind = 'accepted'
+  else if (/^partial credit/i.test(verdict)) kind = 'partial'
+  return { expected, given, percent, kind }
+}
+
 function AnswerCard({ answer, question, flag, onOverrideSaved, onFlagChange }) {
   const [scoreInput, setScoreInput] = useState(
     answer.teacher_score != null ? String(answer.teacher_score) : ''
@@ -255,6 +274,14 @@ function AnswerCard({ answer, question, flag, onOverrideSaved, onFlagChange }) {
 
   let mcqChoices = []
   try { mcqChoices = question?.choices_json ? JSON.parse(question.choices_json) : [] } catch {}
+
+  let criteriaScores = []
+  try { criteriaScores = answer.ai_criteria_scores_json ? JSON.parse(answer.ai_criteria_scores_json) : [] } catch {}
+
+  let rubricCriteria = []
+  try { rubricCriteria = question?.rubric_criteria_json ? JSON.parse(question.rubric_criteria_json) : [] } catch {}
+
+  const idResult = qtype === 'identification' ? parseIdentificationResult(answer.ai_feedback) : null
 
   async function saveOverride(e) {
     e.preventDefault()
@@ -536,28 +563,106 @@ function AnswerCard({ answer, question, flag, onOverrideSaved, onFlagChange }) {
         </div>
       )}
 
-      {/* Identification: show expected */}
-      {qtype === 'identification' && question?.correct_answer && (
+      {/* Identification: show expected (only before grading — once ai_feedback
+          exists, the structured Result block below covers this) */}
+      {qtype === 'identification' && question?.correct_answer && !idResult && (
         <div className="mb-3 flex items-center gap-2 text-xs">
           <span className="text-zinc-500">Expected:</span>
           <span className="font-mono text-emerald-400">{question.correct_answer}</span>
         </div>
       )}
 
-      {/* AI feedback */}
-      {answer.ai_feedback && (
+      {/* AI grading — per-criterion breakdown when the rubric is structured, else plain feedback */}
+      {criteriaScores.length > 0 ? (
+        <div className="mb-3">
+          <div className={`${tw.label} mb-1`}>AI grading breakdown</div>
+          <div className="rounded-lg border border-zinc-700 bg-zinc-900/60 overflow-hidden">
+            <table className="w-full text-xs">
+              <thead>
+                <tr className="border-b border-zinc-800 text-zinc-500">
+                  <th className="text-left font-medium px-3 py-1.5">Criterion</th>
+                  <th className="text-left font-medium px-3 py-1.5 whitespace-nowrap">Level</th>
+                  <th className="text-right font-medium px-3 py-1.5 whitespace-nowrap">Score</th>
+                  <th className="text-left font-medium px-3 py-1.5">Justification</th>
+                </tr>
+              </thead>
+              <tbody>
+                {criteriaScores.map((cs, i) => (
+                  <tr key={i} className="border-b border-zinc-800/60 last:border-0 align-top">
+                    <td className="px-3 py-1.5 text-zinc-200 whitespace-nowrap">{cs.criterion}</td>
+                    <td className="px-3 py-1.5 text-zinc-400 whitespace-nowrap">{cs.level || '—'}</td>
+                    <td className="px-3 py-1.5 text-right text-zinc-300 whitespace-nowrap">
+                      {cs.score}/{cs.max_points}
+                    </td>
+                    <td className="px-3 py-1.5 text-zinc-400 leading-relaxed">{cs.justification}</td>
+                  </tr>
+                ))}
+                <tr className="bg-zinc-950/40">
+                  <td className="px-3 py-1.5 font-medium text-zinc-200">Total</td>
+                  <td className="px-3 py-1.5"></td>
+                  <td className="px-3 py-1.5 text-right font-medium text-zinc-100 whitespace-nowrap">
+                    {criteriaScores.reduce((s, cs) => s + (parseFloat(cs.score) || 0), 0)}/{maxPts}
+                  </td>
+                  <td className="px-3 py-1.5"></td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      ) : answer.ai_feedback && (
         <div className="mb-3">
           <div className={`${tw.label} mb-1`}>
             {qtype === 'essay' ? 'AI feedback' : 'Result'}
           </div>
-          <div className="rounded-lg border border-zinc-700 bg-zinc-900/60 px-3 py-2 text-xs text-zinc-300 leading-relaxed">
-            {answer.ai_feedback}
-          </div>
+          {idResult ? (
+            <div className="rounded-lg border border-zinc-700 bg-zinc-900/60 px-3 py-2 text-xs">
+              <div className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1">
+                <span className="text-zinc-500">Expected</span>
+                <span className="font-mono text-emerald-400">{idResult.expected}</span>
+                <span className="text-zinc-500">Your answer</span>
+                <span className="font-mono text-zinc-200">{idResult.given || '(none)'}</span>
+              </div>
+              <div className={[
+                'mt-2 inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-xs font-medium',
+                idResult.kind === 'exact' || idResult.kind === 'accepted'
+                  ? 'border-emerald-800 bg-emerald-950/50 text-emerald-300'
+                  : idResult.kind === 'partial'
+                  ? 'border-amber-800 bg-amber-950/50 text-amber-300'
+                  : 'border-rose-800 bg-rose-950/50 text-rose-300',
+              ].join(' ')}>
+                {idResult.kind === 'exact'   && '✓ Exact match'}
+                {idResult.kind === 'accepted' && `✓ Accepted${idResult.percent != null ? ` (${idResult.percent}% match)` : ''}`}
+                {idResult.kind === 'partial'  && `◐ Partial credit${idResult.percent != null ? ` (${idResult.percent}% match)` : ''}`}
+                {idResult.kind === 'incorrect' && `✗ Incorrect${idResult.percent != null ? ` (${idResult.percent}% match)` : ''}`}
+              </div>
+            </div>
+          ) : (
+            <div className="rounded-lg border border-zinc-700 bg-zinc-900/60 px-3 py-2 text-xs text-zinc-300 leading-relaxed">
+              {answer.ai_feedback}
+            </div>
+          )}
         </div>
       )}
 
       {/* Rubric (essay only) */}
-      {qtype === 'essay' && question?.rubric_text && (
+      {qtype === 'essay' && rubricCriteria.length > 0 && (
+        <details className="mb-3">
+          <summary className="text-xs text-zinc-500 cursor-pointer hover:text-zinc-300 select-none">
+            View rubric
+          </summary>
+          <div className="mt-1 flex flex-col gap-2 rounded-lg border border-zinc-800 bg-zinc-950/40 px-3 py-2">
+            {rubricCriteria.map((c, i) => (
+              <div key={i} className="text-xs text-zinc-400">
+                <span className="text-zinc-200 font-medium">{c.name}</span> ({c.max_points} pts)
+                {(c.levels || []).map((lvl, j) => (
+                  <div key={j} className="pl-3 leading-relaxed">• {lvl.label} ({lvl.points} pts): {lvl.description}</div>
+                ))}
+              </div>
+            ))}
+          </div>
+        </details>
+      )}
+      {qtype === 'essay' && rubricCriteria.length === 0 && question?.rubric_text && (
         <details className="mb-3">
           <summary className="text-xs text-zinc-500 cursor-pointer hover:text-zinc-300 select-none">
             View rubric

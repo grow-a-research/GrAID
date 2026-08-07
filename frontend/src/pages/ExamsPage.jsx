@@ -2,6 +2,8 @@ import { useEffect, useRef, useState } from 'react'
 import { api } from '../api'
 import { tw, ErrorBox, Empty } from '../ui'
 import { useWorkflow } from '../context/WorkflowContext'
+import RubricCriteriaEditor, { criterionMaxPoints, emptyCriterion } from '../components/RubricCriteriaEditor'
+import { toCsvFile } from '../lib/excelImport'
 
 // Shown as a concrete example of a well-structured rubric — weighted criteria
 // grade more consistently through the AI grader than a single vague paragraph.
@@ -47,6 +49,70 @@ function downloadRubricsCsvTemplate() {
   ])
 }
 
+// Long/tidy layout — one row per (criterion, level) — so level count can vary
+// per criterion without forcing empty columns for shorter rows. A criterion's
+// max points isn't a column — it's always derived as the highest level_points
+// among its rows, so it can never disagree with the levels that define it.
+function downloadRubricCriteriaCsvTemplate() {
+  downloadCsv('rubric_criteria_template.csv', [
+    ['criterion_name', 'level_label', 'level_points', 'level_description'],
+    [csvCell('Content & Examples'), csvCell('Needs Improvement'), '2',
+      csvCell('Minimal explanation of general knowledge; missing or vague examples.')],
+    [csvCell('Content & Examples'), csvCell('Satisfactory'), '3',
+      csvCell('Clearly explains the importance of general knowledge with 1 specific example.')],
+    [csvCell('Content & Examples'), csvCell('Excellent'), '5',
+      csvCell('Thoroughly explains the importance of general knowledge with 2 or more detailed, realistic examples.')],
+    [csvCell('Organization & Length'), csvCell('Needs Improvement'), '1',
+      csvCell('Fragmented structure; significantly under the length minimum.')],
+    [csvCell('Organization & Length'), csvCell('Excellent'), '3',
+      csvCell('Well-organized with smooth transitions; meets or exceeds the length requirement.')],
+  ])
+}
+
+// A real blank .xlsx (header row only) — for teachers who'd rather fill the
+// rubric directly in Excel/Sheets than edit a CSV, with no guessing about
+// what the column names need to be (they're already typed in row 1).
+async function downloadRubricCriteriaXlsxTemplate() {
+  const XLSX = await import('xlsx')
+  const ws = XLSX.utils.aoa_to_sheet([
+    ['criterion_name', 'level_label', 'level_points', 'level_description'],
+  ])
+  const wb = XLSX.utils.book_new()
+  XLSX.utils.book_append_sheet(wb, ws, 'Rubric')
+  const wbout = XLSX.write(wb, { bookType: 'xlsx', type: 'array' })
+  const blob = new Blob([wbout], { type: 'application/octet-stream' })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url; a.download = 'rubric_criteria_blank_template.xlsx'
+  document.body.appendChild(a); a.click(); a.remove()
+  URL.revokeObjectURL(url)
+}
+
+// Read-only collapsed view of a saved structured rubric on the question list.
+function RubricCriteriaSummary({ json }) {
+  let criteria = []
+  try { criteria = JSON.parse(json) || [] } catch {}
+  if (!criteria.length) return null
+  const total = criteria.reduce((s, c) => s + (parseFloat(c.max_points) || 0), 0)
+  return (
+    <details className="mt-1">
+      <summary className="text-xs text-zinc-400 cursor-pointer">
+        Rubric: {criteria.length} criteria, {total} pts — {criteria.map(c => c.name).join(', ')}
+      </summary>
+      <div className="mt-1 flex flex-col gap-1.5 pl-3 border-l border-zinc-800">
+        {criteria.map((c, i) => (
+          <div key={i} className="text-xs text-zinc-500">
+            <span className="text-zinc-300 font-medium">{c.name}</span> ({c.max_points} pts)
+            {(c.levels || []).map((lvl, j) => (
+              <div key={j} className="pl-3">• {lvl.label} ({lvl.points} pts): {lvl.description}</div>
+            ))}
+          </div>
+        ))}
+      </div>
+    </details>
+  )
+}
+
 export default function ExamsPage() {
   const {
     selectedClass, selectClass,
@@ -68,6 +134,10 @@ export default function ExamsPage() {
   const [qPrompt, setQPrompt] = useState('')
   const [qPoints, setQPoints] = useState('10')
   const [qRubric, setQRubric] = useState('')
+  const [qRubricMode, setQRubricMode] = useState('structured')   // structured | text
+  const [qCriteria, setQCriteria] = useState([emptyCriterion()])
+  const [qRubricParsing, setQRubricParsing] = useState(false)
+  const [qRubricParseErrors, setQRubricParseErrors] = useState([])
   const [qType, setQType] = useState('essay')          // essay | mcq | tf | identification
   const [qChoices, setQChoices] = useState(['', '', '', ''])  // MCQ choices A-D
   const [qCorrect, setQCorrect] = useState('')          // correct answer
@@ -103,6 +173,10 @@ export default function ExamsPage() {
   const [editQChoices, setEditQChoices] = useState(['', '', '', ''])
   const [editQCorrect, setEditQCorrect] = useState('')
   const [editQRubric, setEditQRubric] = useState('')
+  const [editQRubricMode, setEditQRubricMode] = useState('text')   // structured | text
+  const [editQCriteria, setEditQCriteria] = useState([])
+  const [editQRubricParsing, setEditQRubricParsing] = useState(false)
+  const [editQRubricParseErrors, setEditQRubricParseErrors] = useState([])
   const [editQPoints, setEditQPoints] = useState('10')
   const [savingQ, setSavingQ] = useState(false)
   const [saveQErr, setSaveQErr] = useState('')
@@ -147,14 +221,19 @@ export default function ExamsPage() {
   async function addQuestion(e) {
     e.preventDefault()
     if (!selected || !qPrompt.trim()) return
+    const usingStructured = qType === 'essay' && qRubricMode === 'structured'
+      && qCriteria.some(c => c.name.trim())
     setAddingQ(true); setAddQErr('')
     try {
       const body = {
         order_index: questions.length + 1,
         prompt: qPrompt.trim(),
-        max_points: parseFloat(qPoints) || 10,
+        max_points: usingStructured
+          ? qCriteria.reduce((s, c) => s + criterionMaxPoints(c), 0)
+          : (parseFloat(qPoints) || 10),
         question_type: qType,
-        rubric_text: qType === 'essay' ? qRubric.trim() : null,
+        rubric_text: qType === 'essay' && qRubricMode === 'text' ? qRubric.trim() : null,
+        rubric_criteria_json: usingStructured ? JSON.stringify(qCriteria) : null,
         correct_answer: qCorrect.trim() || null,
         choices_json: qType === 'mcq'
           ? JSON.stringify(qChoices.map(c => c.trim()).filter(Boolean))
@@ -162,10 +241,36 @@ export default function ExamsPage() {
       }
       const q = await api.exams.questions.add(selected.id, body)
       setQuestions(prev => [...prev, q])
-      setQPrompt(''); setQPoints('10'); setQRubric('')
+      setQPrompt(''); setQPoints('10'); setQRubric(''); setQCriteria([])
+      setQRubricParseErrors([])
       setQCorrect(''); setQChoices(['', '', '', ''])
     } catch (err) { setAddQErr(err.message) }
     setAddingQ(false)
+  }
+
+  // Shared by the add + edit rubric builders — parses an uploaded CSV/XLSX
+  // template into structured criteria to prefill the editor (in-memory only,
+  // does not save the question).
+  async function parseAndSetCriteria(file, setCriteriaFn, setErrorsFn, setParsingFn) {
+    if (!file || !selected) return
+    setParsingFn(true); setErrorsFn([])
+    try {
+      const csvFile = await toCsvFile(file)
+      const result = await api.exams.questions.rubricCriteria.parse(selected.id, csvFile)
+      if (result.criteria?.length) setCriteriaFn(result.criteria)
+      if (result.errors?.length) setErrorsFn(result.errors)
+    } catch (err) {
+      setErrorsFn([err.message])
+    }
+    setParsingFn(false)
+  }
+
+  function downloadRubricPdf() {
+    if (!selected) return
+    const url = api.exams.rubricPdfUrl(selected.id)
+    const a = document.createElement('a')
+    a.href = url; a.download = `exam_${selected.exam_code}_rubric.pdf`
+    document.body.appendChild(a); a.click(); a.remove()
   }
   async function generateTemplate() {
     if (!selected) return
@@ -253,12 +358,17 @@ export default function ExamsPage() {
   function startEditQ(q) {
     let choices = ['', '', '', '']
     try { if (q.choices_json) choices = JSON.parse(q.choices_json).concat(['','','','']).slice(0, 4) } catch {}
+    let criteria = []
+    try { if (q.rubric_criteria_json) criteria = JSON.parse(q.rubric_criteria_json) || [] } catch {}
     setEditingQId(q.id)
     setEditQPrompt(q.prompt)
     setEditQType(q.question_type || 'essay')
     setEditQChoices(choices)
     setEditQCorrect(q.correct_answer || '')
     setEditQRubric(q.rubric_text || '')
+    setEditQCriteria(criteria)
+    setEditQRubricMode(criteria.length > 0 ? 'structured' : 'text')
+    setEditQRubricParseErrors([])
     setEditQPoints(String(q.max_points ?? 10))
     setSaveQErr('')
   }
@@ -266,17 +376,29 @@ export default function ExamsPage() {
     setEditingQId(null); setSaveQErr('')
   }
   async function saveEditQ(qId) {
+    const orig = questions.find(x => x.id === qId)
+    const usingStructured = editQType === 'essay' && editQRubricMode === 'structured'
+      && editQCriteria.some(c => c.name.trim())
     setSavingQ(true); setSaveQErr('')
     try {
       const body = {
         prompt: editQPrompt.trim() || undefined,
         question_type: editQType,
-        rubric_text: editQType === 'essay' ? (editQRubric.trim() || null) : null,
-        max_points: parseFloat(editQPoints) || undefined,
+        rubric_text: editQType === 'essay' && editQRubricMode === 'text' ? (editQRubric.trim() || null) : null,
+        max_points: usingStructured
+          ? editQCriteria.reduce((s, c) => s + criterionMaxPoints(c), 0)
+          : (parseFloat(editQPoints) || undefined),
         choices_json: editQType === 'mcq'
           ? JSON.stringify(editQChoices.map(c => c.trim()).filter(Boolean))
           : null,
         correct_answer: editQCorrect.trim() || null,
+      }
+      if (usingStructured) {
+        body.rubric_criteria_json = JSON.stringify(editQCriteria)
+      } else if (orig?.rubric_criteria_json) {
+        // Switched away from a previously-structured rubric — clear it explicitly.
+        // (Omitting the key entirely would leave it untouched on the server.)
+        body.rubric_criteria_json = ''
       }
       const updated = await api.exams.questions.update(selected.id, qId, body)
       setQuestions(prev => prev.map(q => q.id === qId ? updated : q))
@@ -394,6 +516,12 @@ export default function ExamsPage() {
                   <button className={tw.btnSm} onClick={downloadQuestionnaire}
                     title="Plain document listing question text — separate from the answer sheet, safe to hand out or read from">
                     Download questionnaire
+                  </button>
+                )}
+                {questions.some(q => q.rubric_criteria_json) && (
+                  <button className={tw.btnSm} onClick={downloadRubricPdf}
+                    title="PDF listing every essay question's structured rubric">
+                    Download rubric PDF
                   </button>
                 )}
                 {templateReady && (
@@ -536,9 +664,57 @@ export default function ExamsPage() {
 
               {/* Essay: rubric */}
               {qType === 'essay' && (
-                <textarea className={tw.input} rows={3}
-                  placeholder={`Rubric / marking criteria * — write it as weighted criteria, e.g.:\n${EXAMPLE_RUBRIC}`}
-                  value={qRubric} onChange={e => setQRubric(e.target.value)} />
+                <div className="flex flex-col gap-2">
+                  <div className="flex items-center gap-2">
+                    <div className={tw.label}>Rubric</div>
+                    <div className="flex gap-1">
+                      {[['structured', 'Structured rubric'], ['text', 'Simple text']].map(([val, lbl]) => (
+                        <button key={val} type="button"
+                          onClick={() => {
+                            setQRubricMode(val)
+                            if (val === 'structured') setQCriteria(prev => prev.length ? prev : [emptyCriterion()])
+                          }}
+                          className={[
+                            'rounded px-2 py-0.5 text-xs transition',
+                            qRubricMode === val ? 'bg-emerald-700 text-white' : 'bg-zinc-800 text-zinc-400 hover:text-zinc-100',
+                          ].join(' ')}>
+                          {lbl}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  {qRubricMode === 'text' ? (
+                    <textarea className={tw.input} rows={3}
+                      placeholder={`Rubric / marking criteria * — write it as weighted criteria, e.g.:\n${EXAMPLE_RUBRIC}`}
+                      value={qRubric} onChange={e => setQRubric(e.target.value)} />
+                  ) : (
+                    <>
+                      <div className="flex gap-2 flex-wrap">
+                        <button type="button" className={tw.btnSm} onClick={downloadRubricCriteriaCsvTemplate}>
+                          Download CSV template
+                        </button>
+                        <button type="button" className={tw.btnSm} onClick={downloadRubricCriteriaXlsxTemplate}
+                          title="Blank .xlsx with just the required column headers — fill it in directly in Excel/Sheets">
+                          Download blank Excel template
+                        </button>
+                        <label className={`${tw.btnSm} cursor-pointer`}>
+                          {qRubricParsing ? 'Parsing…' : 'Upload CSV/XLSX'}
+                          <input type="file" accept=".csv,.xlsx,text/csv" className="hidden"
+                            disabled={qRubricParsing}
+                            onChange={e => {
+                              parseAndSetCriteria(e.target.files?.[0], setQCriteria, setQRubricParseErrors, setQRubricParsing)
+                              e.target.value = ''
+                            }} />
+                        </label>
+                      </div>
+                      {qRubricParseErrors.length > 0 && (
+                        <div className="text-xs text-amber-400">{qRubricParseErrors.join(' · ')}</div>
+                      )}
+                      <RubricCriteriaEditor criteria={qCriteria} onChange={setQCriteria} />
+                    </>
+                  )}
+                </div>
               )}
 
               {/* MCQ: four choices + correct answer letter */}
@@ -576,11 +752,20 @@ export default function ExamsPage() {
                   value={qCorrect} onChange={e => setQCorrect(e.target.value)} />
               )}
 
-              <input className={tw.input} placeholder="Max points" type="number" min="0" step="0.5"
-                value={qPoints} onChange={e => setQPoints(e.target.value)} />
+              {!(qType === 'essay' && qRubricMode === 'structured') && (
+                <input className={tw.input} placeholder="Max points" type="number" min="0" step="0.5"
+                  value={qPoints} onChange={e => setQPoints(e.target.value)} />
+              )}
               <ErrorBox msg={addQErr} />
               <button className={tw.btnPrimary} type="submit"
-                disabled={addingQ || !qPrompt.trim() || (qType === 'essay' && !qRubric.trim())}>
+                disabled={
+                  addingQ || !qPrompt.trim() ||
+                  (qType === 'essay' && (
+                    qRubricMode === 'text'
+                      ? !qRubric.trim()
+                      : !qCriteria.some(c => c.name.trim())
+                  ))
+                }>
                 {addingQ ? 'Adding…' : 'Add question'}
               </button>
             </form>
@@ -620,9 +805,57 @@ export default function ExamsPage() {
                             value={editQPrompt} onChange={e => setEditQPrompt(e.target.value)} />
 
                           {editQType === 'essay' && (
-                            <textarea className={tw.input} rows={3}
-                              placeholder={`Rubric / marking criteria — write it as weighted criteria, e.g.:\n${EXAMPLE_RUBRIC}`}
-                              value={editQRubric} onChange={e => setEditQRubric(e.target.value)} />
+                            <div className="flex flex-col gap-2">
+                              <div className="flex items-center gap-2">
+                                <div className={tw.label}>Rubric</div>
+                                <div className="flex gap-1">
+                                  {[['structured', 'Structured rubric'], ['text', 'Simple text']].map(([val, lbl]) => (
+                                    <button key={val} type="button"
+                                      onClick={() => {
+                                        setEditQRubricMode(val)
+                                        if (val === 'structured') setEditQCriteria(prev => prev.length ? prev : [emptyCriterion()])
+                                      }}
+                                      className={[
+                                        'rounded px-2 py-0.5 text-xs transition',
+                                        editQRubricMode === val ? 'bg-emerald-700 text-white' : 'bg-zinc-800 text-zinc-400 hover:text-zinc-100',
+                                      ].join(' ')}>
+                                      {lbl}
+                                    </button>
+                                  ))}
+                                </div>
+                              </div>
+
+                              {editQRubricMode === 'text' ? (
+                                <textarea className={tw.input} rows={3}
+                                  placeholder={`Rubric / marking criteria — write it as weighted criteria, e.g.:\n${EXAMPLE_RUBRIC}`}
+                                  value={editQRubric} onChange={e => setEditQRubric(e.target.value)} />
+                              ) : (
+                                <>
+                                  <div className="flex gap-2 flex-wrap">
+                                    <button type="button" className={tw.btnSm} onClick={downloadRubricCriteriaCsvTemplate}>
+                                      Download CSV template
+                                    </button>
+                                    <button type="button" className={tw.btnSm} onClick={downloadRubricCriteriaXlsxTemplate}
+                                      title="Blank .xlsx with just the required column headers — fill it in directly in Excel/Sheets">
+                                      Download blank Excel template
+                                    </button>
+                                    <label className={`${tw.btnSm} cursor-pointer`}>
+                                      {editQRubricParsing ? 'Parsing…' : 'Upload CSV/XLSX'}
+                                      <input type="file" accept=".csv,.xlsx,text/csv" className="hidden"
+                                        disabled={editQRubricParsing}
+                                        onChange={e => {
+                                          parseAndSetCriteria(e.target.files?.[0], setEditQCriteria, setEditQRubricParseErrors, setEditQRubricParsing)
+                                          e.target.value = ''
+                                        }} />
+                                    </label>
+                                  </div>
+                                  {editQRubricParseErrors.length > 0 && (
+                                    <div className="text-xs text-amber-400">{editQRubricParseErrors.join(' · ')}</div>
+                                  )}
+                                  <RubricCriteriaEditor criteria={editQCriteria} onChange={setEditQCriteria} />
+                                </>
+                              )}
+                            </div>
                           )}
 
                           {editQType === 'mcq' && (
@@ -657,8 +890,10 @@ export default function ExamsPage() {
                               value={editQCorrect} onChange={e => setEditQCorrect(e.target.value)} />
                           )}
 
-                          <input className={tw.input} placeholder="Max points" type="number" min="0" step="0.5"
-                            value={editQPoints} onChange={e => setEditQPoints(e.target.value)} />
+                          {!(editQType === 'essay' && editQRubricMode === 'structured') && (
+                            <input className={tw.input} placeholder="Max points" type="number" min="0" step="0.5"
+                              value={editQPoints} onChange={e => setEditQPoints(e.target.value)} />
+                          )}
 
                           <ErrorBox msg={saveQErr} />
                           <div className="flex gap-2">
@@ -684,7 +919,9 @@ export default function ExamsPage() {
                               <span className={`text-xs font-mono ${typeColor}`}>[{typeLabel}]</span>
                               <span className="text-sm font-medium text-zinc-100">Q{q.order_index}. {q.prompt}</span>
                             </div>
-                            {q.rubric_text && (
+                            {q.rubric_criteria_json ? (
+                              <RubricCriteriaSummary json={q.rubric_criteria_json} />
+                            ) : q.rubric_text && (
                               <div className="mt-1 text-xs text-zinc-400">Rubric: {q.rubric_text}</div>
                             )}
                             {choices.length > 0 && (

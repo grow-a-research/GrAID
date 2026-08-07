@@ -38,6 +38,9 @@ export default function SubmissionsPage() {
   // create
   const [newExamId, setNewExamId] = useState('')
   const [newStudentId, setNewStudentId] = useState('')
+  const [studentSearch, setStudentSearch] = useState('')
+  const [enrolledStudents, setEnrolledStudents] = useState([])
+  const [studentPickerOpen, setStudentPickerOpen] = useState(false)
   const [creating, setCreating] = useState(false)
   const [createErr, setCreateErr] = useState('')
 
@@ -83,6 +86,15 @@ export default function SubmissionsPage() {
   useEffect(() => {
     api.exams.list(selectedClass?.id).then(setExams).catch(() => setExams([]))
   }, [selectedClass?.id])
+
+  // Loads the roster for whichever exam is picked in "New submission" — the
+  // student picker only offers students enrolled in that exam's class.
+  useEffect(() => {
+    setNewStudentId(''); setStudentSearch('')
+    const ex = exams.find(x => x.id === parseInt(newExamId))
+    if (!ex) { setEnrolledStudents([]); return }
+    api.classes.enrolled(ex.class_id).then(setEnrolledStudents).catch(() => setEnrolledStudents([]))
+  }, [newExamId])
 
   // Loads the submission list whenever the shared selected exam changes — covers both
   // an explicit pick here and arriving with an exam already selected from Exams/Results.
@@ -219,7 +231,7 @@ export default function SubmissionsPage() {
       // denormalized student_name/student_id the UI displays, not just the raw FK id.
       const subList = ex ? await api.exams.submissions(ex.id) : []
       if (ex) setSubmissions(subList)
-      setNewStudentId('')
+      setNewStudentId(''); setStudentSearch('')
       const row = subList.find(s => s.id === sub.id)
       if (ex) pickExam(ex) // picking a (possibly different) exam clears submission first
       setSelectedSub(row ?? sub)
@@ -351,10 +363,48 @@ export default function SubmissionsPage() {
               <option key={ex.id} value={ex.id}>{ex.title} ({ex.exam_code})</option>
             ))}
           </select>
-          <input className={tw.input} placeholder="Student ID (school-issued)"
-            value={newStudentId} onChange={e => setNewStudentId(e.target.value)} />
+          <div className="relative">
+            <input className={tw.input}
+              placeholder={newExamId ? 'Search enrolled student…' : 'Select an exam first'}
+              value={studentSearch}
+              disabled={!newExamId}
+              onChange={e => { setStudentSearch(e.target.value); setNewStudentId(''); setStudentPickerOpen(true) }}
+              onFocus={() => setStudentPickerOpen(true)}
+              onBlur={() => setTimeout(() => setStudentPickerOpen(false), 150)} />
+            {studentPickerOpen && newExamId && (
+              <div className="absolute z-10 mt-1 max-h-48 w-full overflow-y-auto rounded-lg border border-zinc-700 bg-zinc-900 shadow-lg">
+                {(() => {
+                  const q = studentSearch.trim().toLowerCase()
+                  const matches = q
+                    ? enrolledStudents.filter(s =>
+                        s.student_id.toLowerCase().includes(q) || s.full_name.toLowerCase().includes(q))
+                    : enrolledStudents
+                  if (matches.length === 0) {
+                    return (
+                      <div className="px-3 py-2 text-xs text-zinc-500">
+                        {enrolledStudents.length === 0 ? 'No students enrolled in this class.' : 'No match.'}
+                      </div>
+                    )
+                  }
+                  return matches.map(s => (
+                    <button key={s.id} type="button"
+                      className="flex w-full items-center justify-between gap-2 px-3 py-2 text-left text-xs hover:bg-zinc-800"
+                      onMouseDown={e => e.preventDefault()}
+                      onClick={() => {
+                        setNewStudentId(s.student_id)
+                        setStudentSearch(`${s.full_name} (${s.student_id})`)
+                        setStudentPickerOpen(false)
+                      }}>
+                      <span className="text-zinc-100">{s.full_name}</span>
+                      <span className="text-zinc-500">{s.student_id}</span>
+                    </button>
+                  ))
+                })()}
+              </div>
+            )}
+          </div>
           <ErrorBox msg={createErr} />
-          <button className={tw.btnPrimary} type="submit" disabled={creating}>
+          <button className={tw.btnPrimary} type="submit" disabled={creating || !newExamId || !newStudentId}>
             {creating ? 'Creating…' : 'Create submission'}
           </button>
         </form>

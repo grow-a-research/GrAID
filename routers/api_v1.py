@@ -23,6 +23,7 @@ import db_models as m
 from api_schemas import (
     BatchFileResult,
     BatchUploadResult,
+    BulkDeleteResult,
     BulkEnrollResult,
     BulkProcessResult,
     BulkProcessStatus,
@@ -47,6 +48,7 @@ from api_schemas import (
     OcrResult,
     QuestionImportResult,
     QuestionStats,
+    RubricCriteriaParseResult,
     RubricImportResult,
     StudentAnalytics,
     StudentCreate,
@@ -327,6 +329,20 @@ def list_exam_submissions(exam_id: int, db: Session = Depends(get_db)) -> list[S
 # ---------------------------------------------------------------------------
 
 
+def _normalize_rubric_criteria(criteria: list[dict]) -> list[dict]:
+    """
+    Recompute each criterion's max_points as the highest of its own levels'
+    points. The criterion max is derived, never independently client-set, so
+    it can't silently disagree with the levels that actually define it.
+    """
+    normalized = []
+    for c in criteria:
+        levels = c.get("levels", []) or []
+        level_points = [float(lv.get("points", 0) or 0) for lv in levels]
+        normalized.append({**c, "max_points": max(level_points) if level_points else 0.0})
+    return normalized
+
+
 @router.post("/exams/{exam_id}/questions", response_model=ExamQuestionRead)
 def add_question(exam_id: int, body: ExamQuestionCreate, db: Session = Depends(get_db)) -> m.ExamQuestion:
     exam = db.get(m.Exam, exam_id)
@@ -338,13 +354,23 @@ def add_question(exam_id: int, body: ExamQuestionCreate, db: Session = Depends(g
             status_code=422,
             detail=f"correct_answer is required for question type '{qtype}'",
         )
+    max_points = body.max_points
+    rubric_criteria_json = body.rubric_criteria_json
+    if body.rubric_criteria_json:
+        try:
+            criteria = _normalize_rubric_criteria(json.loads(body.rubric_criteria_json))
+            max_points = sum(c["max_points"] for c in criteria)
+            rubric_criteria_json = json.dumps(criteria)
+        except Exception:
+            raise HTTPException(status_code=422, detail="rubric_criteria_json is not valid JSON")
     row = m.ExamQuestion(
         exam_id=exam_id,
         order_index=body.order_index,
         prompt=body.prompt,
         question_type=qtype,
         rubric_text=body.rubric_text,
-        max_points=body.max_points,
+        rubric_criteria_json=rubric_criteria_json,
+        max_points=max_points,
         choices_json=body.choices_json,
         correct_answer=body.correct_answer,
     )
@@ -400,7 +426,24 @@ def update_question(
             structural = True
     if body.rubric_text is not None:
         q.rubric_text = body.rubric_text.strip() or None
-    if body.max_points is not None and body.max_points != q.max_points:
+    if body.rubric_criteria_json is not None and body.rubric_criteria_json != q.rubric_criteria_json:
+        structural = True
+        if body.rubric_criteria_json:
+            try:
+                criteria = _normalize_rubric_criteria(json.loads(body.rubric_criteria_json))
+                q.rubric_criteria_json = json.dumps(criteria)
+                q.max_points = sum(c["max_points"] for c in criteria)
+            except Exception:
+                raise HTTPException(status_code=422, detail="rubric_criteria_json is not valid JSON")
+        else:
+            q.rubric_criteria_json = None
+    if (
+        body.max_points is not None
+        and body.max_points != q.max_points
+        and not (body.rubric_criteria_json is not None and q.rubric_criteria_json)
+    ):
+        # Ignored when a structured rubric is being set in this same request —
+        # max_points is derived from criteria max_points above, not client-supplied.
         q.max_points = body.max_points
         structural = True
     if body.choices_json is not None and body.choices_json != q.choices_json:
@@ -1066,6 +1109,59 @@ def download_questionnaire_pdf(exam_id: int, db: Session = Depends(get_db)) -> R
     )
 
 
+@router.get("/exams/{exam_id}/rubric/pdf")
+def download_rubric_pdf(exam_id: int, db: Session = Depends(get_db)) -> Response:
+    """
+    Download a single PDF listing every essay question's structured rubric
+    (criteria x performance levels) for the exam. Generated fresh from
+    current data on every request, like the questionnaire PDF.
+
+    Essay questions that only have a legacy free-text rubric_text (no
+    structured rubric_criteria_json) are skipped — there's no tabular
+    structure to render for those in v1.
+    """
+    from pdf_generator import RubricQuestionInput, generate_rubric_pdf
+
+    exam = db.get(m.Exam, exam_id)
+    if not exam:
+        raise HTTPException(status_code=404, detail="Exam not found")
+
+    questions = (
+        db.query(m.ExamQuestion)
+        .filter(m.ExamQuestion.exam_id == exam_id, m.ExamQuestion.question_type == "essay")
+        .order_by(m.ExamQuestion.order_index)
+        .all()
+    )
+    essay_with_criteria = [q for q in questions if q.rubric_criteria_json]
+    if not essay_with_criteria:
+        raise HTTPException(
+            status_code=400,
+            detail="No essay questions with a structured rubric found.",
+        )
+
+    course = db.get(m.CourseClass, exam.class_id)
+    class_code = course.code if course else "—"
+
+    q_inputs = [
+        RubricQuestionInput(
+            order_index=q.order_index, prompt=q.prompt,
+            criteria=json.loads(q.rubric_criteria_json),
+        )
+        for q in essay_with_criteria
+    ]
+    pdf_bytes = generate_rubric_pdf(
+        exam_title=exam.title, exam_code=exam.exam_code,
+        class_code=class_code, questions=q_inputs,
+    )
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": f'attachment; filename="exam_{exam.exam_code}_rubric.pdf"'
+        },
+    )
+
+
 @router.get("/exams/{exam_id}/papers/zip")
 def download_all_papers_zip(exam_id: int, db: Session = Depends(get_db)) -> StreamingResponse:
     """
@@ -1243,7 +1339,8 @@ def grade_submission(
     - Updates submission.status → 'graded'.
     - fuzzy_full / fuzzy_partial control Identification scoring thresholds.
     """
-    from ai_grader import GradeResult, grade_answer
+    from ai_grader import EssayGradeResult, grade_essay
+    from omr_engine import MULTIPLE_MARKS_LABEL
 
     sub = db.get(m.Submission, submission_id)
     if not sub:
@@ -1292,16 +1389,18 @@ def grade_submission(
         if qtype == "essay":
             # --- AI grading via Groq ---
             try:
-                result: GradeResult = grade_answer(
-                    question_prompt=question.prompt      if question else "General answer",
-                    rubric=         question.rubric_text if question else "Grade for content and clarity.",
-                    max_points=     question.max_points  if question else 10.0,
-                    ocr_text=       ans.ocr_text,
+                result: EssayGradeResult = grade_essay(
+                    question_prompt=         question.prompt                if question else "General answer",
+                    rubric_text=             question.rubric_text           if question else "Grade for content and clarity.",
+                    rubric_criteria_json=    question.rubric_criteria_json  if question else None,
+                    max_points=              question.max_points           if question else 10.0,
+                    ocr_text=                ans.ocr_text,
                 )
-                ans.ai_score        = result.score
-                ans.ai_feedback     = result.feedback
-                ans.groq_confidence = result.confidence
-                ans.status          = "graded"
+                ans.ai_score               = result.score
+                ans.ai_feedback            = result.feedback
+                ans.groq_confidence        = result.confidence
+                ans.ai_criteria_scores_json = result.criteria_scores_json
+                ans.status                 = "graded"
                 if result.score == 0.0:
                     _auto_flag(ans, "essay_score_zero", db)
                 elif result.confidence < 0.4:
@@ -1320,12 +1419,26 @@ def grade_submission(
 
         elif qtype in ("mcq", "tf"):
             # --- Deterministic exact-match scoring (OMR or OCR detected letter) ---
+            max_pts = question.max_points if question else 1.0
+            if ans.ocr_text.strip() == MULTIPLE_MARKS_LABEL:
+                # Two or more bubbles were filled — an invalid answer on any
+                # real answer sheet, regardless of which mark is darkest.
+                # Score it wrong outright instead of picking a "winner".
+                ans.ai_score    = 0.0
+                ans.ai_feedback = (
+                    f"Correct answer: {question.correct_answer}. "
+                    "Detected answer: multiple bubbles marked. "
+                    "Incorrect — more than one option was filled in, so no single "
+                    "answer can be credited. ⚠ Please verify on the original scan."
+                )
+                ans.status = "needs_review"
+                _auto_flag(ans, "omr_multiple_marks", db)
+                continue
             correct = (question.correct_answer or "").strip().upper()
             given   = ans.ocr_text.strip().upper()
             # Accept first letter/word in case noise was picked up
             given_first = given.split()[0] if given else ""
             match = (given_first == correct) or (given == correct)
-            max_pts = question.max_points if question else 1.0
             ans.ai_score = max_pts if match else 0.0
             feedback = (
                 f"Correct answer: {question.correct_answer}. "
@@ -1434,10 +1547,10 @@ def _run_bulk_process(exam_id: int, db: Session) -> BulkProcessResult:
     import difflib
 
     import ocr_pipeline
-    from ai_grader import GradeResult, correct_id_text, correct_ocr_text, grade_answer
+    from ai_grader import EssayGradeResult, correct_id_text, correct_ocr_text, grade_essay
     from database import SessionLocal
     from ocr_alignment import crop_content_area, crop_region, detect_and_warp
-    from omr_engine import LOW_CONFIDENCE_THRESHOLD, detect_omr
+    from omr_engine import LOW_CONFIDENCE_THRESHOLD, MULTIPLE_MARKS_LABEL, detect_omr
 
     exam = db.get(m.Exam, exam_id)
     if not exam:
@@ -1630,16 +1743,18 @@ def _run_bulk_process(exam_id: int, db: Session) -> BulkProcessResult:
                 qtype    = (question.question_type if question else "essay") or "essay"
 
                 if qtype == "essay":
-                    result: GradeResult = grade_answer(
-                        question_prompt=question.prompt      if question else "General answer",
-                        rubric=         question.rubric_text if question else "Grade for content and clarity.",
-                        max_points=     question.max_points  if question else 10.0,
-                        ocr_text=       ans.ocr_text,
+                    result: EssayGradeResult = grade_essay(
+                        question_prompt=         question.prompt                if question else "General answer",
+                        rubric_text=             question.rubric_text           if question else "Grade for content and clarity.",
+                        rubric_criteria_json=    question.rubric_criteria_json  if question else None,
+                        max_points=              question.max_points           if question else 10.0,
+                        ocr_text=                ans.ocr_text,
                     )
-                    ans.ai_score        = result.score
-                    ans.ai_feedback     = result.feedback
-                    ans.groq_confidence = result.confidence
-                    ans.status          = "graded"
+                    ans.ai_score                = result.score
+                    ans.ai_feedback             = result.feedback
+                    ans.groq_confidence         = result.confidence
+                    ans.ai_criteria_scores_json = result.criteria_scores_json
+                    ans.status                  = "graded"
                     if result.score == 0.0:
                         _auto_flag(ans, "essay_score_zero", sub_db)
                     elif result.confidence < 0.4:
@@ -1649,11 +1764,24 @@ def _run_bulk_process(exam_id: int, db: Session) -> BulkProcessResult:
                         _auto_flag(ans, "fallback_ocr_ambiguous_question", sub_db)
 
                 elif qtype in ("mcq", "tf"):
+                    max_pts = question.max_points if question else 1.0
+                    if ans.ocr_text.strip() == MULTIPLE_MARKS_LABEL:
+                        # Two or more bubbles were filled — invalid regardless
+                        # of which mark is darkest, so it's an automatic zero.
+                        ans.ai_score    = 0.0
+                        ans.ai_feedback = (
+                            f"Correct answer: {question.correct_answer}. "
+                            "Detected: multiple bubbles marked. "
+                            "Incorrect — more than one option was filled in, so no "
+                            "single answer can be credited. ⚠ Please verify on the original scan."
+                        )
+                        ans.status = "needs_review"
+                        _auto_flag(ans, "omr_multiple_marks", sub_db)
+                        continue
                     correct     = (question.correct_answer or "").strip().upper()
                     given       = ans.ocr_text.strip().upper()
                     given_first = given.split()[0] if given else ""
                     match       = (given_first == correct) or (given == correct)
-                    max_pts     = question.max_points if question else 1.0
                     ans.ai_score    = max_pts if match else 0.0
                     ans.ai_feedback = (
                         f"Correct answer: {question.correct_answer}. "
@@ -2117,6 +2245,15 @@ def delete_exam(exam_id: int, db: Session = Depends(get_db)) -> None:
     db.commit()
 
 
+def _delete_student(student: m.Student, db: Session) -> None:
+    """Cascade-delete a student: enrollments and all submissions (+ files + answers)."""
+    for sub in list(student.submissions):
+        _delete_submission_data(sub, db)
+    for enr in list(student.enrollments):
+        db.delete(enr)
+    db.delete(student)
+
+
 @router.delete("/students/{student_id}", status_code=204)
 def delete_student(student_id: str, db: Session = Depends(get_db)) -> None:
     """
@@ -2126,15 +2263,35 @@ def delete_student(student_id: str, db: Session = Depends(get_db)) -> None:
     student = db.query(m.Student).filter(m.Student.student_id == student_id).first()
     if not student:
         raise HTTPException(status_code=404, detail=f"Student not found: {student_id}")
-
-    for sub in list(student.submissions):
-        _delete_submission_data(sub, db)
-
-    for enr in list(student.enrollments):
-        db.delete(enr)
-
-    db.delete(student)
+    _delete_student(student, db)
     db.commit()
+
+
+@router.post("/students/bulk-delete", response_model=BulkDeleteResult)
+def bulk_delete_students(body: dict, db: Session = Depends(get_db)) -> BulkDeleteResult:
+    """
+    Delete multiple students by a list of student_id strings.
+
+    Body: {"student_ids": ["2024-0001", "2024-0002", ...]}
+    Each deletion cascades to enrollments and all submissions (+ files + answers),
+    same as the single-student delete. Unknown IDs are reported as errors and
+    skipped rather than aborting the whole batch.
+    """
+    student_ids: list[str] = body.get("student_ids", [])
+    deleted = 0
+    errors: list[str] = []
+    for sid in student_ids:
+        sid = str(sid).strip()
+        if not sid:
+            continue
+        student = db.query(m.Student).filter(m.Student.student_id == sid).first()
+        if not student:
+            errors.append(f"Student not found: {sid}")
+            continue
+        _delete_student(student, db)
+        deleted += 1
+    db.commit()
+    return BulkDeleteResult(deleted=deleted, errors=errors)
 
 
 @router.delete("/classes/{class_id}", status_code=204)
@@ -2439,29 +2596,61 @@ def export_grades_csv(exam_id: int, db: Session = Depends(get_db)) -> Response:
 # ---------------------------------------------------------------------------
 
 
+def _read_tabular_dict_rows(
+    raw: bytes, required_columns: list[str] | None = None,
+) -> tuple[list[dict], list[str]]:
+    """
+    Read an uploaded CSV file into a list of dict rows keyed by lowercased,
+    stripped header text. XLSX uploads are converted to CSV client-side
+    before reaching this endpoint (see frontend/src/lib/excelImport.js) —
+    this only ever needs to handle CSV.
+
+    If `required_columns` is given, the header is validated to contain all
+    of them (case-insensitive) before any rows are returned — this catches a
+    missing column even when the file has zero data rows, not just when a
+    later row-access happens to come up empty.
+
+    Returns (rows, errors) — errors is only non-empty (with rows empty) for
+    structural problems: a missing header row or missing required column(s).
+    """
+    try:
+        text = raw.decode("utf-8-sig")   # handles BOM from Excel CSV exports
+    except UnicodeDecodeError:
+        text = raw.decode("latin-1")
+    reader = csv.DictReader(io.StringIO(text))
+    if not reader.fieldnames:
+        return [], ["File has no header row."]
+    header_norm = {h.strip().lower(): h for h in reader.fieldnames if h}
+    if required_columns:
+        missing = [c for c in required_columns if c not in header_norm]
+        if missing:
+            return [], [f"Missing required column(s): {', '.join(missing)}"]
+    rows = [{k: row.get(v) for k, v in header_norm.items()} for row in reader]
+    return rows, []
+
+
 @router.post("/students/import", response_model=ImportResult)
 async def import_students(
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
 ) -> ImportResult:
     """
-    Bulk import students from a CSV file.
+    Bulk import students from a CSV file (the UI also accepts XLSX and
+    converts it to CSV client-side before uploading here).
 
     Expected columns (header row required): student_id, full_name, email (optional)
     Duplicate student_id rows are skipped. Returns created / skipped / error counts.
     """
     raw = await file.read()
-    try:
-        text = raw.decode("utf-8-sig")   # handles BOM from Excel exports
-    except UnicodeDecodeError:
-        text = raw.decode("latin-1")
+    rows, read_errors = _read_tabular_dict_rows(raw)
+    if read_errors:
+        return ImportResult(created=0, skipped=0, errors=read_errors)
 
-    reader = csv.DictReader(io.StringIO(text))
     created = 0
     skipped = 0
     errors: list[str] = []
 
-    for i, row in enumerate(reader, start=2):   # start=2: row 1 is header
+    for i, row in enumerate(rows, start=2):   # start=2: row 1 is header
         sid  = (row.get("student_id") or "").strip()
         name = (row.get("full_name")  or "").strip()
         email = (row.get("email") or "").strip() or None
@@ -2660,6 +2849,83 @@ def clear_rubrics(exam_id: int, db: Session = Depends(get_db)) -> None:
     db.commit()
 
 
+_RUBRIC_CRITERIA_COLUMNS = [
+    "criterion_name", "level_label", "level_points", "level_description",
+]
+
+
+@router.post("/exams/{exam_id}/rubric-criteria/parse", response_model=RubricCriteriaParseResult)
+async def parse_rubric_criteria(
+    exam_id: int,
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+) -> RubricCriteriaParseResult:
+    """
+    Parse an uploaded CSV rubric template into structured criteria (the UI
+    also accepts XLSX and converts it to CSV client-side before uploading here).
+
+    In-memory only — does NOT write to the database. The frontend rubric
+    builder prefills its editable table from the response; the teacher must
+    still save the question for anything to persist.
+
+    Expected columns (header required, case-insensitive): criterion_name,
+    level_label, level_points, level_description. One row per (criterion,
+    level) pair — consecutive rows sharing the same criterion_name are
+    grouped into a single criterion with multiple levels. A criterion's max
+    points is NOT a column — it is always derived as the highest level_points
+    among its rows (kept in sync with the levels that define it).
+    """
+    exam = db.get(m.Exam, exam_id)
+    if not exam:
+        raise HTTPException(status_code=404, detail="Exam not found")
+
+    raw = await file.read()
+    rows, read_errors = _read_tabular_dict_rows(raw, required_columns=_RUBRIC_CRITERIA_COLUMNS)
+    if read_errors:
+        return RubricCriteriaParseResult(criteria=[], errors=read_errors)
+    rows = [row for row in rows if any((row.get(c) or "").strip() for c in _RUBRIC_CRITERIA_COLUMNS)]
+
+    # Group rows into criteria, preserving first-seen order (case-insensitive
+    # match on criterion_name so minor casing differences don't split a
+    # criterion across two groups).
+    criteria_order: list[str] = []
+    criteria_map: dict[str, dict] = {}
+    errors: list[str] = []
+
+    for i, row in enumerate(rows, start=2):
+        name = str(row.get("criterion_name") or "").strip()
+        if not name:
+            errors.append(f"Row {i}: missing criterion_name — skipped")
+            continue
+
+        label = str(row.get("level_label") or "").strip()
+        lvl_points_raw = str(row.get("level_points") or "").strip()
+        lvl_points = None
+        if lvl_points_raw:
+            try:
+                lvl_points = float(lvl_points_raw)
+            except ValueError:
+                errors.append(
+                    f"Row {i}: level_points '{lvl_points_raw}' is not a number — level skipped"
+                )
+        description = str(row.get("level_description") or "").strip()
+
+        key = name.lower()
+        if key not in criteria_map:
+            criteria_map[key] = {"name": name, "max_points": 0.0, "levels": []}
+            criteria_order.append(key)
+
+        if label and lvl_points is not None:
+            criteria_map[key]["levels"].append({
+                "label": label, "points": lvl_points, "description": description,
+            })
+            # max_points is derived, not a column — always the highest level_points seen so far.
+            criteria_map[key]["max_points"] = max(criteria_map[key]["max_points"], lvl_points)
+
+    criteria = [criteria_map[key] for key in criteria_order]
+    return RubricCriteriaParseResult(criteria=criteria, errors=errors)
+
+
 @router.post("/exams/{exam_id}/duplicate", response_model=ExamRead)
 def duplicate_exam(exam_id: int, db: Session = Depends(get_db)) -> m.Exam:
     """
@@ -2704,6 +2970,7 @@ def duplicate_exam(exam_id: int, db: Session = Depends(get_db)) -> m.Exam:
             prompt=q.prompt,
             question_type=q.question_type,
             rubric_text=q.rubric_text,
+            rubric_criteria_json=q.rubric_criteria_json,
             max_points=q.max_points,
             choices_json=q.choices_json,
             correct_answer=q.correct_answer,

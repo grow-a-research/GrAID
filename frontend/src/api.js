@@ -53,6 +53,7 @@ export const api = {
     create: (body) => req('POST', `${V1}/students`, body),
     update: (studentId, body) => req('PATCH', `${V1}/students/${studentId}`, body),
     delete: (studentId) => req('DELETE', `${V1}/students/${studentId}`),
+    bulkDelete: (studentIds) => req('POST', `${V1}/students/bulk-delete`, { student_ids: studentIds }),
     import: (file) => upload(`${V1}/students/import`, file),
     analytics: (studentId) => req('GET', `${V1}/students/${studentId}/analytics`),
     analyze: (studentId) => req('POST', `${V1}/students/${studentId}/analyze`),
@@ -70,6 +71,9 @@ export const api = {
       update: (examId, qId, body) => req('PATCH', `${V1}/exams/${examId}/questions/${qId}`, body),
       delete: (examId, qId) => req('DELETE', `${V1}/exams/${examId}/questions/${qId}`),
       import: (examId, file) => upload(`${V1}/exams/${examId}/questions/import`, file),
+      rubricCriteria: {
+        parse: (examId, file) => upload(`${V1}/exams/${examId}/rubric-criteria/parse`, file),
+      },
     },
     batchUpload: (examId, files) => {
       const fd = new FormData()
@@ -83,6 +87,7 @@ export const api = {
     generateTemplate: (examId) => req('POST', `${V1}/exams/${examId}/template`),
     templatePdfUrl: (examId) => `${V1}/exams/${examId}/template/pdf`,
     questionnairePdfUrl: (examId) => `${V1}/exams/${examId}/questionnaire/pdf`,
+    rubricPdfUrl: (examId) => `${V1}/exams/${examId}/rubric/pdf`,
     allPapersZipUrl: (examId) => `${V1}/exams/${examId}/papers/zip`,
     submissions: (examId) => req('GET', `${V1}/exams/${examId}/submissions`),
     analytics: (examId) => req('GET', `${V1}/exams/${examId}/analytics`),

@@ -81,6 +81,11 @@ class ExamQuestion(Base):
     prompt: Mapped[str] = mapped_column(Text)
     question_type: Mapped[str] = mapped_column(String(32), default="essay")
     rubric_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Structured rubric — JSON list of criteria, each with name, max_points, and
+    # a list of performance levels ({label, points, description}). When set,
+    # this takes over from rubric_text for grading and PDF export, and
+    # max_points is kept in sync as sum(criteria max_points) server-side.
+    rubric_criteria_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     max_points: Mapped[float] = mapped_column(Float, default=10.0)
     # MCQ choices as JSON list of strings, e.g. ["Paris", "London", "Berlin", "Rome"]
     choices_json: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -150,6 +155,10 @@ class SubmissionAnswer(Base):
     # Phase 6 — AI grading (Groq)
     ai_score: Mapped[float | None] = mapped_column(Float, nullable=True)
     ai_feedback: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Structured per-criterion grading breakdown — JSON list of
+    # {criterion, max_points, score, justification}. Populated only when the
+    # question has a structured rubric (rubric_criteria_json); NULL otherwise.
+    ai_criteria_scores_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     # OCR quality metrics (populated when reference text is available)
     cer: Mapped[float | None] = mapped_column(Float, nullable=True)
     wer: Mapped[float | None] = mapped_column(Float, nullable=True)
