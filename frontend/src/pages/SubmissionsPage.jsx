@@ -282,7 +282,6 @@ export default function SubmissionsPage() {
     if (!selectedSub) return
     const a = document.createElement('a')
     a.href = api.submissions.paperUrl(selectedSub.id)
-    a.download = `submission_${selectedSub.id}_paper.pdf`
     document.body.appendChild(a); a.click(); a.remove()
   }
 

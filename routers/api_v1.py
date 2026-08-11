@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import shutil
+import time
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -778,11 +779,21 @@ def run_submission_ocr(
                         # ── OCR path (essay / identification / no bubbles) ────
                         crop = crop_region(warped, region, template_spec)
                         ocr_clarity_val: float | None = _crop_clarity(crop)
+                        t_ocr = time.perf_counter()
                         ocr_text, boxes, _ = ocr_pipeline.run_ocr_pipeline(crop)
+                        logger.info(
+                            "[Timing] submission %d q%d: remote OCR call took %.2fs",
+                            submission_id, q.id, time.perf_counter() - t_ocr,
+                        )
                         # MCQ/TF without bubbles: skip Groq correction (answer is
                         # a single letter/word — correction may mangle it)
                         if qtype == "essay":
+                            t_corr = time.perf_counter()
                             ocr_text = correct_ocr_text(ocr_text)
+                            logger.info(
+                                "[Timing] submission %d q%d: Groq OCR-correction call took %.2fs",
+                                submission_id, q.id, time.perf_counter() - t_corr,
+                            )
                         elif qtype == "identification":
                             ocr_text = correct_id_text(ocr_text)
                         boxes_data = json.dumps(
@@ -1162,13 +1173,19 @@ def download_rubric_pdf(exam_id: int, db: Session = Depends(get_db)) -> Response
     )
 
 
+def _safe_filename_part(s: str) -> str:
+    """Strip characters illegal in filenames and collapse whitespace to underscores."""
+    cleaned = "".join(c if c not in '\\/:*?"<>|' else "_" for c in s)
+    return "_".join(cleaned.split())
+
+
 @router.get("/exams/{exam_id}/papers/zip")
 def download_all_papers_zip(exam_id: int, db: Session = Depends(get_db)) -> StreamingResponse:
     """
     Generate personalised PDFs for every enrolled student and return them as a ZIP.
 
     Each file inside the ZIP is named:
-        {exam_code}_{student_id}.pdf
+        {exam_code}_{student_name}_{student_id}.pdf
 
     Requires that the exam template has already been generated.
     """
@@ -1221,7 +1238,7 @@ def download_all_papers_zip(exam_id: int, db: Session = Depends(get_db)) -> Stre
                 student_id=student.student_id,
                 student_name=student.full_name,
             )
-            filename = f"{exam.exam_code}_{student.student_id}.pdf"
+            filename = f"{exam.exam_code}_{_safe_filename_part(student.full_name)}_{student.student_id}.pdf"
             zf.writestr(filename, pdf_bytes)
 
     buf.seek(0)
@@ -1260,7 +1277,10 @@ def download_student_paper(submission_id: int, db: Session = Depends(get_db)) ->
 
     _PAPERS_DIR.mkdir(parents=True, exist_ok=True)
     cached_path = _PAPERS_DIR / f"submission_{submission_id}.pdf"
-    filename    = f"exam_{exam.exam_code}_{student.student_id if student else submission_id}.pdf"
+    filename    = (
+        f"{exam.exam_code}_{_safe_filename_part(student.full_name)}_{student.student_id}.pdf"
+        if student else f"{exam.exam_code}_{submission_id}.pdf"
+    )
 
     if not cached_path.exists():
         questions = (
@@ -1389,12 +1409,17 @@ def grade_submission(
         if qtype == "essay":
             # --- AI grading via Groq ---
             try:
+                t_grade = time.perf_counter()
                 result: EssayGradeResult = grade_essay(
                     question_prompt=         question.prompt                if question else "General answer",
                     rubric_text=             question.rubric_text           if question else "Grade for content and clarity.",
                     rubric_criteria_json=    question.rubric_criteria_json  if question else None,
                     max_points=              question.max_points           if question else 10.0,
                     ocr_text=                ans.ocr_text,
+                )
+                logger.info(
+                    "[Timing] submission %d ans%d: Groq grading call took %.2fs",
+                    ans.submission_id, ans.id, time.perf_counter() - t_grade,
                 )
                 ans.ai_score               = result.score
                 ans.ai_feedback            = result.feedback
