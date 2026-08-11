@@ -527,6 +527,20 @@ def _looks_like_runaway_correction(raw_text: str, corrected: str) -> bool:
     # runaway generations repeat the answer across several restated drafts.
     if len(corrected) > max(200, len(raw_text) * 3):
         return True
+    # Structural check, independent of exact wording: a genuine layout-only
+    # cleanup transforms the text, so it should never contain the complete,
+    # unmodified raw OCR text sitting verbatim inside a longer response —
+    # that pattern means the model echoed the original (often followed by
+    # narration like "becomes" or a second "corrected" copy) instead of
+    # returning the cleaned text once. Keyword lists only catch phrasings
+    # seen before; this catches the shape of the bug regardless of wording.
+    raw_stripped = raw_text.strip()
+    if (
+        len(raw_stripped) > 40
+        and raw_stripped in corrected
+        and len(corrected) > len(raw_stripped) + 20
+    ):
+        return True
     return False
 
 _OCR_CORRECTION_SYSTEM = """\
@@ -544,12 +558,20 @@ Your ONLY job is to fix how the text is LAID OUT, never what it says:
      (e.g. starts with "Q1.", "Question", or ends with "?")
    - Keep only the student's answer text.
 
-2. MERGE fragmented lines into paragraphs:
-   - OCR line detection may have split one continuous paragraph into many
-     short lines. Merge lines that are part of the same sentence/thought
-     into one continuous paragraph.
-   - Only keep a line break where it clearly marks the start of a new
-     paragraph.
+2. MERGE fragmented lines ONLY when a line is a physical mid-sentence wrap —
+   i.e. the line does NOT end with sentence-ending punctuation (. ? ! :)
+   and clearly continues, unfinished, on the next line. In that case join
+   them with a single space instead of a line break.
+   - Do NOT merge two lines just because they discuss the same topic. If a
+     line already ends with sentence-ending punctuation, it is a complete
+     sentence/thought on its own — keep it on its own line, even if the
+     next line continues the same general subject.
+   - Example: these two input lines already end in punctuation, so the
+     correct output keeps them exactly as two separate lines:
+       It is bad because it is cheating.
+       But sometimes it is okay if you are lazy.
+   - A student writing several short, complete sentences one per line is a
+     real, intentional structure. Preserve it exactly as written.
 
 3. Separate distinct paragraphs with a blank line.
 
@@ -566,6 +588,10 @@ Absolutely forbidden, even if it looks like an "obvious" fix:
   reformatted text", "however, the above still has...", or any other
   narration about what you just did or are about to do — you have exactly
   ONE attempt, output the answer and stop.
+- Do NOT show a before/after comparison, and never write the word "becomes"
+  (or "changes to", "turns into", etc.) followed by a second version of the
+  text. Output the final cleaned text exactly once — never the original
+  text followed by the corrected one.
 
 Return ONLY the cleaned-up text itself — nothing else. No labels, no
 explanation, no meta-commentary, no multiple drafts."""
