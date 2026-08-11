@@ -10,6 +10,7 @@ from __future__ import annotations
 import base64
 import io
 import os
+import time
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -49,7 +50,18 @@ MODELS: Optional[Models] = None
 # Model loading
 # ---------------------------------------------------------------------------
 
-def load_models() -> None:
+def load_models(force_local: bool = False) -> None:
+    """
+    Load OCR models, or set up remote delegation.
+
+    force_local=True is for vast_ocr_server.py, which IS the model host — it
+    clears REMOTE_OCR_URL before calling this specifically so it always loads
+    Surya/Qwen locally, regardless. Every other caller (the main app) leaves
+    force_local=False: with no REMOTE_OCR_URL configured there, OCR just
+    isn't available yet (MODELS stays None, endpoints 503) rather than
+    silently loading the full model stack onto whatever local GPU happens to
+    be present — that surprised more than it helped in practice.
+    """
     global MODELS
     if MODELS is not None:
         return
@@ -63,6 +75,13 @@ def load_models() -> None:
         except Exception as e:
             print(f"[Models] WARNING: could not reach remote OCR server yet: {e}")
         MODELS = Models(surya_detector=None, qwen_model=None, qwen_processor=None)
+        return
+
+    if not force_local:
+        print(
+            "[Models] No REMOTE_OCR_URL set — OCR endpoints will return 503 "
+            "until one is configured and the server is restarted."
+        )
         return
 
     print("[Models] Checking CUDA...")
@@ -88,10 +107,14 @@ def load_models() -> None:
     qwen_processor = AutoProcessor.from_pretrained(QWEN_MODEL_ID, trust_remote_code=True)
 
     print("[Models] Loading Qwen model in 8-bit (this may take several minutes)...")
+    # Pinned to a single GPU on purpose: this 7B model only needs ~8-10GB in
+    # 8-bit, which fits on one card with room to spare. device_map="auto"
+    # would split it across all visible GPUs, adding PCIe cross-GPU transfer
+    # overhead on every forward pass for no VRAM benefit on a rig like this.
     qwen_model = AutoModelForVision2Seq.from_pretrained(
         QWEN_MODEL_ID,
         quantization_config=bnb_config,
-        device_map="auto",
+        device_map={"": 0},
         torch_dtype=torch.float16,
         trust_remote_code=True,
     )
@@ -261,8 +284,18 @@ def crop_lines(
 # Qwen inference
 # ---------------------------------------------------------------------------
 
+# How many line-crops go through generate() together. Bigger batches use the
+# GPU more efficiently (one forward pass instead of many) but cost more VRAM;
+# 8 is comfortable headroom on a 16GB card for this model. Override with
+# QWEN_OCR_BATCH_SIZE if a page has unusually many/large line crops.
+_OCR_BATCH_SIZE = int(os.getenv("QWEN_OCR_BATCH_SIZE", "8"))
+
+
 def qwen_ocr_lines(line_images: list[Image.Image]) -> list[str]:
     assert MODELS is not None
+    if not line_images:
+        return []
+
     prompt = (
         "Transcribe EXACTLY what is written in this image line, character-for-character. "
         "This is a handwriting recognition task, not a writing-correction task — report "
@@ -277,25 +310,41 @@ def qwen_ocr_lines(line_images: list[Image.Image]) -> list[str]:
         "do not substitute a different, more common real word. Output only the transcribed "
         "text, nothing else."
     )
+
+    # Left-padding is required for batched causal-LM generation: with
+    # right-padding each sequence's real last token would sit at a different
+    # column, so the model would start generating from padding instead of
+    # from the end of the actual prompt.
+    if MODELS.qwen_processor.tokenizer.padding_side != "left":
+        MODELS.qwen_processor.tokenizer.padding_side = "left"
+
     texts: list[str] = []
-    for img in line_images:
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image", "image": img},
-                    {"type": "text", "text": prompt},
-                ],
-            }
+    for start in range(0, len(line_images), _OCR_BATCH_SIZE):
+        batch_images = line_images[start:start + _OCR_BATCH_SIZE]
+        batch_messages = [
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "image": img},
+                        {"type": "text", "text": prompt},
+                    ],
+                }
+            ]
+            for img in batch_images
         ]
-        text = MODELS.qwen_processor.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
-        )
-        image_inputs, video_inputs = process_vision_info(messages)
+        batch_texts = [
+            MODELS.qwen_processor.apply_chat_template(
+                msgs, tokenize=False, add_generation_prompt=True
+            )
+            for msgs in batch_messages
+        ]
+        image_inputs, video_inputs = process_vision_info(batch_messages)
         inputs = MODELS.qwen_processor(
-            text=[text],
+            text=batch_texts,
             images=image_inputs,
             videos=video_inputs,
+            padding=True,
             return_tensors="pt",
         )
         inputs = {k: v.to(MODELS.qwen_model.device) for k, v in inputs.items() if hasattr(v, "to")}
@@ -307,10 +356,13 @@ def qwen_ocr_lines(line_images: list[Image.Image]) -> list[str]:
                 do_sample=False,
             )
 
+        # Left-padding keeps every sequence's prompt the same length, so one
+        # slice index correctly strips the prompt off all rows in the batch.
         prompt_len = inputs["input_ids"].shape[1]
         gen_only = output_ids[:, prompt_len:]
         decoded = MODELS.qwen_processor.batch_decode(gen_only, skip_special_tokens=True)
-        texts.append(decoded[0].strip())
+        texts.extend(t.strip() for t in decoded)
+
     return texts
 
 
@@ -338,7 +390,11 @@ def run_ocr_pipeline(
         det_img = original.convert("RGB")
     else:
         det_img = preprocess_for_detection(original)
+
+    t_surya = time.perf_counter()
     preds = MODELS.surya_detector([det_img])
+    print(f"[Timing] Surya line-detection took {time.perf_counter() - t_surya:.2f}s")
+
     pred0 = preds[0] if preds else None
     boxes = _extract_surya_xyxy(pred0)
     boxes = merge_overlapping_boxes(boxes)
@@ -351,7 +407,12 @@ def run_ocr_pipeline(
         return "", [], boxed
 
     line_crops = crop_lines(original, boxes_sorted)
+    t_qwen = time.perf_counter()
     line_texts = qwen_ocr_lines(line_crops)
+    print(
+        f"[Timing] Qwen transcription of {len(line_crops)} line(s) took "
+        f"{time.perf_counter() - t_qwen:.2f}s"
+    )
     clean_lines = [" ".join(t.split()) for t in line_texts if t and t.strip()]
     full_text = "\n".join(clean_lines).strip()
 

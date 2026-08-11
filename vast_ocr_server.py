@@ -38,6 +38,7 @@ os.environ["HF_HUB_CACHE"] = os.path.join(CACHE_DIR, "hub")
 os.environ.pop("REMOTE_OCR_URL", None)
 
 import io  # noqa: E402
+import time  # noqa: E402
 from contextlib import asynccontextmanager  # noqa: E402
 from typing import AsyncIterator  # noqa: E402
 
@@ -58,7 +59,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             "Vast.ai instance and that `nvidia-smi` works before starting this server."
         )
     print(f"[Models] CUDA OK — {torch.cuda.get_device_name(0)}")
-    ocr_pipeline.load_models()
+    ocr_pipeline.load_models(force_local=True)
     yield
 
 
@@ -77,6 +78,7 @@ async def ocr(file: UploadFile = File(...)) -> JSONResponse:
     if ocr_pipeline.MODELS is None:
         raise HTTPException(status_code=503, detail="Models not loaded")
 
+    t_start = time.perf_counter()
     raw = await file.read()
     try:
         original = Image.open(io.BytesIO(raw)).convert("RGB")
@@ -84,12 +86,16 @@ async def ocr(file: UploadFile = File(...)) -> JSONResponse:
         raise HTTPException(status_code=400, detail=f"Invalid image: {e}") from e
 
     full_text, boxes, boxed = ocr_pipeline.run_ocr_pipeline(original)
-
-    return JSONResponse({
+    response = JSONResponse({
         "text": full_text,
         "boxes": [list(b) for b in boxes],
         "boxed_image_png_base64": ocr_pipeline.encode_png_base64(boxed),
     })
+    # Everything from receiving the upload to building the response — compare
+    # this against the local machine's round-trip time for the same request
+    # to see how much of the gap is network transfer vs. this server's work.
+    print(f"[Timing] /ocr request handled server-side in {time.perf_counter() - t_start:.2f}s")
+    return response
 
 
 if __name__ == "__main__":
