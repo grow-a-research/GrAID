@@ -1,8 +1,14 @@
 import io
+import logging
 import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import AsyncIterator
+
+# Nothing else in this project calls logging.basicConfig(), so without this,
+# every logger.info() call across the app (including job_queue.py's timing
+# logs) has no handler attached anywhere and prints nothing.
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s: %(message)s")
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware

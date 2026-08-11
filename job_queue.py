@@ -16,6 +16,7 @@ import asyncio
 import difflib
 import json
 import logging
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -123,6 +124,7 @@ def _process_job_sync(job: dict) -> None:
     import db_models as m
 
     submission_id = job["submission_id"]
+    job_start = time.perf_counter()
     db = SessionLocal()
     try:
         sub = db.get(m.Submission, submission_id)
@@ -187,7 +189,12 @@ def _process_job_sync(job: dict) -> None:
             aligned  = False
 
             if template_spec:
+                t0 = time.perf_counter()
                 warped, aligned = detect_and_warp(image, template_spec)
+                logger.info(
+                    "[Timing] submission %d p%d: align/warp took %.2fs",
+                    submission_id, sf.page_number, time.perf_counter() - t0,
+                )
                 if aligned:
                     try:
                         _save_png(warped, dest_dir / f"aligned_p{sf.page_number}.png")
@@ -218,9 +225,19 @@ def _process_job_sync(job: dict) -> None:
                         else:
                             crop        = crop_region(warped, region, template_spec)
                             ocr_clarity = _laplacian_var(crop)
+                            t_ocr = time.perf_counter()
                             ocr_text, boxes, _ = ocr_pipeline.run_ocr_pipeline(crop)
+                            logger.info(
+                                "[Timing] submission %d q%d: remote OCR call took %.2fs",
+                                submission_id, q.id, time.perf_counter() - t_ocr,
+                            )
                             if qtype not in ("mcq", "tf"):
+                                t_corr = time.perf_counter()
                                 ocr_text = correct_ocr_text(ocr_text)
+                                logger.info(
+                                    "[Timing] submission %d q%d: Groq OCR-correction call took %.2fs",
+                                    submission_id, q.id, time.perf_counter() - t_corr,
+                                )
                             boxes_data = json.dumps(
                                 [{"x1": b[0], "y1": b[1], "x2": b[2], "y2": b[3]}
                                  for b in boxes]
@@ -236,8 +253,18 @@ def _process_job_sync(job: dict) -> None:
             if not aligned:
                 fallback    = crop_content_area(image, template_spec)
                 ocr_clarity = _laplacian_var(fallback)
+                t_ocr = time.perf_counter()
                 ocr_text, boxes, _ = ocr_pipeline.run_ocr_pipeline(fallback)
+                logger.info(
+                    "[Timing] submission %d p%d: remote OCR call (fallback) took %.2fs",
+                    submission_id, sf.page_number, time.perf_counter() - t_ocr,
+                )
+                t_corr = time.perf_counter()
                 ocr_text   = correct_ocr_text(ocr_text)
+                logger.info(
+                    "[Timing] submission %d p%d: Groq OCR-correction call (fallback) took %.2fs",
+                    submission_id, sf.page_number, time.perf_counter() - t_corr,
+                )
                 boxes_data = json.dumps(
                     [{"x1": b[0], "y1": b[1], "x2": b[2], "y2": b[3]} for b in boxes]
                 )
@@ -263,12 +290,17 @@ def _process_job_sync(job: dict) -> None:
             qtype    = (question.question_type if question else "essay") or "essay"
 
             if qtype == "essay":
+                t_grade = time.perf_counter()
                 result: EssayGradeResult = grade_essay(
                     question_prompt=         question.prompt                if question else "General answer",
                     rubric_text=             question.rubric_text           if question else "Grade for content and clarity.",
                     rubric_criteria_json=    question.rubric_criteria_json  if question else None,
                     max_points=              question.max_points           if question else 10.0,
                     ocr_text=                ans.ocr_text,
+                )
+                logger.info(
+                    "[Timing] submission %d ans%d: Groq grading call took %.2fs",
+                    submission_id, ans.id, time.perf_counter() - t_grade,
                 )
                 ans.ai_score                = result.score
                 ans.ai_feedback             = result.feedback
@@ -347,7 +379,10 @@ def _process_job_sync(job: dict) -> None:
 
         sub.status = "graded"
         db.commit()
-        logger.info("Queue: submission %d done (OCR + graded).", submission_id)
+        logger.info(
+            "Queue: submission %d done (OCR + graded) — total %.2fs",
+            submission_id, time.perf_counter() - job_start,
+        )
 
     finally:
         db.close()
