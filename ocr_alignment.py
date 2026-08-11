@@ -35,6 +35,13 @@ _DETECTOR     = cv2.aruco.ArucoDetector(_ARUCO_DICT, _ARUCO_PARAMS)
 
 MM_PER_INCH: float = 25.4
 
+# Cap on the longest side (px) of the throwaway copy used for ArUco marker
+# detection — see the scaling comment in detect_and_warp(). Generous enough
+# that a page's markers (typically 15-20mm) stay comfortably resolvable
+# after downscaling; lower this further only if detection reliability is
+# reconfirmed at the smaller size.
+_DETECTION_MAX_DIM: int = 1600
+
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -247,8 +254,22 @@ def detect_and_warp(
     # no deskew — see _detection_copy), but warp the ORIGINAL pixels below.
     # This keeps denoise/CLAHE/resample artifacts out of what Qwen sees.
     original_rgb = np.array(scan.convert("RGB"))
-    detect_rgb   = _detection_copy(original_rgb)
-    gray         = cv2.cvtColor(detect_rgb, cv2.COLOR_RGB2GRAY)
+
+    # fastNlMeansDenoisingColored (inside _detection_copy) scales with pixel
+    # count and dominates this function's runtime on a full-resolution phone
+    # photo (12MP+), even though ArUco marker edges are still easily
+    # resolvable at a much lower resolution. Detect on a downscaled copy —
+    # cheap — then scale the found corners back up to original-image pixel
+    # space before computing the homography, so the warp below still uses
+    # full-resolution pixels and OCR quality is unaffected.
+    h, w  = original_rgb.shape[:2]
+    scale = min(1.0, _DETECTION_MAX_DIM / max(h, w))
+    small_rgb  = (
+        cv2.resize(original_rgb, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+        if scale < 1.0 else original_rgb
+    )
+    detect_rgb = _detection_copy(small_rgb)
+    gray       = cv2.cvtColor(detect_rgb, cv2.COLOR_RGB2GRAY)
 
     corners_list, ids, _ = _DETECTOR.detectMarkers(gray)
 
@@ -258,6 +279,9 @@ def detect_and_warp(
             "ArUco: only %d marker(s) detected — falling back to full-page OCR", n_found
         )
         return preprocess_scan(scan), False
+
+    if scale < 1.0:
+        corners_list = [c / scale for c in corners_list]
 
     template_corners = _template_marker_corners(template_spec)
     ids_flat = ids.flatten().tolist()
