@@ -251,6 +251,29 @@ function parseIdentificationResult(feedback) {
   return { expected, given, percent, kind }
 }
 
+// Backend flattens structured per-criterion essay grading into one string, e.g.
+// "Stance & Argument: 9.5/10 (Clear & Strong) — ...; Word Count & Focus: 5/5
+// (Clear & Strong) — ...". Parse it back into rows for answers graded before
+// ai_criteria_scores_json started being saved (or where it failed to save) —
+// same fallback pattern as parseIdentificationResult. Returns null if the
+// text doesn't match this format.
+function parseCriteriaFeedback(feedback) {
+  if (!feedback) return null
+  const itemRe = /([^:;]+):\s*([\d.]+)\/([\d.]+)(?:\s*\(([^()]+)\))?\s*—\s*([\s\S]*?)(?=(?:;\s*[^:;]+:\s*[\d.]+\/[\d.]+)|$)/g
+  const rows = []
+  for (const m of feedback.matchAll(itemRe)) {
+    const [, criterion, score, maxPoints, level, justification] = m
+    rows.push({
+      criterion: criterion.trim(),
+      score: parseFloat(score),
+      max_points: parseFloat(maxPoints),
+      level: level ?? '',
+      justification: justification.trim(),
+    })
+  }
+  return rows.length > 0 ? rows : null
+}
+
 function AnswerCard({ answer, question, flag, onOverrideSaved, onFlagChange }) {
   const [scoreInput, setScoreInput] = useState(
     answer.teacher_score != null ? String(answer.teacher_score) : ''
@@ -277,6 +300,9 @@ function AnswerCard({ answer, question, flag, onOverrideSaved, onFlagChange }) {
 
   let criteriaScores = []
   try { criteriaScores = answer.ai_criteria_scores_json ? JSON.parse(answer.ai_criteria_scores_json) : [] } catch {}
+  if (criteriaScores.length === 0 && qtype === 'essay') {
+    criteriaScores = parseCriteriaFeedback(answer.ai_feedback) ?? []
+  }
 
   let rubricCriteria = []
   try { rubricCriteria = question?.rubric_criteria_json ? JSON.parse(question.rubric_criteria_json) : [] } catch {}
