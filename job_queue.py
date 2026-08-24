@@ -226,12 +226,23 @@ def _process_job_sync(job: dict) -> None:
                             crop        = crop_region(warped, region, template_spec)
                             ocr_clarity = _laplacian_var(crop)
                             t_ocr = time.perf_counter()
-                            ocr_text, boxes, _ = ocr_pipeline.run_ocr_pipeline(crop)
+                            ocr_text, boxes, _ = ocr_pipeline.run_ocr_pipeline(crop, include_boxed_image=False)
                             logger.info(
                                 "[Timing] submission %d q%d: remote OCR call took %.2fs",
                                 submission_id, q.id, time.perf_counter() - t_ocr,
                             )
-                            if qtype not in ("mcq", "tf"):
+                            if not ocr_text.strip():
+                                # A legible crop returning zero text is a known transient
+                                # hiccup on the remote OCR service, not a bad crop — one
+                                # retry usually recovers it (confirmed by hand: replaying
+                                # the exact same crop through the pipeline succeeds).
+                                logger.warning(
+                                    "submission %d q%d: OCR returned empty text — retrying once",
+                                    submission_id, q.id,
+                                )
+                                ocr_text, boxes, _ = ocr_pipeline.run_ocr_pipeline(crop, include_boxed_image=False)
+
+                            if qtype not in ("mcq", "tf") and ocr_text.strip():
                                 t_corr = time.perf_counter()
                                 ocr_text = correct_ocr_text(ocr_text)
                                 logger.info(
@@ -242,7 +253,7 @@ def _process_job_sync(job: dict) -> None:
                                 [{"x1": b[0], "y1": b[1], "x2": b[2], "y2": b[3]}
                                  for b in boxes]
                             )
-                            ans_status = "done"
+                            ans_status = "done" if ocr_text.strip() else "needs_review"
 
                         _upsert_answer(
                             db, sub.id, q.id, sf.page_number,
@@ -254,7 +265,7 @@ def _process_job_sync(job: dict) -> None:
                 fallback    = crop_content_area(image, template_spec)
                 ocr_clarity = _laplacian_var(fallback)
                 t_ocr = time.perf_counter()
-                ocr_text, boxes, _ = ocr_pipeline.run_ocr_pipeline(fallback)
+                ocr_text, boxes, _ = ocr_pipeline.run_ocr_pipeline(fallback, include_boxed_image=False)
                 logger.info(
                     "[Timing] submission %d p%d: remote OCR call (fallback) took %.2fs",
                     submission_id, sf.page_number, time.perf_counter() - t_ocr,

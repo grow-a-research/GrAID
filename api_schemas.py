@@ -210,7 +210,9 @@ class SubmissionAnswerRead(BaseModel):
 
 # --- Teacher override ---
 class TeacherOverride(BaseModel):
-    teacher_score: float = Field(..., ge=0)
+    # Optional so a reference_text-only request can compute CER/WER without
+    # also having to submit a score override (see teacher_override()).
+    teacher_score: float | None = Field(default=None, ge=0)
     teacher_note: str | None = None
     # Optional ground-truth transcription — when provided, CER/WER are computed
     # against ocr_text to measure OCR accuracy for that answer.

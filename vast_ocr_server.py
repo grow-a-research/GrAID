@@ -74,7 +74,7 @@ def health() -> dict[str, str]:
 
 
 @app.post("/ocr")
-async def ocr(file: UploadFile = File(...)) -> JSONResponse:
+async def ocr(file: UploadFile = File(...), include_boxed_image: bool = True) -> JSONResponse:
     if ocr_pipeline.MODELS is None:
         raise HTTPException(status_code=503, detail="Models not loaded")
 
@@ -86,10 +86,15 @@ async def ocr(file: UploadFile = File(...)) -> JSONResponse:
         raise HTTPException(status_code=400, detail=f"Invalid image: {e}") from e
 
     full_text, boxes, boxed = ocr_pipeline.run_ocr_pipeline(original)
+    # Every grading call site discards the annotated debug image — only the
+    # OCR Tool page actually displays it. Skipping the PNG encode + base64
+    # (which inflates size ~33%) saves real time on both ends of the wire
+    # for the calls that never use it.
+    boxed_b64 = ocr_pipeline.encode_png_base64(boxed) if include_boxed_image else ""
     response = JSONResponse({
         "text": full_text,
         "boxes": [list(b) for b in boxes],
-        "boxed_image_png_base64": ocr_pipeline.encode_png_base64(boxed),
+        "boxed_image_png_base64": boxed_b64,
     })
     # Everything from receiving the upload to building the response — compare
     # this against the local machine's round-trip time for the same request

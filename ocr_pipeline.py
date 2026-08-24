@@ -291,7 +291,13 @@ def crop_lines(
 _OCR_BATCH_SIZE = int(os.getenv("QWEN_OCR_BATCH_SIZE", "8"))
 
 
-def qwen_ocr_lines(line_images: list[Image.Image]) -> list[str]:
+def qwen_ocr_lines(line_images: list[Image.Image]) -> list[tuple[str, float]]:
+    """
+    Returns (transcribed_text, confidence) per line. Confidence is the
+    minimum per-token generation probability Qwen assigned along the line —
+    its own least-certain moment — distinct from ocr_clarity (pre-OCR image
+    blur) and from the grader's later self-reported confidence.
+    """
     assert MODELS is not None
     if not line_images:
         return []
@@ -315,10 +321,14 @@ def qwen_ocr_lines(line_images: list[Image.Image]) -> list[str]:
     # right-padding each sequence's real last token would sit at a different
     # column, so the model would start generating from padding instead of
     # from the end of the actual prompt.
-    if MODELS.qwen_processor.tokenizer.padding_side != "left":
-        MODELS.qwen_processor.tokenizer.padding_side = "left"
+    tokenizer = MODELS.qwen_processor.tokenizer
+    if tokenizer.padding_side != "left":
+        tokenizer.padding_side = "left"
+    # Positions from the first EOS/pad token onward are generation padding,
+    # not real transcription — excluded when reducing to a line confidence.
+    stop_ids = {tokenizer.pad_token_id, tokenizer.eos_token_id} - {None}
 
-    texts: list[str] = []
+    texts: list[tuple[str, float]] = []
     for start in range(0, len(line_images), _OCR_BATCH_SIZE):
         batch_images = line_images[start:start + _OCR_BATCH_SIZE]
         batch_messages = [
@@ -350,18 +360,30 @@ def qwen_ocr_lines(line_images: list[Image.Image]) -> list[str]:
         inputs = {k: v.to(MODELS.qwen_model.device) for k, v in inputs.items() if hasattr(v, "to")}
 
         with torch.inference_mode():
-            output_ids = MODELS.qwen_model.generate(
+            outputs = MODELS.qwen_model.generate(
                 **inputs,
                 max_new_tokens=128,
                 do_sample=False,
+                output_scores=True,
+                return_dict_in_generate=True,
             )
 
         # Left-padding keeps every sequence's prompt the same length, so one
         # slice index correctly strips the prompt off all rows in the batch.
         prompt_len = inputs["input_ids"].shape[1]
-        gen_only = output_ids[:, prompt_len:]
+        gen_only = outputs.sequences[:, prompt_len:]
         decoded = MODELS.qwen_processor.batch_decode(gen_only, skip_special_tokens=True)
-        texts.extend(t.strip() for t in decoded)
+
+        # outputs.scores[t] = pre-softmax logits for generation step t, shape
+        # (batch, vocab) — gather the probability the model actually assigned
+        # to the token it went with at each step.
+        step_probs = torch.stack(outputs.scores, dim=1).softmax(dim=-1)
+        token_probs = step_probs.gather(2, gen_only.unsqueeze(-1)).squeeze(-1)
+
+        for row_ids, row_probs, text in zip(gen_only.tolist(), token_probs, decoded):
+            real_len = next((i for i, tid in enumerate(row_ids) if tid in stop_ids), len(row_ids))
+            confidence = row_probs[:real_len].min().item() if real_len > 0 else 1.0
+            texts.append((text.strip(), confidence))
 
     return texts
 
@@ -372,19 +394,30 @@ def qwen_ocr_lines(line_images: list[Image.Image]) -> list[str]:
 
 def run_ocr_pipeline(
     original: Image.Image,
+    include_boxed_image: bool = True,
 ) -> tuple[str, list[tuple[int, int, int, int]], Image.Image]:
     """
     Run the full OCR pipeline on a single PIL image.
 
+    include_boxed_image controls whether the remote path (see
+    _run_remote_ocr_pipeline) bothers building/transmitting the annotated
+    debug image over the network — every grading call site discards it
+    (`_`), so for those it's pure wasted encode time + payload size. Only
+    the standalone OCR Tool debug page (main.py's /extract) actually
+    displays it, so that's the only caller that needs the default True.
+
     Returns:
         full_text   – lines joined by newline
         boxes       – list of (x1,y1,x2,y2) tuples, top-to-bottom order
-        boxed_image – original image with red bounding boxes drawn
+        boxed_image – original image with red bounding boxes drawn (or,
+                      when include_boxed_image=False on the remote path,
+                      just the original image — callers that need the real
+                      annotated image must pass include_boxed_image=True)
     """
     assert MODELS is not None
 
     if REMOTE_OCR_URL:
-        return _run_remote_ocr_pipeline(original)
+        return _run_remote_ocr_pipeline(original, include_boxed_image)
 
     if os.getenv("SURYA_RAW_DETECT") == "1":
         det_img = original.convert("RGB")
@@ -408,19 +441,29 @@ def run_ocr_pipeline(
 
     line_crops = crop_lines(original, boxes_sorted)
     t_qwen = time.perf_counter()
-    line_texts = qwen_ocr_lines(line_crops)
+    line_results = qwen_ocr_lines(line_crops)
     print(
         f"[Timing] Qwen transcription of {len(line_crops)} line(s) took "
         f"{time.perf_counter() - t_qwen:.2f}s"
     )
-    clean_lines = [" ".join(t.split()) for t in line_texts if t and t.strip()]
+    clean_lines = [" ".join(t.split()) for t, _ in line_results if t and t.strip()]
     full_text = "\n".join(clean_lines).strip()
+
+    confidences = [c for t, c in line_results if t and t.strip()]
+    if confidences:
+        low = sum(1 for c in confidences if c < 0.5)
+        print(
+            f"[OCR confidence] min={min(confidences):.2f} "
+            f"mean={sum(confidences) / len(confidences):.2f} "
+            f"({low}/{len(confidences)} line(s) below 0.50)"
+        )
 
     return full_text, boxes_sorted, boxed
 
 
 def _run_remote_ocr_pipeline(
     original: Image.Image,
+    include_boxed_image: bool = True,
 ) -> tuple[str, list[tuple[int, int, int, int]], Image.Image]:
     """Send the image to the remote OCR server and adapt its response
     to the same (full_text, boxes, boxed_image) shape as the local pipeline."""
@@ -431,13 +474,21 @@ def _run_remote_ocr_pipeline(
     resp = requests.post(
         f"{REMOTE_OCR_URL}/ocr",
         files={"file": ("image.png", buf, "image/png")},
+        params={"include_boxed_image": include_boxed_image},
         timeout=180,
     )
     resp.raise_for_status()
     data = resp.json()
 
     boxes = [tuple(b) for b in data.get("boxes", [])]
-    boxed_bytes = base64.b64decode(data["boxed_image_png_base64"])
-    boxed = Image.open(io.BytesIO(boxed_bytes)).convert("RGB")
+    boxed_b64 = data.get("boxed_image_png_base64") or ""
+    if boxed_b64:
+        boxed = Image.open(io.BytesIO(base64.b64decode(boxed_b64))).convert("RGB")
+    else:
+        # Server skipped building/encoding it (include_boxed_image=False) —
+        # callers that discard this value (all grading call sites) don't
+        # care what's here; only main.py's /extract debug endpoint needs
+        # the real annotated image, and it always passes True.
+        boxed = original
 
     return data.get("text", ""), boxes, boxed

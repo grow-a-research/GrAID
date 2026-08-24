@@ -9,6 +9,31 @@ const PAPER_TABS = [
   { id: 'pdf',      label: 'Student PDF',    hint: 'generated paper' },
 ]
 
+// Scan previews can be multi-MB and slow over a constrained connection (e.g. the
+// Cloudflare tunnel used for remote demos) — without this, a slow-loading <img>
+// just shows nothing, indistinguishable from broken. Tracks its own load state so
+// "still loading" reads as loading, not dead.
+function ScanImage({ src, alt, notFoundText }) {
+  const [status, setStatus] = useState('loading') // 'loading' | 'loaded' | 'error'
+  return (
+    <div>
+      {status === 'loading' && (
+        <div className="flex h-24 items-center justify-center text-xs text-zinc-600">Loading…</div>
+      )}
+      {status === 'error' && (
+        <div className="flex h-24 items-center justify-center text-xs text-zinc-600">{notFoundText}</div>
+      )}
+      <img
+        src={src}
+        alt={alt}
+        className={`w-full object-contain bg-zinc-950 rounded ${status === 'loaded' ? '' : 'hidden'}`}
+        onLoad={() => setStatus('loaded')}
+        onError={() => setStatus('error')}
+      />
+    </div>
+  )
+}
+
 function ProcessedPaperPanel({ submissionId, answers, hasPaper }) {
   const [activeTab, setActiveTab] = useState('aligned')
   const [page, setPage] = useState(1)
@@ -57,34 +82,20 @@ function ProcessedPaperPanel({ submissionId, answers, hasPaper }) {
       {/* Tab content */}
       <div className="p-2">
         {activeTab === 'aligned' && (
-          <img
+          <ScanImage
+            key={`aligned-${page}`}
             src={api.submissions.alignedImageUrl(submissionId, page)}
             alt={`Aligned scan page ${page}`}
-            className="w-full object-contain bg-zinc-950 rounded"
-            onError={e => {
-              e.currentTarget.replaceWith(
-                Object.assign(document.createElement('div'), {
-                  className: 'flex h-24 items-center justify-center text-xs text-zinc-600',
-                  textContent: 'Aligned scan not available — OCR may have used the fallback path.',
-                })
-              )
-            }}
+            notFoundText="Aligned scan not available — OCR may have used the fallback path."
           />
         )}
 
         {activeTab === 'original' && (
-          <img
+          <ScanImage
+            key={`original-${page}`}
             src={api.submissions.originalImageUrl(submissionId, page)}
             alt={`Original scan page ${page}`}
-            className="w-full object-contain bg-zinc-950 rounded"
-            onError={e => {
-              e.currentTarget.replaceWith(
-                Object.assign(document.createElement('div'), {
-                  className: 'flex h-24 items-center justify-center text-xs text-zinc-600',
-                  textContent: 'Original scan not found.',
-                })
-              )
-            }}
+            notFoundText="Original scan not found."
           />
         )}
 
@@ -361,6 +372,23 @@ function AnswerCard({ answer, question, flag, onOverrideSaved, onFlagChange }) {
     e.preventDefault()
     setScoreInput('')
     setNoteInput('')
+  }
+
+  async function calculateCerWer(e) {
+    e.preventDefault()
+    if (!refInput.trim()) return
+    setSaving(true); setSaveErr(''); setSaved(false)
+    try {
+      // teacher_score/teacher_note omitted — computes CER/WER without touching the score.
+      const updated = await api.submissions.override(
+        answer.submission_id, answer.id,
+        { reference_text: refInput.trim() }
+      )
+      onOverrideSaved(updated)
+      setSaved(true)
+      setTimeout(() => setSaved(false), 2000)
+    } catch (err) { setSaveErr(err.message) }
+    setSaving(false)
   }
 
   return (
@@ -727,14 +755,24 @@ function AnswerCard({ answer, question, flag, onOverrideSaved, onFlagChange }) {
             )}
           </div>
         </div>
-        {/* Reference transcription — enables CER/WER computation */}
-        {qtype === 'essay' && (
-          <textarea
-            className={`${tw.input} mt-2 resize-none text-xs`} rows={2}
-            placeholder="Reference transcription (optional) — paste what was actually written to compute CER/WER"
-            value={refInput}
-            onChange={e => setRefInput(e.target.value)}
-          />
+        {/* Reference transcription — enables CER/WER computation independent of scoring */}
+        {(qtype === 'essay' || qtype === 'identification') && (
+          <div className="mt-2 flex gap-2 items-start">
+            <textarea
+              className={`${tw.input} flex-1 resize-none text-xs`} rows={2}
+              placeholder="Reference transcription (optional) — paste what was actually written to compute CER/WER"
+              value={refInput}
+              onChange={e => setRefInput(e.target.value)}
+            />
+            <button
+              className={tw.btnSm}
+              type="button"
+              disabled={saving || !refInput.trim()}
+              onClick={calculateCerWer}
+            >
+              {saving ? '…' : 'Calculate CER/WER'}
+            </button>
+          </div>
         )}
         <ErrorBox msg={saveErr} />
         {answer.teacher_note && (

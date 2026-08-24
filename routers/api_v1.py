@@ -780,26 +780,35 @@ def run_submission_ocr(
                         crop = crop_region(warped, region, template_spec)
                         ocr_clarity_val: float | None = _crop_clarity(crop)
                         t_ocr = time.perf_counter()
-                        ocr_text, boxes, _ = ocr_pipeline.run_ocr_pipeline(crop)
+                        ocr_text, boxes, _ = ocr_pipeline.run_ocr_pipeline(crop, include_boxed_image=False)
                         logger.info(
                             "[Timing] submission %d q%d: remote OCR call took %.2fs",
                             submission_id, q.id, time.perf_counter() - t_ocr,
                         )
+                        if not ocr_text.strip():
+                            # A legible crop returning zero text is a known transient
+                            # hiccup on the remote OCR service, not a bad crop — one
+                            # retry usually recovers it.
+                            logger.warning(
+                                "submission %d q%d: OCR returned empty text — retrying once",
+                                submission_id, q.id,
+                            )
+                            ocr_text, boxes, _ = ocr_pipeline.run_ocr_pipeline(crop, include_boxed_image=False)
                         # MCQ/TF without bubbles: skip Groq correction (answer is
                         # a single letter/word — correction may mangle it)
-                        if qtype == "essay":
+                        if qtype == "essay" and ocr_text.strip():
                             t_corr = time.perf_counter()
                             ocr_text = correct_ocr_text(ocr_text)
                             logger.info(
                                 "[Timing] submission %d q%d: Groq OCR-correction call took %.2fs",
                                 submission_id, q.id, time.perf_counter() - t_corr,
                             )
-                        elif qtype == "identification":
+                        elif qtype == "identification" and ocr_text.strip():
                             ocr_text = correct_id_text(ocr_text)
                         boxes_data = json.dumps(
                             [{"x1": b[0], "y1": b[1], "x2": b[2], "y2": b[3]} for b in boxes]
                         )
-                        ans_status = "done"
+                        ans_status = "done" if ocr_text.strip() else "needs_review"
 
                     existing = (
                         db.query(m.SubmissionAnswer)
@@ -839,7 +848,7 @@ def run_submission_ocr(
         if not aligned:
             fallback_image  = crop_content_area(image, template_spec)
             fallback_clarity = _crop_clarity(fallback_image)
-            ocr_text, boxes, _ = ocr_pipeline.run_ocr_pipeline(fallback_image)
+            ocr_text, boxes, _ = ocr_pipeline.run_ocr_pipeline(fallback_image, include_boxed_image=False)
             ocr_text = correct_ocr_text(ocr_text)
             boxes_data = json.dumps(
                 [{"x1": b[0], "y1": b[1], "x2": b[2], "y2": b[3]} for b in boxes]
@@ -887,14 +896,41 @@ def run_submission_ocr(
 # ---------------------------------------------------------------------------
 
 
+def _serve_display_jpeg(path: Path) -> Response:
+    """
+    Re-encode a saved scan (original upload or aligned warp — both saved as
+    full-resolution, effectively-lossless PNGs, several MB each) as a JPEG
+    for the Results page preview. This is a display-only transform: OCR
+    already ran on the untouched source before this endpoint is ever hit,
+    and the stored file on disk is never modified. Cuts transfer size by
+    ~85-90% at the same pixel dimensions (tested: ~7.4MB PNG -> ~0.9MB JPEG),
+    which is what made the aligned/original scan tabs painfully slow over
+    the Cloudflare tunnel used for remote demos.
+    """
+    with Image.open(path) as im:
+        im = ImageOps.exif_transpose(im.convert("RGB"))
+        buf = io.BytesIO()
+        im.save(buf, format="JPEG", quality=85)
+    return Response(
+        content=buf.getvalue(),
+        media_type="image/jpeg",
+        # Short-lived cache: these files CAN be overwritten in place (e.g. a
+        # submission gets reprocessed and aligned_p{page}.png is rewritten at
+        # the same path), so avoid a long/immutable cache that would then
+        # keep serving a stale preview.
+        headers={"Cache-Control": "private, max-age=300"},
+    )
+
+
 @router.get("/submissions/{submission_id}/original-image/{page}")
 def get_original_image(
     submission_id: int,
     page: int,
     db: Session = Depends(get_db),
-) -> FileResponse:
+) -> Response:
     """
-    Return the original uploaded scan for a given page (before any alignment).
+    Return the original uploaded scan for a given page (before any alignment),
+    re-encoded as a compressed JPEG for display (see _serve_display_jpeg).
     Reads from the SubmissionFile record stored_path.
     """
     sub = db.get(m.Submission, submission_id)
@@ -913,16 +949,7 @@ def get_original_image(
     path = Path(__file__).resolve().parent.parent / sf.stored_path
     if not path.exists():
         raise HTTPException(status_code=404, detail="File not found on disk")
-    # Determine media type from extension
-    ext = path.suffix.lower()
-    media_type = {
-        ".png": "image/png",
-        ".jpg": "image/jpeg",
-        ".jpeg": "image/jpeg",
-        ".webp": "image/webp",
-        ".bmp": "image/bmp",
-    }.get(ext, "application/octet-stream")
-    return FileResponse(path=str(path), media_type=media_type)
+    return _serve_display_jpeg(path)
 
 
 @router.get("/submissions/{submission_id}/aligned-image/{page}")
@@ -930,9 +957,10 @@ def get_aligned_image(
     submission_id: int,
     page: int,
     db: Session = Depends(get_db),
-) -> FileResponse:
+) -> Response:
     """
-    Return the perspective-corrected (warped) scan image for a given page.
+    Return the perspective-corrected (warped) scan image for a given page,
+    re-encoded as a compressed JPEG for display (see _serve_display_jpeg).
     Saved to data/submissions/{id}/aligned_p{page}.png during OCR.
     Returns 404 if alignment was not possible for that page.
     """
@@ -944,7 +972,7 @@ def get_aligned_image(
         raise HTTPException(
             status_code=404, detail="Aligned image not available for this page"
         )
-    return FileResponse(path=str(path), media_type="image/png")
+    return _serve_display_jpeg(path)
 
 
 # ---------------------------------------------------------------------------
@@ -1308,6 +1336,13 @@ def download_student_paper(submission_id: int, db: Session = Depends(get_db)) ->
         path=str(cached_path),
         media_type="application/pdf",
         filename=filename,
+        # Without this, FileResponse defaults to Content-Disposition: attachment
+        # (because `filename` is set), which makes browsers hand the response to
+        # the download manager instead of rendering it — breaking the Results page's
+        # embedded <iframe> preview (shows blank, request shows net::ERR_ABORTED).
+        # The separate "Download PDF" link still triggers a real download via its
+        # `download` attribute regardless of this header.
+        content_disposition_type="inline",
     )
 
 
@@ -1681,7 +1716,7 @@ def _run_bulk_process(exam_id: int, db: Session) -> BulkProcessResult:
                                 )
                             else:
                                 crop     = crop_region(warped, region, template_spec)
-                                ocr_text, boxes, _ = ocr_pipeline.run_ocr_pipeline(crop)
+                                ocr_text, boxes, _ = ocr_pipeline.run_ocr_pipeline(crop, include_boxed_image=False)
                                 if qtype == "essay":
                                     ocr_text = correct_ocr_text(ocr_text)
                                 elif qtype == "identification":
@@ -1720,7 +1755,7 @@ def _run_bulk_process(exam_id: int, db: Session) -> BulkProcessResult:
 
                 if not aligned:
                     fallback = crop_content_area(image, template_spec)
-                    ocr_text, boxes, _ = ocr_pipeline.run_ocr_pipeline(fallback)
+                    ocr_text, boxes, _ = ocr_pipeline.run_ocr_pipeline(fallback, include_boxed_image=False)
                     ocr_text   = correct_ocr_text(ocr_text)
                     boxes_data = json.dumps(
                         [{"x1": b[0], "y1": b[1], "x2": b[2], "y2": b[3]} for b in boxes]
@@ -1885,21 +1920,25 @@ def teacher_override(
     Teacher override: set a manual score and optional note on a graded answer.
 
     The final score shown in the Results page uses teacher_score when set,
-    falling back to ai_score otherwise.
+    falling back to ai_score otherwise. teacher_score is optional so a
+    request carrying only reference_text can compute CER/WER (see below)
+    without also forcing a score override — otherwise getting CER/WER on
+    every answer in an exam would mean re-scoring every answer just to
+    unlock the calculation.
     """
     ans = db.get(m.SubmissionAnswer, answer_id)
     if not ans or ans.submission_id != submission_id:
         raise HTTPException(status_code=404, detail="Answer not found")
 
     question = db.get(m.ExamQuestion, ans.question_id) if ans.question_id else None
-    if question and body.teacher_score > question.max_points:
-        raise HTTPException(
-            status_code=400,
-            detail=f"teacher_score {body.teacher_score} exceeds max_points {question.max_points}",
-        )
-
-    ans.teacher_score = body.teacher_score
-    ans.teacher_note  = body.teacher_note
+    if body.teacher_score is not None:
+        if question and body.teacher_score > question.max_points:
+            raise HTTPException(
+                status_code=400,
+                detail=f"teacher_score {body.teacher_score} exceeds max_points {question.max_points}",
+            )
+        ans.teacher_score = body.teacher_score
+        ans.teacher_note  = body.teacher_note
 
     # If the teacher provides a reference transcription, compute OCR quality metrics
     if body.reference_text is not None and ans.ocr_text:

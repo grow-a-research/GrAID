@@ -115,8 +115,15 @@ export default function SubmissionsPage() {
 
   // Loads full submission detail (files, etc.) whenever the shared selected submission
   // changes — the row objects in the list above are lighter-weight than the full record.
+  // Also clears any staged-but-not-yet-uploaded file/photo: that state isn't tied to a
+  // submission id, so without this reset it kept showing on whichever submission you
+  // switched to next, looking like the same scan had "leaked" onto other students.
   useEffect(() => {
     setUploadErr(''); setProcessErr('')
+    streamRef.current?.getTracks().forEach(t => t.stop())
+    streamRef.current = null
+    setUploadFile(null); setCaptured(null)
+    setCamOpen(false); setCamVisible(false); setCamErr('')
     if (!selectedSub) return
     api.submissions.get(selectedSub.id).then(mergeFullSubmission).catch(() => {})
   }, [selectedSub?.id])

@@ -4,7 +4,7 @@ ai_grader.py — Phase 6: AI-powered rubric-based essay grading via Groq.
 Requires:  pip install groq
            GROQ_API_KEY environment variable (get a free key at console.groq.com)
 
-Model used: llama-3.3-70b-versatile  (free tier, fast, strong reasoning)
+Model used: openai/gpt-oss-120b  (free tier, fast, strong reasoning)
 
 Public API
 ----------
@@ -26,7 +26,7 @@ from dataclasses import asdict, dataclass, field
 
 logger = logging.getLogger(__name__)
 
-_GROQ_MODEL = "llama-3.3-70b-versatile"
+_GROQ_MODEL = "openai/gpt-oss-120b"
 
 # Retry configuration for Groq rate-limit / transient errors
 _MAX_RETRIES = 3
@@ -55,7 +55,7 @@ _USER_TEMPLATE = """\
 Grade this answer. Return ONLY a JSON object in this exact format:
 {{
   "score": <number between 0 and {max_points}>,
-  "confidence": <number between 0.0 and 1.0 — how certain you are about this score given OCR quality>,
+  "confidence": <number between 0.0 and 1.0 — how certain you are about this score, considering BOTH how clear the OCR text is AND how clear-cut the rubric judgment is (e.g. a borderline answer that could reasonably be scored two ways should lower confidence even if the text is perfectly legible)>,
   "feedback": "<2-4 sentences: quote specific parts of the answer, identify which parts address the rubric, note what is missing, give targeted suggestions>"
 }}
 """
@@ -261,7 +261,7 @@ object per criterion, in the same order as listed, in this exact format:
   {{
     "criterion": "<criterion name, exactly as given above>",
     "score": <number between 0 and that criterion's max points>,
-    "confidence": <number between 0.0 and 1.0 — how certain you are about this criterion's score given OCR quality>,
+    "confidence": <number between 0.0 and 1.0 — how certain you are about this criterion's score, considering BOTH how clear the OCR text is AND how clear-cut the rubric judgment is (e.g. a borderline answer that could reasonably be scored two ways should lower confidence even if the text is perfectly legible)>,
     "justification": "<1-2 sentences: quote specific parts of the answer relevant to this criterion, note what is present or missing>"
   }},
   ...
@@ -424,7 +424,11 @@ def grade_answer_structured(
             {"role": "system", "content": _STRUCTURED_SYSTEM_PROMPT},
             {"role": "user",   "content": user_msg},
         ],
-        max_tokens=min(2048, 300 + 200 * max(1, len(criteria))),
+        # gpt-oss-120b is a reasoning model: part of this budget is spent on
+        # internal chain-of-thought before it writes the JSON answer, so the
+        # cap needs headroom on top of the per-criterion answer length or it
+        # truncates mid-array and later criteria fall back to "no response".
+        max_tokens=min(4096, 1000 + 400 * max(1, len(criteria))),
         temperature=0.2,
     )
     logger.debug("Groq raw structured response: %s", raw)
@@ -500,11 +504,12 @@ def grade_essay(
 # ── Post-OCR correction ───────────────────────────────────────────────────────
 
 # Phrases that only show up when the correction model narrates its own output
-# instead of just returning it (a known llama-3.3-70b failure mode on messy
-# handwriting input) — e.g. "However, the above response still has run-on
-# lines. Here is the reformatted text:" or "Treaty of Maastricht does not
-# match, however a possible correction is: ...". If any of these leak through,
-# the "corrected" text is unusable and unsafe to grade against.
+# instead of just returning it (originally observed as a llama-3.3-70b-versatile
+# failure mode on messy handwriting input, kept as a safety net regardless of
+# which model is configured) — e.g. "However, the above response still has
+# run-on lines. Here is the reformatted text:" or "Treaty of Maastricht does
+# not match, however a possible correction is: ...". If any of these leak
+# through, the "corrected" text is unusable and unsafe to grade against.
 _RUNAWAY_MARKERS = (
     "here is the reformatted",
     "the above response",
