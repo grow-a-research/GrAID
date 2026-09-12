@@ -5,7 +5,8 @@ Serves the /health and /ocr contract that ocr_pipeline.py's
 `_run_remote_ocr_pipeline()` expects from REMOTE_OCR_URL:
   - GET  /health -> 200 OK once models are loaded.
   - POST /ocr (multipart `file`) -> {"text": str, "boxes": [[x1,y1,x2,y2], ...],
-                                      "boxed_image_png_base64": str}
+                                      "boxed_image_png_base64": str,
+                                      "low_confidence": bool}
 
 This script imports ocr_pipeline.py directly rather than duplicating its
 logic, so behavior is guaranteed identical to the local-load path the
@@ -85,7 +86,7 @@ async def ocr(file: UploadFile = File(...), include_boxed_image: bool = True) ->
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid image: {e}") from e
 
-    full_text, boxes, boxed = ocr_pipeline.run_ocr_pipeline(original)
+    full_text, boxes, boxed, low_confidence = ocr_pipeline.run_ocr_pipeline(original)
     # Every grading call site discards the annotated debug image — only the
     # OCR Tool page actually displays it. Skipping the PNG encode + base64
     # (which inflates size ~33%) saves real time on both ends of the wire
@@ -95,6 +96,7 @@ async def ocr(file: UploadFile = File(...), include_boxed_image: bool = True) ->
         "text": full_text,
         "boxes": [list(b) for b in boxes],
         "boxed_image_png_base64": boxed_b64,
+        "low_confidence": low_confidence,
     })
     # Everything from receiving the upload to building the response — compare
     # this against the local machine's round-trip time for the same request

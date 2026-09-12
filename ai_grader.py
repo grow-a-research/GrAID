@@ -639,6 +639,12 @@ def correct_id_text(raw_text: str) -> str:
             temperature=0.1,
             max_tokens=100,
         )
+        if not corrected.strip():
+            logger.warning(
+                "ID OCR correction returned empty text (likely a reasoning-model "
+                "token-budget issue) — using raw text instead."
+            )
+            return raw_text
         if _looks_like_runaway_correction(raw_text, corrected):
             logger.warning(
                 "ID OCR correction looked like a runaway/self-narrating response "
@@ -674,6 +680,12 @@ def correct_ocr_text(raw_text: str) -> str:
             temperature=0.1,
             max_tokens=min(2048, len(raw_text) * 2 + 200),
         )
+        if not corrected.strip():
+            logger.warning(
+                "OCR correction returned empty text (likely a reasoning-model "
+                "token-budget issue) — using raw text instead."
+            )
+            return raw_text
         if _looks_like_runaway_correction(raw_text, corrected):
             logger.warning(
                 "OCR correction looked like a runaway/self-narrating response "

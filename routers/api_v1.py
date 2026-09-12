@@ -752,6 +752,7 @@ def run_submission_ocr(
                     region = json.loads(q.region_json)
                     qtype = (q.question_type or "essay")
                     omr_confidence: float | None = None
+                    ocr_low_conf = False
 
                     if qtype in ("mcq", "tf") and region.get("bubbles"):
                         # ── Phase 13: OMR bubble-fill detection ───────────────
@@ -780,7 +781,7 @@ def run_submission_ocr(
                         crop = crop_region(warped, region, template_spec)
                         ocr_clarity_val: float | None = _crop_clarity(crop)
                         t_ocr = time.perf_counter()
-                        ocr_text, boxes, _ = ocr_pipeline.run_ocr_pipeline(crop, include_boxed_image=False)
+                        ocr_text, boxes, _, ocr_low_conf = ocr_pipeline.run_ocr_pipeline(crop, include_boxed_image=False)
                         logger.info(
                             "[Timing] submission %d q%d: remote OCR call took %.2fs",
                             submission_id, q.id, time.perf_counter() - t_ocr,
@@ -793,7 +794,7 @@ def run_submission_ocr(
                                 "submission %d q%d: OCR returned empty text — retrying once",
                                 submission_id, q.id,
                             )
-                            ocr_text, boxes, _ = ocr_pipeline.run_ocr_pipeline(crop, include_boxed_image=False)
+                            ocr_text, boxes, _, ocr_low_conf = ocr_pipeline.run_ocr_pipeline(crop, include_boxed_image=False)
                         # MCQ/TF without bubbles: skip Groq correction (answer is
                         # a single letter/word — correction may mangle it)
                         if qtype == "essay" and ocr_text.strip():
@@ -808,7 +809,12 @@ def run_submission_ocr(
                         boxes_data = json.dumps(
                             [{"x1": b[0], "y1": b[1], "x2": b[2], "y2": b[3]} for b in boxes]
                         )
-                        ans_status = "done" if ocr_text.strip() else "needs_review"
+                        # Low OCR confidence never alters ocr_text (see
+                        # run_ocr_pipeline) — it only routes the answer to
+                        # human review instead of silently marking it done.
+                        ans_status = (
+                            "needs_review" if (not ocr_text.strip() or ocr_low_conf) else "done"
+                        )
 
                     existing = (
                         db.query(m.SubmissionAnswer)
@@ -825,6 +831,8 @@ def run_submission_ocr(
                         existing.omr_confidence = omr_confidence
                         existing.ocr_clarity    = ocr_clarity_val if qtype not in ("mcq", "tf") else None
                         existing.updated_at     = now
+                        if ocr_low_conf:
+                            _auto_flag(existing, "ocr_low_confidence", db)
                         db.commit()
                         db.refresh(existing)
                         results.append(existing)
@@ -840,6 +848,9 @@ def run_submission_ocr(
                             ocr_clarity=ocr_clarity_val if qtype not in ("mcq", "tf") else None,
                         )
                         db.add(answer)
+                        db.flush()
+                        if ocr_low_conf:
+                            _auto_flag(answer, "ocr_low_confidence", db)
                         db.commit()
                         db.refresh(answer)
                         results.append(answer)
@@ -848,11 +859,12 @@ def run_submission_ocr(
         if not aligned:
             fallback_image  = crop_content_area(image, template_spec)
             fallback_clarity = _crop_clarity(fallback_image)
-            ocr_text, boxes, _ = ocr_pipeline.run_ocr_pipeline(fallback_image, include_boxed_image=False)
+            ocr_text, boxes, _, ocr_low_conf = ocr_pipeline.run_ocr_pipeline(fallback_image, include_boxed_image=False)
             ocr_text = correct_ocr_text(ocr_text)
             boxes_data = json.dumps(
                 [{"x1": b[0], "y1": b[1], "x2": b[2], "y2": b[3]} for b in boxes]
             )
+            fallback_status = "needs_review" if ocr_low_conf else "done"
             existing = (
                 db.query(m.SubmissionAnswer)
                 .filter(
@@ -865,9 +877,11 @@ def run_submission_ocr(
             if existing:
                 existing.ocr_text    = ocr_text
                 existing.boxes_json  = boxes_data
-                existing.status      = "done"
+                existing.status      = fallback_status
                 existing.ocr_clarity = fallback_clarity
                 existing.updated_at  = now
+                if ocr_low_conf:
+                    _auto_flag(existing, "ocr_low_confidence", db)
                 db.commit()
                 db.refresh(existing)
                 results.append(existing)
@@ -878,10 +892,13 @@ def run_submission_ocr(
                     page_number=sf.page_number,
                     ocr_text=ocr_text,
                     boxes_json=boxes_data,
-                    status="done",
+                    status=fallback_status,
                     ocr_clarity=fallback_clarity,
                 )
                 db.add(answer)
+                db.flush()
+                if ocr_low_conf:
+                    _auto_flag(answer, "ocr_low_confidence", db)
                 db.commit()
                 db.refresh(answer)
                 results.append(answer)
@@ -1700,6 +1717,7 @@ def _run_bulk_process(exam_id: int, db: Session) -> BulkProcessResult:
                             region = json.loads(q.region_json)
                             qtype  = (q.question_type or "essay")
                             omr_confidence: float | None = None
+                            ocr_low_conf = False
 
                             if qtype in ("mcq", "tf") and region.get("bubbles"):
                                 label, conf, _ = detect_omr(warped, region, template_spec)
@@ -1716,7 +1734,7 @@ def _run_bulk_process(exam_id: int, db: Session) -> BulkProcessResult:
                                 )
                             else:
                                 crop     = crop_region(warped, region, template_spec)
-                                ocr_text, boxes, _ = ocr_pipeline.run_ocr_pipeline(crop, include_boxed_image=False)
+                                ocr_text, boxes, _, ocr_low_conf = ocr_pipeline.run_ocr_pipeline(crop, include_boxed_image=False)
                                 if qtype == "essay":
                                     ocr_text = correct_ocr_text(ocr_text)
                                 elif qtype == "identification":
@@ -1725,7 +1743,10 @@ def _run_bulk_process(exam_id: int, db: Session) -> BulkProcessResult:
                                     [{"x1": b[0], "y1": b[1], "x2": b[2], "y2": b[3]}
                                      for b in boxes]
                                 )
-                                ans_status = "done"
+                                # Low OCR confidence never alters ocr_text (see
+                                # run_ocr_pipeline) — it only routes the answer
+                                # to human review instead of silently "done".
+                                ans_status = "needs_review" if ocr_low_conf else "done"
 
                             existing = (
                                 sub_db.query(m.SubmissionAnswer)
@@ -1741,8 +1762,10 @@ def _run_bulk_process(exam_id: int, db: Session) -> BulkProcessResult:
                                 existing.status         = ans_status
                                 existing.omr_confidence = omr_confidence
                                 existing.updated_at     = now
+                                if ocr_low_conf:
+                                    _auto_flag(existing, "ocr_low_confidence", sub_db)
                             else:
-                                sub_db.add(m.SubmissionAnswer(
+                                new_ans = m.SubmissionAnswer(
                                     submission_id=sub.id,
                                     question_id=q.id,
                                     page_number=sf.page_number,
@@ -1750,16 +1773,21 @@ def _run_bulk_process(exam_id: int, db: Session) -> BulkProcessResult:
                                     boxes_json=boxes_data,
                                     status=ans_status,
                                     omr_confidence=omr_confidence,
-                                ))
+                                )
+                                sub_db.add(new_ans)
+                                if ocr_low_conf:
+                                    sub_db.flush()
+                                    _auto_flag(new_ans, "ocr_low_confidence", sub_db)
                             sub_db.commit()
 
                 if not aligned:
                     fallback = crop_content_area(image, template_spec)
-                    ocr_text, boxes, _ = ocr_pipeline.run_ocr_pipeline(fallback, include_boxed_image=False)
+                    ocr_text, boxes, _, ocr_low_conf = ocr_pipeline.run_ocr_pipeline(fallback, include_boxed_image=False)
                     ocr_text   = correct_ocr_text(ocr_text)
                     boxes_data = json.dumps(
                         [{"x1": b[0], "y1": b[1], "x2": b[2], "y2": b[3]} for b in boxes]
                     )
+                    fallback_status = "needs_review" if ocr_low_conf else "done"
                     existing = (
                         sub_db.query(m.SubmissionAnswer)
                         .filter(
@@ -1772,17 +1800,23 @@ def _run_bulk_process(exam_id: int, db: Session) -> BulkProcessResult:
                     if existing:
                         existing.ocr_text   = ocr_text
                         existing.boxes_json = boxes_data
-                        existing.status     = "done"
+                        existing.status     = fallback_status
                         existing.updated_at = now
+                        if ocr_low_conf:
+                            _auto_flag(existing, "ocr_low_confidence", sub_db)
                     else:
-                        sub_db.add(m.SubmissionAnswer(
+                        new_fb_ans = m.SubmissionAnswer(
                             submission_id=sub.id,
                             question_id=None,
                             page_number=sf.page_number,
                             ocr_text=ocr_text,
                             boxes_json=boxes_data,
-                            status="done",
-                        ))
+                            status=fallback_status,
+                        )
+                        sub_db.add(new_fb_ans)
+                        if ocr_low_conf:
+                            sub_db.flush()
+                            _auto_flag(new_fb_ans, "ocr_low_confidence", sub_db)
                     sub_db.commit()
 
             sub.status = "ocr_done"

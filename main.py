@@ -91,7 +91,7 @@ async def extract(file: UploadFile = File(...)) -> ExtractResponse:
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Could not decode image: {e}") from e
 
-    full_text, _boxes, boxed = ocr_pipeline.run_ocr_pipeline(original)
+    full_text, _boxes, boxed, _low_conf = ocr_pipeline.run_ocr_pipeline(original)
     return ExtractResponse(
         text=full_text,
         boxed_image_png_base64=ocr_pipeline.encode_png_base64(boxed),

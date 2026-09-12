@@ -27,3 +27,12 @@ frontend/dist/
 .DS_Store
 Thumbs.db
 .vscode/
+
+# DREsS dataset is restricted-access (no personal sharing per its README) —
+# this repo is public, so none of its essay text/scores may be committed.
+# Any file that reproduces DREsS essay content goes here, not just these.
+classification_model/dress_shared_subset_candidates.csv
+classification_model/dress_shared_subset_candidates.pdf
+classification_model/dress_shared_scores_template.csv
+classification_model/dress_shared_scores_entry.xlsx
+classification_model/dress_data/

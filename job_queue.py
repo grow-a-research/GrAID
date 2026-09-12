@@ -226,7 +226,7 @@ def _process_job_sync(job: dict) -> None:
                             crop        = crop_region(warped, region, template_spec)
                             ocr_clarity = _laplacian_var(crop)
                             t_ocr = time.perf_counter()
-                            ocr_text, boxes, _ = ocr_pipeline.run_ocr_pipeline(crop, include_boxed_image=False)
+                            ocr_text, boxes, _, ocr_low_conf = ocr_pipeline.run_ocr_pipeline(crop, include_boxed_image=False)
                             logger.info(
                                 "[Timing] submission %d q%d: remote OCR call took %.2fs",
                                 submission_id, q.id, time.perf_counter() - t_ocr,
@@ -240,7 +240,7 @@ def _process_job_sync(job: dict) -> None:
                                     "submission %d q%d: OCR returned empty text — retrying once",
                                     submission_id, q.id,
                                 )
-                                ocr_text, boxes, _ = ocr_pipeline.run_ocr_pipeline(crop, include_boxed_image=False)
+                                ocr_text, boxes, _, ocr_low_conf = ocr_pipeline.run_ocr_pipeline(crop, include_boxed_image=False)
 
                             if qtype not in ("mcq", "tf") and ocr_text.strip():
                                 t_corr = time.perf_counter()
@@ -253,19 +253,26 @@ def _process_job_sync(job: dict) -> None:
                                 [{"x1": b[0], "y1": b[1], "x2": b[2], "y2": b[3]}
                                  for b in boxes]
                             )
-                            ans_status = "done" if ocr_text.strip() else "needs_review"
+                            # Low OCR confidence never alters ocr_text (see
+                            # run_ocr_pipeline) — it only routes the answer to
+                            # human review instead of silently marking it done.
+                            ans_status = (
+                                "needs_review" if (not ocr_text.strip() or ocr_low_conf) else "done"
+                            )
 
-                        _upsert_answer(
+                        ans = _upsert_answer(
                             db, sub.id, q.id, sf.page_number,
                             ocr_text, boxes_data, ans_status,
                             omr_confidence, ocr_clarity, now,
                         )
+                        if qtype not in ("mcq", "tf") and ocr_low_conf:
+                            _flag(ans, "ocr_low_confidence", db)
 
             if not aligned:
                 fallback    = crop_content_area(image, template_spec)
                 ocr_clarity = _laplacian_var(fallback)
                 t_ocr = time.perf_counter()
-                ocr_text, boxes, _ = ocr_pipeline.run_ocr_pipeline(fallback, include_boxed_image=False)
+                ocr_text, boxes, _, ocr_low_conf = ocr_pipeline.run_ocr_pipeline(fallback, include_boxed_image=False)
                 logger.info(
                     "[Timing] submission %d p%d: remote OCR call (fallback) took %.2fs",
                     submission_id, sf.page_number, time.perf_counter() - t_ocr,
@@ -279,9 +286,13 @@ def _process_job_sync(job: dict) -> None:
                 boxes_data = json.dumps(
                     [{"x1": b[0], "y1": b[1], "x2": b[2], "y2": b[3]} for b in boxes]
                 )
-                _upsert_fallback_answer(
-                    db, sub.id, sf.page_number, ocr_text, boxes_data, ocr_clarity, now
+                fallback_status = "needs_review" if ocr_low_conf else "done"
+                fb_ans = _upsert_fallback_answer(
+                    db, sub.id, sf.page_number, ocr_text, boxes_data, ocr_clarity, now,
+                    fallback_status,
                 )
+                if ocr_low_conf:
+                    _flag(fb_ans, "ocr_low_confidence", db)
 
         sub.status = "ocr_done"
         db.commit()
@@ -439,7 +450,7 @@ def _upsert_answer(
     db, sub_id, q_id, page_num,
     ocr_text, boxes_data, ans_status,
     omr_conf, ocr_clarity, now,
-) -> None:
+):
     import db_models as m
     existing = (
         db.query(m.SubmissionAnswer)
@@ -456,8 +467,9 @@ def _upsert_answer(
         existing.omr_confidence = omr_conf
         existing.ocr_clarity    = ocr_clarity
         existing.updated_at     = now
+        ans = existing
     else:
-        db.add(m.SubmissionAnswer(
+        ans = m.SubmissionAnswer(
             submission_id=sub_id,
             question_id=q_id,
             page_number=page_num,
@@ -466,13 +478,15 @@ def _upsert_answer(
             status=ans_status,
             omr_confidence=omr_conf,
             ocr_clarity=ocr_clarity,
-        ))
+        )
+        db.add(ans)
     db.commit()
+    return ans
 
 
 def _upsert_fallback_answer(
-    db, sub_id, page_num, ocr_text, boxes_data, ocr_clarity, now
-) -> None:
+    db, sub_id, page_num, ocr_text, boxes_data, ocr_clarity, now, ans_status="done"
+):
     import db_models as m
     existing = (
         db.query(m.SubmissionAnswer)
@@ -486,17 +500,20 @@ def _upsert_fallback_answer(
     if existing:
         existing.ocr_text    = ocr_text
         existing.boxes_json  = boxes_data
-        existing.status      = "done"
+        existing.status      = ans_status
         existing.ocr_clarity = ocr_clarity
         existing.updated_at  = now
+        ans = existing
     else:
-        db.add(m.SubmissionAnswer(
+        ans = m.SubmissionAnswer(
             submission_id=sub_id,
             question_id=None,
             page_number=page_num,
             ocr_text=ocr_text,
             boxes_json=boxes_data,
-            status="done",
+            status=ans_status,
             ocr_clarity=ocr_clarity,
-        ))
+        )
+        db.add(ans)
     db.commit()
+    return ans

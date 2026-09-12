@@ -1,0 +1,7 @@
+essay_id,part,professor_id,question_prompt,essay_text,criterion_name,criterion_max_points,criterion_score
+E-001,1,profA,Discuss the effects of distance learning.,<essay text here>,Content,10,7
+E-001,1,profA,Discuss the effects of distance learning.,<essay text here>,Organization,10,8
+E-001,1,profA,Discuss the effects of distance learning.,<essay text here>,Grammar,10,6
+PB-001,2,profA,Summer projects.,<PERSUADE batch essay text here>,Content,10,8
+PB-001,2,profB,Summer projects.,<PERSUADE batch essay text here>,Content,10,7
+PB-001,2,profC,Summer projects.,<PERSUADE batch essay text here>,Content,10,9

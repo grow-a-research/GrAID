@@ -104,7 +104,14 @@ def load_models(force_local: bool = False) -> None:
     )
 
     print(f"[Models] Loading Qwen processor ({QWEN_MODEL_ID})...")
-    qwen_processor = AutoProcessor.from_pretrained(QWEN_MODEL_ID, trust_remote_code=True)
+    # Pinned to the "slow" (pure-PIL) image processor on purpose: transformers
+    # now defaults new loads to a different "fast" implementation that the
+    # library itself warns can produce slightly different preprocessed pixels
+    # for the same input image. Pinning keeps this pipeline's preprocessing
+    # stable across transformers upgrades instead of silently drifting.
+    qwen_processor = AutoProcessor.from_pretrained(
+        QWEN_MODEL_ID, trust_remote_code=True, use_fast=False,
+    )
 
     print("[Models] Loading Qwen model in 8-bit (this may take several minutes)...")
     # Pinned to a single GPU on purpose: this 7B model only needs ~8-10GB in
@@ -192,7 +199,7 @@ def _vertical_overlap_ratio(
 
 
 def merge_overlapping_boxes(
-    boxes: list[tuple[int, int, int, int]], overlap_thresh: float = 0.5
+    boxes: list[tuple[int, int, int, int]], overlap_thresh: float = 0.7
 ) -> list[tuple[int, int, int, int]]:
     """Merge line boxes whose vertical extents overlap significantly.
 
@@ -202,6 +209,13 @@ def merge_overlapping_boxes(
     same text — each one incomplete, so the model fills gaps with guesses.
     Merging them into a single full-width crop before OCR fixes this at
     the source instead of downstream.
+
+    Threshold is intentionally high (0.7, not just >0): two genuine
+    duplicate detections of the same line overlap nearly completely, while
+    two distinct but tightly-spaced lines can still show partial vertical
+    overlap just from ascenders/descenders bleeding into the neighboring
+    line's box. A low threshold conflates the two and fuses real, separate
+    lines into one oversized multi-line crop.
     """
     merged = list(boxes)
     changed = True
@@ -290,17 +304,37 @@ def crop_lines(
 # QWEN_OCR_BATCH_SIZE if a page has unusually many/large line crops.
 _OCR_BATCH_SIZE = int(os.getenv("QWEN_OCR_BATCH_SIZE", "8"))
 
+# Token budget for a genuine single line of handwriting, and a hard ceiling
+# so one abnormally tall crop can't blow up generation time. A crop taller
+# than one line (e.g. a merge_overlapping_boxes box that still spans more
+# than one physical line) gets a multiple of this instead — see
+# run_ocr_pipeline's per-crop budget calculation.
+_LINE_TOKENS = 128
+_MAX_LINE_TOKENS = 640
 
-def qwen_ocr_lines(line_images: list[Image.Image]) -> list[tuple[str, float]]:
+
+def qwen_ocr_lines(
+    line_images: list[Image.Image],
+    token_budgets: list[int] | None = None,
+) -> list[tuple[str, float]]:
     """
     Returns (transcribed_text, confidence) per line. Confidence is the
     minimum per-token generation probability Qwen assigned along the line —
     its own least-certain moment — distinct from ocr_clarity (pre-OCR image
     blur) and from the grader's later self-reported confidence.
+
+    token_budgets, when given, is a list parallel to line_images estimating
+    how many tokens each crop actually needs (a crop covering more than one
+    physical line needs more room than a single line does). generate() sets
+    one max_new_tokens per batch, so each batch uses the largest budget among
+    its own crops — shorter crops in the same batch simply stop early at
+    their own EOS token, so this costs nothing for them.
     """
     assert MODELS is not None
     if not line_images:
         return []
+    if token_budgets is None:
+        token_budgets = [_LINE_TOKENS] * len(line_images)
 
     prompt = (
         "Transcribe EXACTLY what is written in this image line, character-for-character. "
@@ -331,6 +365,10 @@ def qwen_ocr_lines(line_images: list[Image.Image]) -> list[tuple[str, float]]:
     texts: list[tuple[str, float]] = []
     for start in range(0, len(line_images), _OCR_BATCH_SIZE):
         batch_images = line_images[start:start + _OCR_BATCH_SIZE]
+        batch_max_tokens = min(
+            _MAX_LINE_TOKENS,
+            max(token_budgets[start:start + _OCR_BATCH_SIZE]),
+        )
         batch_messages = [
             [
                 {
@@ -362,7 +400,7 @@ def qwen_ocr_lines(line_images: list[Image.Image]) -> list[tuple[str, float]]:
         with torch.inference_mode():
             outputs = MODELS.qwen_model.generate(
                 **inputs,
-                max_new_tokens=128,
+                max_new_tokens=batch_max_tokens,
                 do_sample=False,
                 output_scores=True,
                 return_dict_in_generate=True,
@@ -395,7 +433,7 @@ def qwen_ocr_lines(line_images: list[Image.Image]) -> list[tuple[str, float]]:
 def run_ocr_pipeline(
     original: Image.Image,
     include_boxed_image: bool = True,
-) -> tuple[str, list[tuple[int, int, int, int]], Image.Image]:
+) -> tuple[str, list[tuple[int, int, int, int]], Image.Image, bool]:
     """
     Run the full OCR pipeline on a single PIL image.
 
@@ -407,12 +445,19 @@ def run_ocr_pipeline(
     displays it, so that's the only caller that needs the default True.
 
     Returns:
-        full_text   – lines joined by newline
-        boxes       – list of (x1,y1,x2,y2) tuples, top-to-bottom order
-        boxed_image – original image with red bounding boxes drawn (or,
-                      when include_boxed_image=False on the remote path,
-                      just the original image — callers that need the real
-                      annotated image must pass include_boxed_image=True)
+        full_text      – lines joined by newline, unmodified (nothing is
+                          ever dropped based on confidence — see
+                          low_confidence below)
+        boxes           – list of (x1,y1,x2,y2) tuples, top-to-bottom order
+        boxed_image     – original image with red bounding boxes drawn (or,
+                          when include_boxed_image=False on the remote path,
+                          just the original image — callers that need the
+                          real annotated image must pass include_boxed_image=True)
+        low_confidence  – True if any line came back below
+                          OCR_MIN_LINE_CONFIDENCE (a likely hallucination on
+                          blank/erased ink, or just genuinely hard-to-read
+                          handwriting) — callers should flag the answer for
+                          human review rather than act on this themselves.
     """
     assert MODELS is not None
 
@@ -437,36 +482,85 @@ def run_ocr_pipeline(
     boxed = draw_boxes(original, boxes_sorted)
 
     if not boxes_sorted:
-        return "", [], boxed
+        return "", [], boxed, False
 
     line_crops = crop_lines(original, boxes_sorted)
+
+    # Estimate token budget per crop from its height relative to a typical
+    # single line on this page. A merge_overlapping_boxes box that still
+    # ended up spanning several physical lines (tight/uneven spacing) would
+    # otherwise get the same fixed budget as a real single line and cut off
+    # mid-sentence. Median height is used as the single-line reference
+    # instead of the smallest box, since the smallest box on a page is often
+    # a short partial line (e.g. "Name:") rather than a representative one.
+    heights = sorted(b[3] - b[1] for b in boxes_sorted)
+    ref_height = max(heights[len(heights) // 2], 1)
+    token_budgets = [
+        min(_MAX_LINE_TOKENS, _LINE_TOKENS * max(1, round((b[3] - b[1]) / ref_height)))
+        for b in boxes_sorted
+    ]
+
     t_qwen = time.perf_counter()
-    line_results = qwen_ocr_lines(line_crops)
+    line_results = qwen_ocr_lines(line_crops, token_budgets)
     print(
         f"[Timing] Qwen transcription of {len(line_crops)} line(s) took "
         f"{time.perf_counter() - t_qwen:.2f}s"
     )
-    clean_lines = [" ".join(t.split()) for t, _ in line_results if t and t.strip()]
+    # A crop with real ink but no actual legible content (e.g. an erased/
+    # scratched-out note that still leaves a visible smudge) still passes
+    # _has_ink() — it has ink — but the transcription prompt forces Qwen to
+    # guess at it anyway rather than return nothing. That guess should come
+    # out with a low confidence score even when the rest of the page reads
+    # confidently. Text is never dropped/altered here, though — a single
+    # low-probability token can drag a whole line's score down even when
+    # only one word in that line is actually bad (confidence is a per-LINE
+    # minimum, not per-word), so auto-deleting on this signal risks losing
+    # real student content along with genuine hallucinations. Instead this
+    # only flags the answer for human review upstream (see callers) —
+    # full_text always contains everything Qwen produced, unmodified.
+    #
+    # 0.15 is based on one observed real example (submission #11): a
+    # hallucinated line scored 0.095 while every genuine line on the same
+    # page scored 0.282-0.596 — a clear gap. Biased toward the low end of
+    # that gap on purpose: flagging too eagerly just means more submissions
+    # for a human to double-check; the failure mode to avoid is silence.
+    _MIN_LINE_CONFIDENCE = float(os.getenv("OCR_MIN_LINE_CONFIDENCE", "0.15"))
+
+    clean_lines: list[str] = []
+    low_confidence = False
+    for text, conf in line_results:
+        if not text or not text.strip():
+            continue
+        # Log every line's own confidence (not just the aggregate) so a
+        # specific bad line — like a hallucinated word — can be identified
+        # directly from the log instead of guessed at from min/mean.
+        print(f"[OCR confidence] {conf:.3f} — {text[:80]!r}")
+        if conf < _MIN_LINE_CONFIDENCE:
+            print(f"[OCR confidence] below threshold {_MIN_LINE_CONFIDENCE} — flagging for review")
+            low_confidence = True
+        clean_lines.append(" ".join(text.split()))
+
     full_text = "\n".join(clean_lines).strip()
 
     confidences = [c for t, c in line_results if t and t.strip()]
     if confidences:
         low = sum(1 for c in confidences if c < 0.5)
         print(
-            f"[OCR confidence] min={min(confidences):.2f} "
+            f"[OCR confidence] page summary: min={min(confidences):.2f} "
             f"mean={sum(confidences) / len(confidences):.2f} "
             f"({low}/{len(confidences)} line(s) below 0.50)"
         )
 
-    return full_text, boxes_sorted, boxed
+    return full_text, boxes_sorted, boxed, low_confidence
 
 
 def _run_remote_ocr_pipeline(
     original: Image.Image,
     include_boxed_image: bool = True,
-) -> tuple[str, list[tuple[int, int, int, int]], Image.Image]:
+) -> tuple[str, list[tuple[int, int, int, int]], Image.Image, bool]:
     """Send the image to the remote OCR server and adapt its response
-    to the same (full_text, boxes, boxed_image) shape as the local pipeline."""
+    to the same (full_text, boxes, boxed_image, low_confidence) shape as
+    the local pipeline."""
     buf = io.BytesIO()
     original.convert("RGB").save(buf, format="PNG")
     buf.seek(0)
@@ -491,4 +585,4 @@ def _run_remote_ocr_pipeline(
         # the real annotated image, and it always passes True.
         boxed = original
 
-    return data.get("text", ""), boxes, boxed
+    return data.get("text", ""), boxes, boxed, bool(data.get("low_confidence", False))
