@@ -454,8 +454,11 @@ function AnswerCard({ answer, question, flag, onOverrideSaved, onFlagChange }) {
     setSaving(false)
   }
 
+  // Overridden answers keep the neutral card — the "teacher override" label in the
+  // header already marks them, and tinting the whole box green read as a
+  // correctness signal on questions the student got wrong.
   return (
-    <div className={answer.teacher_score != null ? tw.cardActive : tw.card}>
+    <div className={tw.card}>
       {/* Question header */}
       <div className="flex items-start justify-between gap-2 mb-3">
         <div className="flex-1">

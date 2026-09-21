@@ -79,7 +79,38 @@ GPT-4o on 13,121 essays; Yoo et al. (2025), using the same DREsS corpus, reporte
 within this range. Scale and rubric differences prevent direct ranking; these are
 reported as context.
 
-## 4.x.4 Professor Perception
+## 4.x.4 Sensitivity to Prompt-Development Overlap
+
+Part of the prompt used to score these essays was selected using essays that also
+appear in the evaluation set. Two overlaps exist: the A/B comparison sets used to
+choose prompt wording (38 essays in total), and, most directly, the four worked
+examples embedded in the few-shot prompt, whose professor scores appear verbatim in
+the prompt itself. A further 43 evaluation essays had been scored by an earlier
+version of the prompt during development.
+
+Because selecting a prompt on essays later used to evaluate it can inflate apparent
+agreement, the headline figures were recomputed on the essays prompt development
+never touched.
+
+| Subset | n | r | Within 10% | QWK | Professor vs. four | System vs. four |
+|---|---|---|---|---|---|---|
+| All essays (primary) | 200 | .578 | 64.5% | .519 | .598 | .565 |
+| Excluding prompt-development essays | 162 | .633 | 66.0% | .573 | .621 | .619 |
+| Also excluding earlier-scored essays | 127 | .636 | 66.1% | .565 | .609 | .622 |
+
+Agreement does not fall on the uncontaminated subsets; it rises. On the 162 essays
+never used for prompt development, correlation increases from .578 to .633 and the
+system's agreement with a four-professor consensus (.619) becomes statistically
+indistinguishable from a professor's own (.621). On the most conservative subset of
+127 essays, the system's agreement (.622) slightly exceeds the professor average
+(.609).
+
+The overlap therefore depressed rather than inflated the reported figures, and the
+primary results in this chapter are conservative. All-essay figures are retained as
+the primary result because that sample was specified in advance; the restricted
+subsets are reported as a sensitivity check.
+
+## 4.x.5 Professor Perception
 
 Professors described conditional trust with retained oversight. Five of six
 respondents said without prompting that they still reviewed essay scores
@@ -93,7 +124,7 @@ effort and all six would adopt the system. Professors treated it as a support to
 whose output they would verify — the same usage pattern the quantitative results
 support.
 
-## 4.x.5 Summary
+## 4.x.6 Summary
 
 | Claim | Result |
 |---|---|
@@ -101,6 +132,7 @@ support.
 | Scores agree with expert judgment | Supported — r = .578, 64.5% within 10%, κ = .519 |
 | Agrees comparably to a human rater | Supported — system r = .565 vs. professor r = .598 |
 | Professors find it useful and would adopt it | Supported — all six respondents |
+| Results survive removal of prompt-development essays | Supported — r rises .578 to .633 on n = 162 |
 
 ---
 

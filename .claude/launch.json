@@ -5,7 +5,7 @@
       "name": "backend-no-models",
       "runtimeExecutable": "C:\\Users\\ASUS\\OneDrive\\Desktop\\Files\\John\\GrAID-Repo\\venv\\Scripts\\python.exe",
       "runtimeArgs": [
-        "C:\\Users\\ASUS\\AppData\\Local\\Temp\\claude\\C--Users-ASUS-OneDrive-Desktop-Files-John-GrAID-Repo\\8fc13325-f715-401d-8a84-751d337fae46\\scratchpad\\run_dev_backend.py"
+        "C:\\Users\\ASUS\\AppData\\Local\\Temp\\claude\\C--Users-ASUS-OneDrive-Desktop-Files-John-GrAID-Repo\\8e7638a9-7a01-4820-8cfe-e234a5864016\\scratchpad\\run_dev_backend.py"
       ],
       "port": 8000
     },
@@ -16,6 +16,15 @@
         "C:\\Users\\ASUS\\AppData\\Local\\Temp\\claude\\C--Users-ASUS-OneDrive-Desktop-Files-John-GrAID-Repo\\db4b8843-d326-4cc9-841d-3355139139ff\\scratchpad\\run_band_test_backend.py"
       ],
       "port": 8000
+    },
+    {
+      "name": "frontend-against-test-backend",
+      "runtimeExecutable": "cmd",
+      "runtimeArgs": [
+        "/c",
+        "set VITE_API_BASE=http://127.0.0.1:8011&& npm run dev --prefix C:\\Users\\ASUS\\OneDrive\\Desktop\\Files\\John\\GrAID-Repo\\frontend -- --port 5199"
+      ],
+      "port": 5199
     },
     {
       "name": "frontend-dev",

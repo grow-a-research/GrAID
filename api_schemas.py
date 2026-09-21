@@ -300,6 +300,14 @@ class BulkDeleteResult(BaseModel):
     errors: list[str]
 
 
+# --- Bulk create submissions (one draft per enrolled student) ---
+class BulkSubmissionResult(BaseModel):
+    created: int             # new draft submissions made
+    skipped: int             # students that already had a submission
+    total_enrolled: int      # roster size for the exam's class
+    submissions: list[SubmissionSummary]
+
+
 # --- Phase 10: Question CSV import ---
 class QuestionImportResult(BaseModel):
     created: int

@@ -43,6 +43,8 @@ export default function SubmissionsPage() {
   const [studentPickerOpen, setStudentPickerOpen] = useState(false)
   const [creating, setCreating] = useState(false)
   const [createErr, setCreateErr] = useState('')
+  const [bulkCreating, setBulkCreating] = useState(false)
+  const [bulkMsg, setBulkMsg] = useState('')
 
   // upload
   const [uploadFile, setUploadFile] = useState(null)
@@ -278,6 +280,25 @@ export default function SubmissionsPage() {
     setCreating(false)
   }
 
+  // One draft submission per enrolled student, so a whole class can be set up
+  // in a single click before uploading scans. Idempotent server-side — students
+  // who already have a submission are skipped rather than duplicated.
+  async function bulkCreateSubmissions() {
+    if (!newExamId) return
+    setBulkCreating(true); setCreateErr(''); setBulkMsg('')
+    try {
+      const result = await api.exams.bulkCreateSubmissions(parseInt(newExamId))
+      const ex = exams.find(x => x.id === parseInt(newExamId))
+      if (ex) { pickExam(ex); setSubmissions(result.submissions) }
+      setBulkMsg(
+        `Created ${result.created} submission${result.created !== 1 ? 's' : ''}` +
+        (result.skipped ? ` — skipped ${result.skipped} that already existed` : '') +
+        ` (${result.total_enrolled} enrolled).`
+      )
+    } catch (err) { setCreateErr(err.message) }
+    setBulkCreating(false)
+  }
+
   async function uploadPaper(e) {
     e.preventDefault()
     if (!selectedSub || !uploadFile) return
@@ -445,6 +466,18 @@ export default function SubmissionsPage() {
           <button className={tw.btnPrimary} type="submit" disabled={creating || !newExamId || !newStudentId}>
             {creating ? 'Creating…' : 'Create submission'}
           </button>
+
+          <div className="flex items-center gap-2 text-[10px] uppercase tracking-wide text-zinc-600">
+            <span className="h-px flex-1 bg-zinc-800" />or<span className="h-px flex-1 bg-zinc-800" />
+          </div>
+          <button className={tw.btnGhost} type="button"
+            onClick={bulkCreateSubmissions}
+            disabled={bulkCreating || !newExamId}>
+            {bulkCreating
+              ? 'Creating…'
+              : `Create for all enrolled${enrolledStudents.length ? ` (${enrolledStudents.length})` : ''}`}
+          </button>
+          {bulkMsg && <div className="text-xs text-emerald-400">{bulkMsg}</div>}
         </form>
 
         {/* Browse by exam */}

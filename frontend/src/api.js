@@ -90,6 +90,10 @@ export const api = {
     rubricPdfUrl: (examId) => `${V1}/exams/${examId}/rubric/pdf`,
     allPapersZipUrl: (examId) => `${V1}/exams/${examId}/papers/zip`,
     submissions: (examId) => req('GET', `${V1}/exams/${examId}/submissions`),
+    // Creates one draft submission per enrolled student; skips students that
+    // already have one, so it is safe to click more than once.
+    bulkCreateSubmissions: (examId) =>
+      req('POST', `${V1}/exams/${examId}/submissions/bulk`),
     analytics: (examId) => req('GET', `${V1}/exams/${examId}/analytics`),
     analyze: (examId) => req('POST', `${V1}/exams/${examId}/analyze`),
     duplicate: (examId) => req('POST', `${V1}/exams/${examId}/duplicate`),

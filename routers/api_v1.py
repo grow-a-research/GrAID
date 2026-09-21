@@ -27,6 +27,7 @@ from api_schemas import (
     BatchUploadResult,
     BulkDeleteResult,
     BulkEnrollResult,
+    BulkSubmissionResult,
     BulkProcessResult,
     BulkProcessStatus,
     ClassAnalytics,
@@ -552,6 +553,48 @@ def create_or_get_submission(body: SubmissionCreate, db: Session = Depends(get_d
     db.commit()
     db.refresh(row)
     return row
+
+
+@router.post("/exams/{exam_id}/submissions/bulk", response_model=BulkSubmissionResult)
+def bulk_create_submissions(exam_id: int, db: Session = Depends(get_db)) -> BulkSubmissionResult:
+    """
+    Create one draft submission per student enrolled in the exam's class.
+
+    Saves creating them one at a time before a batch upload. Students that
+    already have a submission for this exam are skipped, so the endpoint is
+    idempotent — clicking twice never produces duplicates.
+    """
+    exam = db.get(m.Exam, exam_id)
+    if not exam:
+        raise HTTPException(status_code=404, detail="Exam not found")
+
+    roster = (
+        db.query(m.Student)
+        .join(m.Enrollment, m.Enrollment.student_id == m.Student.id)
+        .filter(m.Enrollment.class_id == exam.class_id)
+        .order_by(m.Student.full_name)
+        .all()
+    )
+    existing_ids = {
+        sid for (sid,) in db.query(m.Submission.student_id)
+        .filter(m.Submission.exam_id == exam_id)
+    }
+
+    created = 0
+    for student in roster:
+        if student.id in existing_ids:
+            continue
+        db.add(m.Submission(exam_id=exam_id, student_id=student.id, status="draft"))
+        created += 1
+    if created:
+        db.commit()
+
+    return BulkSubmissionResult(
+        created=created,
+        skipped=len(roster) - created,
+        total_enrolled=len(roster),
+        submissions=list_exam_submissions(exam_id, db),
+    )
 
 
 @router.get("/submissions/{submission_id}", response_model=SubmissionRead)

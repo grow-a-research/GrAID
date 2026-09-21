@@ -76,7 +76,17 @@ Each professor, and the AI, correlated against the mean of the remaining four.
 | Self-reported confidence | 0.0438 |
 | Per-criterion spread | 0.1696 |
 
-## 7. Score distributions (whole points, 0-15)
+## 7. Sensitivity to prompt-development overlap
+
+Some evaluation essays were also used while choosing the prompt wording, including the four worked examples embedded in the few-shot prompt itself. The headline figures are re-reported below on the essays that were never used that way.
+
+| Subset | n | r | Within 10% | QWK | Prof. pairwise | LOO prof. | LOO system |
+|---|---|---|---|---|---|---|---|
+| All essays (primary) | 200 | 0.5778 | 64.5% | 0.5193 | 0.4603 | 0.5983 | 0.5646 |
+| Excluding prompt-development essays | 162 | 0.6326 | 66.0% | 0.5725 | 0.4847 | 0.6209 | 0.6191 |
+| Also excluding earlier-scored essays | 127 | 0.6362 | 66.1% | 0.5654 | 0.4686 | 0.6088 | 0.6220 |
+
+## 8. Score distributions (whole points, 0-15)
 
 | Score | AI | Professor consensus |
 |---|---|---|

@@ -56,6 +56,18 @@ REPLACEMENT_PKL = DATA_DIR / "_replacement_28_raw.pkl"
 PER_ESSAY_OUT = DATA_DIR / "essay_agreement_per_essay.csv"
 RESULTS_OUT = Path(__file__).resolve().parent / "essay_agreement_results.md"
 
+# Prompt development touched some of the essays we evaluate on, so the headline
+# figures are re-reported on the subset it never touched. Two sources of overlap:
+# the A/B test sets used to choose prompt wording, and the four worked examples
+# embedded in the few-shot prompt itself (those are the most direct leak — their
+# professor scores are literally in the prompt). training_500 is a weaker,
+# separate concern: those essays were scored by an earlier prompt, not used to
+# select one.
+FEWSHOT_TEST = DATA_DIR / "fewshot_test_result.csv"
+ANTICOMPRESSION_TEST = DATA_DIR / "anticompression_test_result.csv"
+TRAINING_500 = DATA_DIR / "dress_training_combined.csv"
+FEWSHOT_EXEMPLARS = ["DRESS-2151", "DRESS-1781", "DRESS-1449", "DRESS-567"]
+
 AGREEMENT_THRESHOLD_PCT = 10.0   # Methodology: "normalized difference at most 10%"
 QWK_ABSOLUTE_TARGET = 0.70       # Methodology: Williamson et al. (2012)
 QWK_MAX_GAP = 0.10               # Methodology: gap below professors' mean pairwise
@@ -336,11 +348,68 @@ def analyse(merged: pd.DataFrame, per_professor: np.ndarray) -> dict:
     results["spread_vs_error_r"] = float(stats.pearsonr(merged["spread"], abs_err).statistic)
 
     # Both raters' distributions, which the Methodology requires alongside QWK.
+    results["sensitivity"] = sensitivity(merged, per_professor)
+
     results["distributions"] = {
         "ai": pd.Series(to_units(ai_total, 1.0)).value_counts().sort_index().to_dict(),
         "professor": pd.Series(to_units(prof_total, 1.0)).value_counts().sort_index().to_dict(),
     }
     return results
+
+
+def ids_from(path: Path) -> set[str]:
+    """Essay ids in a results file, or an empty set if it is not present."""
+    if not path.exists():
+        return set()
+    return set(pd.read_csv(path)["essay_id"])
+
+
+def core_measures(merged: pd.DataFrame, per_professor: np.ndarray) -> dict:
+    """The headline figures, on whatever subset is passed in."""
+    ai_total = merged["ai_total"].to_numpy()
+    n_professors = per_professor.shape[1]
+    others = lambda j: per_professor[:, [i for i in range(n_professors) if i != j]].mean(axis=1)
+
+    return {
+        "n": len(merged),
+        "pearson_r": float(stats.pearsonr(merged["score_pct"], merged["prof_score_pct"]).statistic),
+        "agreement_pct": float((merged["abs_diff_pct"] <= AGREEMENT_THRESHOLD_PCT).mean() * 100),
+        "qwk": qwk(ai_total, per_professor.mean(axis=1), 0.5),
+        "prof_pairwise": float(np.mean([
+            qwk(per_professor[:, i], per_professor[:, j], 0.5)
+            for i, j in itertools.combinations(range(n_professors), 2)
+        ])),
+        "loo_professor": float(np.mean([
+            stats.pearsonr(per_professor[:, j], others(j)).statistic for j in range(n_professors)
+        ])),
+        "loo_system": float(np.mean([
+            stats.pearsonr(ai_total, others(j)).statistic for j in range(n_professors)
+        ])),
+    }
+
+
+def sensitivity(merged: pd.DataFrame, per_professor: np.ndarray) -> list[dict]:
+    """
+    Re-report the headline on essays prompt development never touched.
+
+    Selecting prompt wording on essays that are later used to evaluate that
+    prompt is a real validity threat, so the size and direction of the effect
+    has to be measured rather than asserted.
+    """
+    prompt_dev = ids_from(FEWSHOT_TEST) | ids_from(ANTICOMPRESSION_TEST) | set(FEWSHOT_EXEMPLARS)
+    training = ids_from(TRAINING_500)
+
+    subsets = [
+        ("All essays (primary)", pd.Series(True, index=merged.index)),
+        ("Excluding prompt-development essays", ~merged["essay_id"].isin(prompt_dev)),
+        ("Also excluding earlier-scored essays", ~merged["essay_id"].isin(prompt_dev | training)),
+    ]
+
+    rows = []
+    for label, mask in subsets:
+        subset = merged[mask].reset_index(drop=True)
+        rows.append({"label": label, **core_measures(subset, per_professor[mask.to_numpy()])})
+    return rows
 
 
 def render(results: dict) -> str:
@@ -441,7 +510,22 @@ def render(results: dict) -> str:
     add(f"| Per-criterion spread | {results['spread_vs_error_r']:.4f} |")
     add("")
 
-    add("## 7. Score distributions (whole points, 0-15)")
+    add("## 7. Sensitivity to prompt-development overlap")
+    add("")
+    add("Some evaluation essays were also used while choosing the prompt wording, "
+        "including the four worked examples embedded in the few-shot prompt itself. "
+        "The headline figures are re-reported below on the essays that were never "
+        "used that way.")
+    add("")
+    add("| Subset | n | r | Within 10% | QWK | Prof. pairwise | LOO prof. | LOO system |")
+    add("|---|---|---|---|---|---|---|---|")
+    for row in results["sensitivity"]:
+        add(f"| {row['label']} | {row['n']} | {row['pearson_r']:.4f} | "
+            f"{row['agreement_pct']:.1f}% | {row['qwk']:.4f} | {row['prof_pairwise']:.4f} | "
+            f"{row['loo_professor']:.4f} | {row['loo_system']:.4f} |")
+    add("")
+
+    add("## 8. Score distributions (whole points, 0-15)")
     add("")
     add("| Score | AI | Professor consensus |")
     add("|---|---|---|")
