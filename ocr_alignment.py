@@ -42,6 +42,20 @@ MM_PER_INCH: float = 25.4
 # reconfirmed at the smaller size.
 _DETECTION_MAX_DIM: int = 1600
 
+# How tilted the handwriting rows on a warped page may be before the
+# alignment is re-done at full detection resolution. Retrying costs a few
+# seconds and only happens when this trips.
+#
+# Measured on real submissions: pages that transcribe cleanly sit at 0.00,
+# 0.25, 0.75 and 1.00 degrees, while -3.25 split every line box (whole
+# clauses transcribed twice) and -1.25 duplicated the opening lines. The bar
+# therefore sits just above the clean pages: the comparison is strict, so a
+# page measuring exactly 1.00 still takes the fast path.
+_MAX_CONTENT_SKEW_DEG: float = 1.0
+
+# Half-width of the angle sweep used to measure that tilt.
+_SKEW_SEARCH_DEG: float = 6.0
+
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -225,6 +239,124 @@ def preprocess_crop(crop: Image.Image) -> Image.Image:
 
 # ── Alignment ─────────────────────────────────────────────────────────────────
 
+def _warp_once(
+    original_rgb: np.ndarray,
+    template_spec: dict[str, Any],
+    detection_max_dim: int,
+    out_w: int,
+    out_h: int,
+) -> tuple[np.ndarray | None, int]:
+    """
+    One detect-and-warp pass with markers detected at `detection_max_dim`.
+
+    Detection runs on a denoise+contrast-boosted, downscaled throwaway copy
+    (cheap — fastNlMeansDenoisingColored cost scales with pixel count), with
+    the found corners scaled back into original-image space so the warp still
+    uses full-resolution, unedited pixels. Returns (None, n) when the page
+    can't be aligned.
+    """
+    h, w  = original_rgb.shape[:2]
+    scale = min(1.0, detection_max_dim / max(h, w))
+    small_rgb = (
+        cv2.resize(original_rgb, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+        if scale < 1.0 else original_rgb
+    )
+    gray = cv2.cvtColor(_detection_copy(small_rgb), cv2.COLOR_RGB2GRAY)
+
+    corners_list, ids, _ = _DETECTOR.detectMarkers(gray)
+    n_found = 0 if ids is None else len(ids)
+    if n_found < 2:
+        logger.warning(
+            "ArUco: only %d marker(s) detected — falling back to full-page OCR", n_found
+        )
+        return None, n_found
+
+    if scale < 1.0:
+        corners_list = [c / scale for c in corners_list]
+
+    template_corners = _template_marker_corners(template_spec)
+    src_pts: list[np.ndarray] = []
+    dst_pts: list[np.ndarray] = []
+    for i, mid in enumerate(ids.flatten().tolist()):
+        if mid in template_corners:
+            src_pts.append(corners_list[i][0])
+            dst_pts.append(template_corners[mid])
+
+    matched = len(src_pts)
+    if matched < 2:
+        logger.warning("ArUco: %d matched marker(s) — need ≥2", matched)
+        return None, matched
+
+    H, mask = cv2.findHomography(
+        np.concatenate(src_pts, axis=0), np.concatenate(dst_pts, axis=0),
+        cv2.RANSAC, ransacReprojThreshold=5.0,
+    )
+    if H is None:
+        logger.warning("ArUco: findHomography returned None")
+        return None, matched
+
+    inliers = int(mask.sum()) if mask is not None else "?"
+    logger.info(
+        "ArUco: homography from %d marker(s), %s/%d inliers (detection @%dpx)",
+        matched, inliers, 4 * matched, detection_max_dim,
+    )
+    return cv2.warpPerspective(
+        original_rgb, H, (out_w, out_h),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=(255, 255, 255),
+    ), matched
+
+
+def _content_skew_deg(warped_rgb: np.ndarray, dpi: float) -> float | None:
+    """
+    Tilt (degrees) of the handwriting rows on a warped page.
+
+    This is the quantity Surya's line detector is sensitive to: tilted rows
+    force tall bounding boxes that overlap their neighbours, so Qwen reads the
+    same lines two or three times. Measured on the *output* of the warp, so it
+    catches a bad warp regardless of cause — and, unlike marker positions or
+    the form's printed rules (both measured insensitive to exactly this
+    failure), it tracks the damage that reaches OCR.
+
+    Printed rules are removed first: they're long continuous runs, so a
+    horizontal opening isolates them, and what's left is handwriting. Returns
+    None when there's too little ink to judge.
+    """
+    gray  = cv2.cvtColor(warped_rgb, cv2.COLOR_RGB2GRAY)
+    scale = 0.25
+    small = cv2.resize(
+        gray, (int(gray.shape[1] * scale), int(gray.shape[0] * scale)),
+        interpolation=cv2.INTER_AREA,
+    )
+    binary = cv2.adaptiveThreshold(
+        small, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY_INV, 31, 10,
+    )
+    rule_kernel = cv2.getStructuringElement(
+        cv2.MORPH_RECT, (max(20, int(_mm_to_px(30.0, dpi) * scale)), 1),
+    )
+    rules = cv2.morphologyEx(binary, cv2.MORPH_OPEN, rule_kernel)
+    ink = cv2.subtract(
+        binary, cv2.dilate(rules, cv2.getStructuringElement(cv2.MORPH_RECT, (1, 5))),
+    )
+    if (ink > 0).mean() < 0.001:
+        return None
+
+    # Rows of text stack into a sharply peaked horizontal projection only when
+    # they're level, so the angle maximising that profile's variance is the tilt.
+    h, w = ink.shape
+    best, best_score = 0.0, -1.0
+    for angle in np.arange(-_SKEW_SEARCH_DEG, _SKEW_SEARCH_DEG + 0.25, 0.25):
+        rotated = cv2.warpAffine(
+            ink, cv2.getRotationMatrix2D((w / 2, h / 2), float(angle), 1.0), (w, h),
+            flags=cv2.INTER_NEAREST, borderValue=0,
+        )
+        score = float(np.var(rotated.sum(axis=1, dtype=np.float64)))
+        if score > best_score:
+            best, best_score = float(angle), score
+    return best
+
+
 def detect_and_warp(
     scan: Image.Image,
     template_spec: dict[str, Any],
@@ -255,71 +387,234 @@ def detect_and_warp(
     # This keeps denoise/CLAHE/resample artifacts out of what Qwen sees.
     original_rgb = np.array(scan.convert("RGB"))
 
-    # fastNlMeansDenoisingColored (inside _detection_copy) scales with pixel
-    # count and dominates this function's runtime on a full-resolution phone
-    # photo (12MP+), even though ArUco marker edges are still easily
-    # resolvable at a much lower resolution. Detect on a downscaled copy —
-    # cheap — then scale the found corners back up to original-image pixel
-    # space before computing the homography, so the warp below still uses
-    # full-resolution pixels and OCR quality is unaffected.
-    h, w  = original_rgb.shape[:2]
-    scale = min(1.0, _DETECTION_MAX_DIM / max(h, w))
-    small_rgb  = (
-        cv2.resize(original_rgb, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
-        if scale < 1.0 else original_rgb
-    )
-    detect_rgb = _detection_copy(small_rgb)
-    gray       = cv2.cvtColor(detect_rgb, cv2.COLOR_RGB2GRAY)
+    # Detect fast on a downscaled copy first, then CHECK the result (see
+    # _alignment_error_mm). Downscaled detection multiplies every corner
+    # error by 1/scale, which on a 3-marker page can tilt the whole
+    # homography — measured at 3 degrees of false rotation on a scan whose
+    # handwriting was straight, splitting Surya's line boxes and making Qwen
+    # transcribe the same lines twice. Good pages keep the fast path; only
+    # pages that fail the check pay for full-resolution detection.
+    warped_np, matched = _warp_once(original_rgb, template_spec, _DETECTION_MAX_DIM, out_w, out_h)
+    if warped_np is None:
+        return preprocess_scan(scan), False
 
-    corners_list, ids, _ = _DETECTOR.detectMarkers(gray)
-
-    n_found = 0 if ids is None else len(ids)
-    if n_found < 2:
-        logger.warning(
-            "ArUco: only %d marker(s) detected — falling back to full-page OCR", n_found
+    skew = _content_skew_deg(warped_np, dpi)
+    h, w = original_rgb.shape[:2]
+    if skew is not None and abs(skew) > _MAX_CONTENT_SKEW_DEG and max(h, w) > _DETECTION_MAX_DIM:
+        logger.info(
+            "ArUco: warped text tilted %.2f deg at %dpx detection — retrying at full resolution",
+            skew, _DETECTION_MAX_DIM,
         )
-        return preprocess_scan(scan), False
+        retry_np, retry_matched = _warp_once(original_rgb, template_spec, max(h, w), out_w, out_h)
+        if retry_np is not None:
+            retry_skew = _content_skew_deg(retry_np, dpi)
+            # Keep whichever warp leaves the text straighter — a page whose
+            # handwriting is genuinely slanted keeps the original result
+            # rather than paying twice for no gain.
+            if retry_skew is not None and abs(retry_skew) < abs(skew):
+                logger.info(
+                    "ArUco: full-resolution alignment accepted (%.2f deg vs %.2f deg)",
+                    retry_skew, skew,
+                )
+                warped_np, matched, skew = retry_np, retry_matched, retry_skew
 
-    if scale < 1.0:
-        corners_list = [c / scale for c in corners_list]
-
-    template_corners = _template_marker_corners(template_spec)
-    ids_flat = ids.flatten().tolist()
-
-    src_pts: list[np.ndarray] = []
-    dst_pts: list[np.ndarray] = []
-
-    for i, mid in enumerate(ids_flat):
-        if mid in template_corners:
-            src_pts.append(corners_list[i][0])
-            dst_pts.append(template_corners[mid])
-
-    matched = len(src_pts)
-    if matched < 2:
-        logger.warning("ArUco: %d matched marker(s) — need ≥2", matched)
-        return preprocess_scan(scan), False
-
-    src_all = np.concatenate(src_pts, axis=0)
-    dst_all = np.concatenate(dst_pts, axis=0)
-
-    H, mask = cv2.findHomography(src_all, dst_all, cv2.RANSAC, ransacReprojThreshold=5.0)
-    if H is None:
-        logger.warning("ArUco: findHomography returned None")
-        return preprocess_scan(scan), False
-
-    inliers = int(mask.sum()) if mask is not None else "?"
     logger.info(
-        "ArUco: homography from %d marker(s), %s/%d inliers",
-        matched, inliers, len(src_all),
-    )
-
-    warped_np = cv2.warpPerspective(
-        original_rgb, H, (out_w, out_h),
-        flags=cv2.INTER_LINEAR,
-        borderMode=cv2.BORDER_CONSTANT,
-        borderValue=(255, 255, 255),
+        "ArUco: warped from %d marker(s), text tilt %s",
+        matched, "unknown" if skew is None else f"{skew:+.2f} deg",
     )
     return Image.fromarray(warped_np), True
+
+
+# Identification box snapping (see _snap_region_to_box). The search reaches
+# far enough to cover the 5-8 mm drift measured near the top of pages warped
+# from only the two bottom markers, but stays under half the 18.5 mm box
+# pitch so it can't lock onto a neighbouring box.
+_SNAP_SEARCH_MM      = 10.0
+_SNAP_HEIGHT_TOL_MM  = 2.0
+_SNAP_STRIPS         = 12
+_SNAP_MIN_STRIPS     = 3
+_SNAP_OUTLIER_MM     = 3.0
+
+# Horizontal snapping (see _snap_region_x). Unlike the vertical search there is
+# no neighbouring box to lock onto — the nearest confusable vertical structure
+# is the page edge — so the window reaches the 13 mm sideways drift measured on
+# a page warped from two markers. Left and right borders are paired and their
+# span checked against the template width, which rejects the page edge.
+# The tolerance below is a fraction of the box width, not a fixed margin: a
+# page warped from two markers carries a real scale error (3-7% measured here),
+# and a tight margin rejects the true border pair while still admitting a
+# spurious one built from the page edge.
+_SNAP_X_SEARCH_MM    = 16.0
+_SNAP_WIDTH_TOL_FRAC = 0.08
+
+
+def _strip_line_positions(line_mask: np.ndarray, y_offset_px: int, dpi: float) -> list[float]:
+    """Y positions (mm, page space) of horizontal lines in one vertical strip."""
+    profile = (line_mask > 0).mean(axis=1)
+    rows = np.where(profile > 0.35)[0]
+    merge_px = int(_mm_to_px(1.0, dpi))
+    groups: list[list[int]] = []
+    for r in rows:
+        if groups and r - groups[-1][-1] <= merge_px:
+            groups[-1].append(r)
+        else:
+            groups.append([r])
+    return [
+        (y_offset_px + float(np.average(g, weights=profile[g]))) * MM_PER_INCH / dpi
+        for g in groups
+    ]
+
+
+def _band_vertical_lines(band: np.ndarray, x_offset_px: int, dpi: float) -> list[float]:
+    """X positions (mm, page space) of vertical lines spanning one horizontal band."""
+    binary = cv2.adaptiveThreshold(
+        band, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY_INV, 31, 10,
+    )
+    # Keep only vertical runs covering most of the band — box borders survive,
+    # the printed "Q<n>." label and handwriting do not.
+    kernel = cv2.getStructuringElement(
+        cv2.MORPH_RECT, (1, max(3, int(band.shape[0] * 0.6))),
+    )
+    lines   = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
+    profile = (lines > 0).mean(axis=0)
+    cols    = np.where(profile > 0.5)[0]
+    merge_px = max(1, int(_mm_to_px(1.0, dpi)))
+    groups: list[list[int]] = []
+    for c in cols:
+        if groups and c - groups[-1][-1] <= merge_px:
+            groups[-1].append(c)
+        else:
+            groups.append([c])
+    return [
+        (x_offset_px + float(np.average(g, weights=profile[g]))) * MM_PER_INCH / dpi
+        for g in groups
+    ]
+
+
+def _snap_region_x(
+    gray: np.ndarray,
+    region: dict[str, Any],
+    dpi: float,
+) -> dict[str, Any]:
+    """
+    Move a vertically-snapped region onto the box's printed left/right borders.
+
+    Same drift as the vertical case, on the other axis: warped from only the
+    two bottom markers the homography can't pin down tilt, so boxes slide
+    sideways as well — measured at 13 mm on one page, far enough to pull the
+    printed "Q<n>." label into the crop and put it in the transcription.
+
+    Candidate borders on each side are paired and their span checked against
+    the template width, so a page edge falling inside the search window can't
+    be mistaken for a border. Returns the region unchanged if no pair matches.
+    """
+    box_w     = region["x2_mm"] - region["x1_mm"]
+    width_tol = max(4.0, box_w * _SNAP_WIDTH_TOL_FRAC)
+    # Inset from the top/bottom borders so they don't register as vertical runs.
+    inset = (region["y2_mm"] - region["y1_mm"]) * 0.15
+    y0 = max(0,              int(_mm_to_px(region["y1_mm"] + inset, dpi)))
+    y1 = min(gray.shape[0],  int(_mm_to_px(region["y2_mm"] - inset, dpi)))
+    if y1 - y0 < 10:
+        return region
+
+    def borders(centre_mm: float) -> list[float]:
+        x0 = max(0,             int(_mm_to_px(centre_mm - _SNAP_X_SEARCH_MM, dpi)))
+        x1 = min(gray.shape[1], int(_mm_to_px(centre_mm + _SNAP_X_SEARCH_MM, dpi)))
+        if x1 - x0 < 3:
+            return []
+        return _band_vertical_lines(gray[y0:y1, x0:x1], x0, dpi)
+
+    best: tuple[float, float, float] | None = None
+    for left in borders(region["x1_mm"]):
+        for right in borders(region["x2_mm"]):
+            if abs((right - left) - box_w) > width_tol:
+                continue
+            offset = abs(left - region["x1_mm"])
+            if best is None or offset < best[0]:
+                best = (offset, left, right)
+
+    if best is None:
+        logger.info(
+            "Box snap: left/right borders not found near x=%.1f-%.1fmm — using template x",
+            region["x1_mm"], region["x2_mm"],
+        )
+        return region
+
+    _, left, right = best
+    logger.info(
+        "Box snap: x %.1f-%.1fmm -> %.1f-%.1fmm",
+        region["x1_mm"], region["x2_mm"], left, right,
+    )
+    return {**region, "x1_mm": left, "x2_mm": right}
+
+
+def _snap_region_to_box(
+    warped: Image.Image,
+    region: dict[str, Any],
+    dpi: float,
+) -> dict[str, Any]:
+    """
+    Move a single-line answer region onto the printed box actually found on
+    the warped page.
+
+    When a page is warped from only the two bottom ArUco markers (the
+    top-left one is often covered or cut off in phone photos), the
+    homography can't pin down tilt, so boxes drift several mm from their
+    template position toward the top of the page — enough to cut
+    handwriting off the crop. This finds the box's top and bottom border
+    lines near the expected position and returns a region matching them,
+    then hands off to _snap_region_x for the same correction sideways.
+
+    Borders are found per vertical strip so a slightly rotated page still
+    works; strips that disagree with the median are dropped, and the crop
+    covers every remaining strip's box. Returns the region unchanged if the
+    box can't be found reliably — the horizontal snap is only attempted once
+    the box has been located vertically, since it needs a trustworthy band.
+    """
+    gray = cv2.cvtColor(np.asarray(warped.convert("RGB")), cv2.COLOR_RGB2GRAY)
+    y0 = max(0, int(_mm_to_px(region["y1_mm"] - _SNAP_SEARCH_MM, dpi)))
+    y1 = min(gray.shape[0], int(_mm_to_px(region["y2_mm"] + _SNAP_SEARCH_MM, dpi)))
+    # Stay inside the box's left/right borders — the vertical border lines
+    # would otherwise count toward every row.
+    x0 = max(0, int(_mm_to_px(region["x1_mm"] + 3.0, dpi)))
+    x1 = min(gray.shape[1], int(_mm_to_px(region["x2_mm"] - 3.0, dpi)))
+    if y1 - y0 < 10 or x1 - x0 < _SNAP_STRIPS * 10:
+        return region
+
+    binary = cv2.adaptiveThreshold(
+        gray[y0:y1, x0:x1], 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY_INV, 31, 10,
+    )
+    # Keep only horizontal runs ≥5 mm — box borders survive, handwriting mostly doesn't.
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (int(_mm_to_px(5.0, dpi)), 1))
+    lines = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
+
+    box_h = region["y2_mm"] - region["y1_mm"]
+    found: list[tuple[float, float]] = []
+    for cols in np.array_split(np.arange(lines.shape[1]), _SNAP_STRIPS):
+        ys = _strip_line_positions(lines[:, cols[0]:cols[-1] + 1], y0, dpi)
+        best: tuple[float, float, float] | None = None
+        for i, top in enumerate(ys):
+            for bottom in ys[i + 1:]:
+                if abs((bottom - top) - box_h) <= _SNAP_HEIGHT_TOL_MM:
+                    offset = abs(top - region["y1_mm"])
+                    if best is None or offset < best[0]:
+                        best = (offset, top, bottom)
+        if best:
+            found.append((best[1], best[2]))
+
+    if len(found) >= _SNAP_MIN_STRIPS:
+        median_top = float(np.median([t for t, _ in found]))
+        found = [(t, b) for t, b in found if abs(t - median_top) <= _SNAP_OUTLIER_MM]
+    if len(found) < _SNAP_MIN_STRIPS:
+        logger.info("Box snap: box not found near y=%.1fmm — using template position", region["y1_mm"])
+        return region
+
+    top, bottom = min(t for t, _ in found), max(b for _, b in found)
+    logger.info(
+        "Box snap: y %.1f-%.1fmm -> %.1f-%.1fmm (%d strips)",
+        region["y1_mm"], region["y2_mm"], top, bottom, len(found),
+    )
+    return _snap_region_x(gray, {**region, "y1_mm": top, "y2_mm": bottom}, dpi)
 
 
 def crop_region(
@@ -328,6 +623,7 @@ def crop_region(
     template_spec: dict[str, Any],
     padding_mm: float = 2.0,
     top_padding_mm: float = 0.5,
+    snap_to_box: bool = False,
 ) -> Image.Image:
     """
     Crop a single answer region from the perspective-corrected (but
@@ -342,8 +638,14 @@ def crop_region(
     top_padding_mm  : Extra margin on the top edge only. Kept very small (0.5 mm)
                       to avoid bleeding into the printed question prompt that sits
                       immediately above the answer box.
+    snap_to_box     : Re-locate the region on the printed box actually found on
+                      the page (see _snap_region_to_box). Only for single-line
+                      identification boxes — essay boxes contain ruled lines
+                      that the border search could mistake for the box edge.
     """
     dpi = float(template_spec.get("dpi", 300))
+    if snap_to_box:
+        region = _snap_region_to_box(warped, region, dpi)
     x1  = max(0,             int(_mm_to_px(region["x1_mm"]    - padding_mm,     dpi)))
     y1  = max(0,             int(_mm_to_px(region["y1_mm"]    - top_padding_mm, dpi)))
     x2  = min(warped.width,  int(_mm_to_px(region["x2_mm"]    + padding_mm,     dpi)))

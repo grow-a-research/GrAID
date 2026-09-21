@@ -105,6 +105,71 @@ async def ocr(file: UploadFile = File(...), include_boxed_image: bool = True) ->
     return response
 
 
+@app.post("/ocr_id")
+async def ocr_id(file: UploadFile = File(...)) -> JSONResponse:
+    """
+    Identification answers: read the whole answer box as one line, skipping
+    Surya line detection entirely (see id_ocr.py for why).
+
+    Separate from /ocr on purpose — essay OCR keeps running the untouched
+    run_ocr_pipeline path above, so its CER/WER stay comparable.
+    """
+    import id_ocr
+
+    if ocr_pipeline.MODELS is None:
+        raise HTTPException(status_code=503, detail="Models not loaded")
+
+    t_start = time.perf_counter()
+    raw = await file.read()
+    try:
+        original = Image.open(io.BytesIO(raw)).convert("RGB")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid image: {e}") from e
+
+    text, confidence = id_ocr.transcribe_answer_box(original)
+    print(
+        f"[Timing] /ocr_id request handled server-side in "
+        f"{time.perf_counter() - t_start:.2f}s (confidence {confidence:.3f})"
+    )
+    return JSONResponse({
+        "text": text,
+        "boxes": [[0, 0, original.width, original.height]],
+        "confidence": confidence,
+        "low_confidence": confidence < id_ocr.MIN_CONFIDENCE,
+    })
+
+
+@app.post("/ocr_trocr")
+async def ocr_trocr(file: UploadFile = File(...), single_line: bool = False) -> JSONResponse:
+    """
+    Experimental: transcribe with TrOCR (a handwriting-specialised model)
+    instead of Qwen, for benchmarking against /ocr and /ocr_id.
+
+    Additive only — /ocr and /ocr_id are untouched, and nothing in the app
+    calls this. The model loads on first request, so the first call is slow.
+    """
+    import trocr_ocr
+
+    if ocr_pipeline.MODELS is None:
+        raise HTTPException(status_code=503, detail="Models not loaded")
+
+    t_start = time.perf_counter()
+    raw = await file.read()
+    try:
+        original = Image.open(io.BytesIO(raw)).convert("RGB")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid image: {e}") from e
+
+    text, boxes, low_confidence = trocr_ocr.transcribe(original, single_line=single_line)
+    print(f"[Timing] /ocr_trocr handled server-side in {time.perf_counter() - t_start:.2f}s")
+    return JSONResponse({
+        "text": text,
+        "boxes": [list(b) for b in boxes],
+        "low_confidence": low_confidence,
+        "model": trocr_ocr.TROCR_MODEL_ID,
+    })
+
+
 if __name__ == "__main__":
     import uvicorn
 

@@ -28,18 +28,81 @@ function downloadCsv(filename, rows) {
 
 function downloadQuestionsCsvTemplate() {
   downloadCsv('questions_template.csv', [
-    ['prompt', 'question_type', 'rubric_text', 'max_points', 'choices', 'correct_answer'],
+    ['prompt', 'question_type', 'rubric_text', 'max_points', 'choices', 'correct_answer', 'case_sensitive'],
     [
       csvCell('Explain how photosynthesis converts sunlight into chemical energy.'),
-      'essay', csvCell(EXAMPLE_RUBRIC), '10', '', '',
+      'essay', csvCell(EXAMPLE_RUBRIC), '10', '', '', '',
     ],
-    [csvCell('What is the capital of France?'), 'identification', '', '5', '', 'Paris'],
-    [csvCell('The mitochondria is the powerhouse of the cell.'), 'tf', '', '2', '', 'True'],
+    [csvCell('Who wrote Noli Me Tangere?'), 'identification', '', '5', '', csvCell('Rizal|Jose Rizal|Dr. Jose Rizal'), 'no'],
+    [csvCell('The mitochondria is the powerhouse of the cell.'), 'tf', '', '2', '', 'True', ''],
     [
       csvCell('Which gas do plants absorb during photosynthesis?'),
-      'mcq', '', '2', csvCell('Oxygen|Carbon Dioxide|Nitrogen|Hydrogen'), 'B',
+      'mcq', '', '2', csvCell('Oxygen|Carbon Dioxide|Nitrogen|Hydrogen'), 'B', '',
     ],
   ])
+}
+
+// Identification answer key: one box per accepted answer, plus the teacher's
+// case-sensitivity choice. Scoring is an exact match against these. The parent
+// (and the API) still hold the list as one "|"-separated string, so the boxes
+// are joined on every change.
+const splitAccepted = s => {
+  const items = (s || '').split('|').map(a => a.trim()).filter(Boolean)
+  return items.length ? items : ['']
+}
+const joinAccepted = items => items.map(a => a.trim()).filter(Boolean).join(' | ')
+
+function IdentificationAnswerFields({ value, onChange, caseSensitive, onCaseSensitiveChange }) {
+  const [items, setItems] = useState(() => splitAccepted(value))
+  const [syncedValue, setSyncedValue] = useState(value)
+
+  // Re-sync when the parent resets the form or opens a different question
+  // (but not on our own edits, which would drop empty boxes mid-typing).
+  if (value !== syncedValue) {
+    setSyncedValue(value)
+    if (joinAccepted(items) !== value) setItems(splitAccepted(value))
+  }
+
+  function update(next) {
+    setItems(next)
+    onChange(joinAccepted(next))
+  }
+
+  return (
+    <div className="flex flex-col gap-1.5">
+      <div className={tw.label}>Accepted answers</div>
+      {items.map((item, i) => (
+        <div key={i} className="flex items-center gap-2">
+          <input className={tw.input}
+            placeholder={i === 0 ? 'Accepted answer (e.g. Jose Rizal)' : 'Another accepted answer'}
+            value={item}
+            // "|" is the storage separator, so it can't appear inside an answer.
+            onChange={e => update(items.map((a, idx) => idx === i ? e.target.value.replace(/\|/g, '') : a))} />
+          {items.length > 1 && (
+            <button type="button" className={tw.btnSm} title="Remove this answer"
+              onClick={() => update(items.filter((_, idx) => idx !== i))}>
+              ✕
+            </button>
+          )}
+        </div>
+      ))}
+      <div>
+        <button type="button" className={tw.btnSm} onClick={() => update([...items, ''])}>
+          + Add accepted answer
+        </button>
+      </div>
+      <label className="flex items-center gap-2 text-xs text-zinc-400 cursor-pointer select-none">
+        <input type="checkbox" className="accent-emerald-500"
+          checked={caseSensitive} onChange={e => onCaseSensitiveChange(e.target.checked)} />
+        Case-sensitive (capitalization must match)
+      </label>
+      <p className="text-xs text-zinc-500">
+        A student answer gets full points only if it exactly matches one of these
+        {caseSensitive ? '' : ' (capitalization ignored)'}. Add spelling variants
+        such as "Lapulapu" and "Lapu-Lapu" as separate answers.
+      </p>
+    </div>
+  )
 }
 
 function downloadRubricsCsvTemplate() {
@@ -141,6 +204,7 @@ export default function ExamsPage() {
   const [qType, setQType] = useState('essay')          // essay | mcq | tf | identification
   const [qChoices, setQChoices] = useState(['', '', '', ''])  // MCQ choices A-D
   const [qCorrect, setQCorrect] = useState('')          // correct answer
+  const [qCaseSensitive, setQCaseSensitive] = useState(false)  // identification only
   const [addingQ, setAddingQ] = useState(false)
   const [addQErr, setAddQErr] = useState('')
 
@@ -172,6 +236,7 @@ export default function ExamsPage() {
   const [editQType, setEditQType] = useState('essay')
   const [editQChoices, setEditQChoices] = useState(['', '', '', ''])
   const [editQCorrect, setEditQCorrect] = useState('')
+  const [editQCaseSensitive, setEditQCaseSensitive] = useState(false)
   const [editQRubric, setEditQRubric] = useState('')
   const [editQRubricMode, setEditQRubricMode] = useState('text')   // structured | text
   const [editQCriteria, setEditQCriteria] = useState([])
@@ -235,6 +300,7 @@ export default function ExamsPage() {
         rubric_text: qType === 'essay' && qRubricMode === 'text' ? qRubric.trim() : null,
         rubric_criteria_json: usingStructured ? JSON.stringify(qCriteria) : null,
         correct_answer: qCorrect.trim() || null,
+        case_sensitive: qType === 'identification' && qCaseSensitive,
         choices_json: qType === 'mcq'
           ? JSON.stringify(qChoices.map(c => c.trim()).filter(Boolean))
           : null,
@@ -243,7 +309,7 @@ export default function ExamsPage() {
       setQuestions(prev => [...prev, q])
       setQPrompt(''); setQPoints('10'); setQRubric(''); setQCriteria([])
       setQRubricParseErrors([])
-      setQCorrect(''); setQChoices(['', '', '', ''])
+      setQCorrect(''); setQCaseSensitive(false); setQChoices(['', '', '', ''])
     } catch (err) { setAddQErr(err.message) }
     setAddingQ(false)
   }
@@ -365,6 +431,7 @@ export default function ExamsPage() {
     setEditQType(q.question_type || 'essay')
     setEditQChoices(choices)
     setEditQCorrect(q.correct_answer || '')
+    setEditQCaseSensitive(!!q.case_sensitive)
     setEditQRubric(q.rubric_text || '')
     setEditQCriteria(criteria)
     setEditQRubricMode(criteria.length > 0 ? 'structured' : 'text')
@@ -392,6 +459,7 @@ export default function ExamsPage() {
           ? JSON.stringify(editQChoices.map(c => c.trim()).filter(Boolean))
           : null,
         correct_answer: editQCorrect.trim() || null,
+        case_sensitive: editQType === 'identification' && editQCaseSensitive,
       }
       if (usingStructured) {
         body.rubric_criteria_json = JSON.stringify(editQCriteria)
@@ -568,7 +636,8 @@ export default function ExamsPage() {
                     <span className="font-mono text-zinc-400">rubric_text</span> (required for essay),{' '}
                     <span className="font-mono text-zinc-400">max_points</span>,{' '}
                     <span className="font-mono text-zinc-400">choices</span> (MCQ only — pipe-separated, e.g. <span className="font-mono">Oxygen|Carbon Dioxide|Nitrogen|Hydrogen</span>; order maps to A/B/C/D),{' '}
-                    <span className="font-mono text-zinc-400">correct_answer</span> (required for mcq/tf/identification — a letter for MCQ, "True"/"False" for T-F, the expected text for Identification).
+                    <span className="font-mono text-zinc-400">correct_answer</span> (required for mcq/tf/identification — a letter for MCQ, "True"/"False" for T-F, the accepted answers for Identification, pipe-separated, e.g. <span className="font-mono">Rizal|Jose Rizal</span>),{' '}
+                    <span className="font-mono text-zinc-400">case_sensitive</span> (Identification only — <span className="font-mono">yes</span> to require matching capitalization; defaults to no).
                     {' '}Download the template below to see a filled example of each type.
                   </p>
                   <div className="flex gap-2 flex-wrap">
@@ -746,10 +815,11 @@ export default function ExamsPage() {
                 </select>
               )}
 
-              {/* Identification: expected answer */}
+              {/* Identification: accepted answers + case sensitivity */}
               {qType === 'identification' && (
-                <input className={tw.input} placeholder="Expected answer (used for auto-scoring)"
-                  value={qCorrect} onChange={e => setQCorrect(e.target.value)} />
+                <IdentificationAnswerFields
+                  value={qCorrect} onChange={setQCorrect}
+                  caseSensitive={qCaseSensitive} onCaseSensitiveChange={setQCaseSensitive} />
               )}
 
               {!(qType === 'essay' && qRubricMode === 'structured') && (
@@ -886,8 +956,9 @@ export default function ExamsPage() {
                           )}
 
                           {editQType === 'identification' && (
-                            <input className={tw.input} placeholder="Expected answer (auto-scoring)"
-                              value={editQCorrect} onChange={e => setEditQCorrect(e.target.value)} />
+                            <IdentificationAnswerFields
+                              value={editQCorrect} onChange={setEditQCorrect}
+                              caseSensitive={editQCaseSensitive} onCaseSensitiveChange={setEditQCaseSensitive} />
                           )}
 
                           {!(editQType === 'essay' && editQRubricMode === 'structured') && (
@@ -935,7 +1006,12 @@ export default function ExamsPage() {
                                 ))}
                               </div>
                             )}
-                            {q.correct_answer && q.question_type !== 'mcq' && (
+                            {q.correct_answer && q.question_type === 'identification' ? (
+                              <div className="mt-1 text-xs text-emerald-400">
+                                Accepted: {q.correct_answer.split('|').map(a => a.trim()).filter(Boolean).join(' | ')}
+                                <span className="text-zinc-500"> · {q.case_sensitive ? 'case-sensitive' : 'not case-sensitive'}</span>
+                              </div>
+                            ) : q.correct_answer && q.question_type !== 'mcq' && (
                               <div className="mt-1 text-xs text-emerald-400">Answer: {q.correct_answer}</div>
                             )}
                             {q.region_json && (

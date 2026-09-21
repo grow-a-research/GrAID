@@ -21,6 +21,7 @@ from PIL import Image, ImageOps
 from sqlalchemy.orm import Session
 
 import db_models as m
+from band_classifier import MODEL_VERSION as BAND_MODEL_VERSION, classify_essay
 from api_schemas import (
     BatchFileResult,
     BatchUploadResult,
@@ -31,6 +32,7 @@ from api_schemas import (
     ClassAnalytics,
     QueueEnqueueResult,
     QueueStatus,
+    ReprocessRequest,
     CourseClassCreate,
     CourseClassRead,
     EnrollmentCreate,
@@ -64,6 +66,7 @@ from api_schemas import (
     TeacherOverride,
 )
 from database import get_db
+from identification_scoring import looks_unreadable, parse_accepted_answers, score_identification
 
 router = APIRouter(prefix="/api/v1", tags=["platform"])
 
@@ -344,13 +347,19 @@ def _normalize_rubric_criteria(criteria: list[dict]) -> list[dict]:
     return normalized
 
 
+def _missing_correct_answer(qtype: str, correct_answer: str | None) -> bool:
+    if qtype == "identification":
+        return not parse_accepted_answers(correct_answer)
+    return qtype in ("mcq", "tf") and not (correct_answer or "").strip()
+
+
 @router.post("/exams/{exam_id}/questions", response_model=ExamQuestionRead)
 def add_question(exam_id: int, body: ExamQuestionCreate, db: Session = Depends(get_db)) -> m.ExamQuestion:
     exam = db.get(m.Exam, exam_id)
     if not exam:
         raise HTTPException(status_code=404, detail="Exam not found")
     qtype = (body.question_type or "essay").strip()
-    if qtype in ("mcq", "tf", "identification") and not (body.correct_answer or "").strip():
+    if _missing_correct_answer(qtype, body.correct_answer):
         raise HTTPException(
             status_code=422,
             detail=f"correct_answer is required for question type '{qtype}'",
@@ -374,6 +383,7 @@ def add_question(exam_id: int, body: ExamQuestionCreate, db: Session = Depends(g
         max_points=max_points,
         choices_json=body.choices_json,
         correct_answer=body.correct_answer,
+        case_sensitive=body.case_sensitive,
     )
     db.add(row)
     db.commit()
@@ -407,7 +417,7 @@ def update_question(
     Structural changes (question_type, choices_json, max_points) invalidate the
     exam template — region_json on the question and template_spec_json on the exam
     are cleared so the teacher is prompted to regenerate before processing scans.
-    Non-structural changes (prompt, rubric_text, correct_answer) leave the template intact.
+    Non-structural changes (prompt, rubric_text, correct_answer, case_sensitive) leave the template intact.
     """
     exam = db.get(m.Exam, exam_id)
     if not exam:
@@ -452,12 +462,14 @@ def update_question(
         structural = True
     if body.correct_answer is not None:
         q.correct_answer = body.correct_answer.strip() or None
+    if body.case_sensitive is not None:
+        q.case_sensitive = body.case_sensitive
     if body.order_index is not None:
         q.order_index = body.order_index
 
     # Validate correct_answer after all updates are applied
     final_type = (q.question_type or "essay").strip()
-    if final_type in ("mcq", "tf", "identification") and not (q.correct_answer or "").strip():
+    if _missing_correct_answer(final_type, q.correct_answer):
         raise HTTPException(
             status_code=422,
             detail=f"correct_answer is required for question type '{final_type}'",
@@ -657,7 +669,8 @@ def run_submission_ocr(
     Updates submission.status → 'ocr_done' when complete.
     """
     import ocr_pipeline
-    from ai_grader import correct_id_text, correct_ocr_text
+    from ai_grader import correct_ocr_text
+    from text_normalize import strip_printed_prompt
     from job_queue import _laplacian_var as _crop_clarity
     from ocr_alignment import (
         check_scan_quality,
@@ -706,6 +719,9 @@ def run_submission_ocr(
     dest_dir.mkdir(parents=True, exist_ok=True)
     results: list[m.SubmissionAnswer] = []
     quality_warnings: list[str] = []
+    # Questions already written during THIS run — a later page continues them
+    # instead of overwriting (see _merge_page_text).
+    written_questions: set[int] = set()
 
     for sf in files:
         img_path = project_root / sf.stored_path
@@ -778,10 +794,14 @@ def run_submission_ocr(
                         )
                     else:
                         # ── OCR path (essay / identification / no bubbles) ────
-                        crop = crop_region(warped, region, template_spec)
+                        crop = crop_region(
+                            warped, region, template_spec,
+                            snap_to_box=(qtype == "identification"),
+                            top_padding_mm=_TOP_PAD_MM.get(qtype, _DEFAULT_TOP_PAD_MM),
+                        )
                         ocr_clarity_val: float | None = _crop_clarity(crop)
                         t_ocr = time.perf_counter()
-                        ocr_text, boxes, _, ocr_low_conf = ocr_pipeline.run_ocr_pipeline(crop, include_boxed_image=False)
+                        ocr_text, boxes, ocr_low_conf = _ocr_answer_crop(crop, qtype)
                         logger.info(
                             "[Timing] submission %d q%d: remote OCR call took %.2fs",
                             submission_id, q.id, time.perf_counter() - t_ocr,
@@ -794,18 +814,20 @@ def run_submission_ocr(
                                 "submission %d q%d: OCR returned empty text — retrying once",
                                 submission_id, q.id,
                             )
-                            ocr_text, boxes, _, ocr_low_conf = ocr_pipeline.run_ocr_pipeline(crop, include_boxed_image=False)
-                        # MCQ/TF without bubbles: skip Groq correction (answer is
-                        # a single letter/word — correction may mangle it)
+                            ocr_text, boxes, ocr_low_conf = _ocr_answer_crop(crop, qtype)
+                        # Essays keep the transcription as OCR'd too. The Groq
+                        # correction step was a LAYOUT cleaner (merge wrapped
+                        # lines, split paragraphs, strip a printed prompt), and
+                        # text_normalize now does all three from the real line
+                        # geometry — Groq was only re-splitting the joined
+                        # paragraphs back into one sentence per line, and had
+                        # once truncated an essay outright.
                         if qtype == "essay" and ocr_text.strip():
-                            t_corr = time.perf_counter()
-                            ocr_text = correct_ocr_text(ocr_text)
-                            logger.info(
-                                "[Timing] submission %d q%d: Groq OCR-correction call took %.2fs",
-                                submission_id, q.id, time.perf_counter() - t_corr,
-                            )
-                        elif qtype == "identification" and ocr_text.strip():
-                            ocr_text = correct_id_text(ocr_text)
+                            ocr_text = strip_printed_prompt(ocr_text, q.prompt)
+                        # Identification answers keep the raw OCR text: exact-match
+                        # scoring needs what the student actually wrote, and Groq
+                        # correction can't tell an OCR slip from a student's own
+                        # misspelling (it both removed and granted credit that way).
                         boxes_data = json.dumps(
                             [{"x1": b[0], "y1": b[1], "x2": b[2], "y2": b[3]} for b in boxes]
                         )
@@ -825,7 +847,9 @@ def run_submission_ocr(
                         .first()
                     )
                     if existing:
-                        existing.ocr_text       = ocr_text
+                        existing.ocr_text       = _merge_page_text(
+                            existing.ocr_text, ocr_text, q.id in written_questions,
+                        )
                         existing.boxes_json     = boxes_data
                         existing.status         = ans_status
                         existing.omr_confidence = omr_confidence
@@ -854,6 +878,7 @@ def run_submission_ocr(
                         db.commit()
                         db.refresh(answer)
                         results.append(answer)
+                    written_questions.add(q.id)
 
         # ── Fallback: content-area OCR (excludes header + question prompts) ────
         if not aligned:
@@ -1368,6 +1393,57 @@ def download_student_paper(submission_id: int, db: Session = Depends(get_db)) ->
 # ---------------------------------------------------------------------------
 
 
+# Extra margin above an answer region's top edge, per question type.
+# Essays start 1.5mm INSIDE the box: the printed "Qn." label sits just above
+# it, and a sliver of that label survived the old 0.5mm margin and was
+# transcribed as a first line of text ("Q1." read as "91"). Trimming into the
+# box also drops the border line, which measured *more* text recovered, not
+# less. Identification boxes are only 14mm tall and already snap to the
+# printed box, so they keep the small outward margin.
+_DEFAULT_TOP_PAD_MM = 0.5
+_TOP_PAD_MM = {"essay": -1.5}
+
+
+def _merge_page_text(previous: str | None, new_text: str, already_written: bool) -> str:
+    """
+    Text to store for an answer after OCR'ing one page of a submission.
+
+    A question's region is read from every uploaded page, so a two-page essay
+    produces two transcriptions of the same answer. They are CONTINUATIONS,
+    not replacements: before this, page 2 overwrote page 1 and a 2745-char
+    essay was graded on its last 680 characters. `already_written` is true
+    only for a page later in the same OCR run, so re-running OCR still starts
+    clean instead of appending forever.
+    """
+    if not already_written:
+        return new_text
+    if not new_text.strip():
+        return previous or ""
+    if not (previous or "").strip():
+        return new_text
+    return f"{previous.rstrip()}\n\n{new_text.lstrip()}"
+
+
+def _ocr_answer_crop(crop, qtype: str) -> tuple[str, list, bool]:
+    """
+    OCR one answer crop by question type: identification boxes go to the
+    single-line endpoint (whole box, no line detection — see id_ocr.py),
+    essays run the two-scale pass (see essay_ocr.py), anything else takes the
+    plain pipeline.
+
+    Returns (text, boxes, low_confidence).
+    """
+    import ocr_pipeline  # imported per-call, like the rest of this module's uses
+    if qtype == "identification":
+        from id_ocr_client import run_identification_ocr
+        return run_identification_ocr(crop)
+    if qtype == "essay":
+        from essay_ocr import run_essay_ocr
+        return run_essay_ocr(crop)
+    text, boxes, _, low_conf = ocr_pipeline.run_ocr_pipeline(crop, include_boxed_image=False)
+    return text, boxes, low_conf
+
+
 def _auto_flag(
     ans: m.SubmissionAnswer,
     reason: str,
@@ -1392,13 +1468,62 @@ def _auto_flag(
         ))
 
 
+def _clear_auto_flag(ans: m.SubmissionAnswer, db: Session) -> None:
+    """
+    Remove a stale auto-flag after a re-grade no longer warrants it.
+    Manual flags and anything a teacher already reviewed are kept, so
+    RQ4 review decisions are never lost.
+    """
+    db.query(m.FlagLog).filter(
+        m.FlagLog.submission_answer_id == ans.id,
+        m.FlagLog.auto_flagged.is_(True),
+        m.FlagLog.review_decision.is_(None),
+    ).delete(synchronize_session=False)
+
+
+def _flag_identification(
+    ans: m.SubmissionAnswer,
+    correct_answer: str | None,
+    score: float,
+    db: Session,
+) -> None:
+    """
+    Set status and auto-flag for a freshly scored identification answer.
+
+    Wrong answers whose OCR text looks unreadable — or that the OCR step
+    already marked needs_review for low confidence — get their own flag
+    reason and stay in needs_review, so a teacher can tell an OCR misread
+    apart from a genuinely wrong answer. Must run before ans.status is
+    overwritten, since it reads the OCR step's status.
+    """
+    if score > 0.0:
+        ans.status = "graded"
+        _clear_auto_flag(ans, db)
+    elif ans.status == "needs_review" or looks_unreadable(correct_answer, ans.ocr_text):
+        ans.status = "needs_review"
+        _auto_flag(ans, "identification_ocr_unreadable", db)
+    else:
+        ans.status = "graded"
+        _auto_flag(ans, "identification_no_match", db)
+
+
+def _apply_band(ans: m.SubmissionAnswer, max_points: float) -> None:
+    """
+    Store the classification model's suggested band on a freshly graded essay.
+    Always overwrites, so a re-grade without per-criterion scores clears a
+    stale band instead of leaving the old one behind. Display only — never
+    raises an auto-flag.
+    """
+    result = classify_essay(ans.ai_score, max_points, ans.groq_confidence, ans.ai_criteria_scores_json)
+    ans.ai_band               = result.band if result else None
+    ans.ai_band_probs_json    = json.dumps(result.probabilities) if result else None
+    ans.ai_spread             = result.spread if result else None
+    ans.ai_band_model_version = BAND_MODEL_VERSION if result else None
+
+
 @router.post("/submissions/{submission_id}/grade", response_model=list[SubmissionAnswerRead])
 def grade_submission(
     submission_id: int,
-    fuzzy_full: float = Query(default=0.85, ge=0.0, le=1.0,
-        description="Minimum fuzzy ratio for full credit on identification questions"),
-    fuzzy_partial: float = Query(default=0.60, ge=0.0, le=1.0,
-        description="Minimum fuzzy ratio for 50% partial credit on identification questions"),
     db: Session = Depends(get_db),
 ) -> list[m.SubmissionAnswer]:
     """
@@ -1409,7 +1534,7 @@ def grade_submission(
     - For answers linked to a question, uses that question's rubric + max_points.
     - Stores ai_score, ai_feedback, and groq_confidence on each SubmissionAnswer.
     - Updates submission.status → 'graded'.
-    - fuzzy_full / fuzzy_partial control Identification scoring thresholds.
+    - Identification answers are exact-matched against the teacher's accepted answers.
     """
     from ai_grader import EssayGradeResult, grade_essay
     from omr_engine import MULTIPLE_MARKS_LABEL
@@ -1477,6 +1602,7 @@ def grade_submission(
                 ans.ai_feedback            = result.feedback
                 ans.groq_confidence        = result.confidence
                 ans.ai_criteria_scores_json = result.criteria_scores_json
+                _apply_band(ans, question.max_points if question else 10.0)
                 ans.status                 = "graded"
                 if result.score == 0.0:
                     _auto_flag(ans, "essay_score_zero", db)
@@ -1539,34 +1665,13 @@ def grade_submission(
             ans.ai_feedback = feedback
 
         elif qtype == "identification":
-            # --- Regex / fuzzy match scoring ---
-            correct = (question.correct_answer or "").strip()
-            given   = ans.ocr_text.strip()
-            max_pts = question.max_points if question else 1.0
-            # Exact match (case-insensitive)
-            if correct.lower() == given.lower():
-                score = max_pts
-                verdict = "Exact match."
-            else:
-                # Fuzzy ratio: proportion of matching characters
-                import difflib
-                ratio = difflib.SequenceMatcher(None, correct.lower(), given.lower()).ratio()
-                if ratio >= fuzzy_full:
-                    score = max_pts
-                    verdict = f"Accepted (fuzzy match {ratio:.0%})."
-                elif ratio >= fuzzy_partial:
-                    score = max_pts * 0.5
-                    verdict = f"Partial credit (fuzzy match {ratio:.0%})."
-                else:
-                    score = 0.0
-                    verdict = f"Incorrect (fuzzy match {ratio:.0%})."
-            ans.ai_score    = score
-            ans.ai_feedback = (
-                f"Expected: {correct}. Your answer: {given}. {verdict}"
+            # --- Exact match against the teacher's accepted answers ---
+            score, ans.ai_feedback = score_identification(
+                question.correct_answer, ans.ocr_text,
+                question.max_points, question.case_sensitive,
             )
-            ans.status = "graded"
-            if score == 0.0:
-                _auto_flag(ans, "identification_no_match", db)
+            ans.ai_score = score
+            _flag_identification(ans, question.correct_answer, score, db)
 
         ans.updated_at = now
 
@@ -1597,7 +1702,6 @@ def bulk_process_submissions(
     submission), and holding a single pooled connection that long starves
     every other concurrent request (results pages, single-submission
     processing) of connections from the same small pool.
-    Uses default fuzzy thresholds (full=0.85, partial=0.60) for Identification.
     """
     if exam_id in _BULK_PROCESSING_EXAMS:
         raise HTTPException(
@@ -1621,10 +1725,9 @@ def bulk_process_status(exam_id: int) -> BulkProcessStatus:
 
 
 def _run_bulk_process(exam_id: int, db: Session) -> BulkProcessResult:
-    import difflib
-
     import ocr_pipeline
-    from ai_grader import EssayGradeResult, correct_id_text, correct_ocr_text, grade_essay
+    from ai_grader import EssayGradeResult, correct_ocr_text, grade_essay
+    from text_normalize import strip_printed_prompt
     from database import SessionLocal
     from ocr_alignment import crop_content_area, crop_region, detect_and_warp
     from omr_engine import LOW_CONFIDENCE_THRESHOLD, MULTIPLE_MARKS_LABEL, detect_omr
@@ -1694,6 +1797,9 @@ def _run_bulk_process(exam_id: int, db: Session) -> BulkProcessResult:
             dest_dir = DATA_ROOT / str(sub.id)
             dest_dir.mkdir(parents=True, exist_ok=True)
             now = datetime.now(timezone.utc)
+            # Per-submission: a later page continues a question's answer
+            # rather than overwriting it (see _merge_page_text).
+            written_questions: set[int] = set()
 
             # ── OCR ──────────────────────────────────────────────────────────
             for sf in files:
@@ -1733,12 +1839,16 @@ def _run_bulk_process(exam_id: int, db: Session) -> BulkProcessResult:
                                     else "done"
                                 )
                             else:
-                                crop     = crop_region(warped, region, template_spec)
-                                ocr_text, boxes, _, ocr_low_conf = ocr_pipeline.run_ocr_pipeline(crop, include_boxed_image=False)
+                                crop     = crop_region(
+                                    warped, region, template_spec,
+                                    snap_to_box=(qtype == "identification"),
+                                    top_padding_mm=_TOP_PAD_MM.get(qtype, _DEFAULT_TOP_PAD_MM),
+                                )
+                                ocr_text, boxes, ocr_low_conf = _ocr_answer_crop(crop, qtype)
+                                # Identification and essays both keep the raw
+                                # transcription — see run_submission_ocr.
                                 if qtype == "essay":
-                                    ocr_text = correct_ocr_text(ocr_text)
-                                elif qtype == "identification":
-                                    ocr_text = correct_id_text(ocr_text)
+                                    ocr_text = strip_printed_prompt(ocr_text, q.prompt)
                                 boxes_data = json.dumps(
                                     [{"x1": b[0], "y1": b[1], "x2": b[2], "y2": b[3]}
                                      for b in boxes]
@@ -1757,7 +1867,9 @@ def _run_bulk_process(exam_id: int, db: Session) -> BulkProcessResult:
                                 .first()
                             )
                             if existing:
-                                existing.ocr_text       = ocr_text
+                                existing.ocr_text       = _merge_page_text(
+                                    existing.ocr_text, ocr_text, q.id in written_questions,
+                                )
                                 existing.boxes_json     = boxes_data
                                 existing.status         = ans_status
                                 existing.omr_confidence = omr_confidence
@@ -1779,6 +1891,7 @@ def _run_bulk_process(exam_id: int, db: Session) -> BulkProcessResult:
                                     sub_db.flush()
                                     _auto_flag(new_ans, "ocr_low_confidence", sub_db)
                             sub_db.commit()
+                        written_questions.add(q.id)
 
                 if not aligned:
                     fallback = crop_content_area(image, template_spec)
@@ -1848,6 +1961,7 @@ def _run_bulk_process(exam_id: int, db: Session) -> BulkProcessResult:
                     ans.ai_feedback             = result.feedback
                     ans.groq_confidence         = result.confidence
                     ans.ai_criteria_scores_json = result.criteria_scores_json
+                    _apply_band(ans, question.max_points if question else 10.0)
                     ans.status                  = "graded"
                     if result.score == 0.0:
                         _auto_flag(ans, "essay_score_zero", sub_db)
@@ -1893,28 +2007,12 @@ def _run_bulk_process(exam_id: int, db: Session) -> BulkProcessResult:
                         ans.status = "graded"
 
                 elif qtype == "identification":
-                    correct = (question.correct_answer or "").strip()
-                    given   = ans.ocr_text.strip()
-                    max_pts = question.max_points if question else 1.0
-                    if correct.lower() == given.lower():
-                        score   = max_pts
-                        verdict = "Exact match."
-                    else:
-                        ratio = difflib.SequenceMatcher(None, correct.lower(), given.lower()).ratio()
-                        if ratio >= 0.85:
-                            score   = max_pts
-                            verdict = f"Accepted (fuzzy {ratio:.0%})."
-                        elif ratio >= 0.60:
-                            score   = max_pts * 0.5
-                            verdict = f"Partial credit (fuzzy {ratio:.0%})."
-                        else:
-                            score   = 0.0
-                            verdict = f"Incorrect (fuzzy {ratio:.0%})."
-                    ans.ai_score    = score
-                    ans.ai_feedback = f"Expected: {correct}. Your answer: {given}. {verdict}"
-                    ans.status      = "graded"
-                    if score == 0.0:
-                        _auto_flag(ans, "identification_no_match", sub_db)
+                    score, ans.ai_feedback = score_identification(
+                        question.correct_answer, ans.ocr_text,
+                        question.max_points, question.case_sensitive,
+                    )
+                    ans.ai_score = score
+                    _flag_identification(ans, question.correct_answer, score, sub_db)
 
                 ans.updated_at = now
 
@@ -1977,8 +2075,13 @@ def teacher_override(
     # If the teacher provides a reference transcription, compute OCR quality metrics
     if body.reference_text is not None and ans.ocr_text:
         from ai_grader import compute_cer, compute_wer
-        ref = body.reference_text.strip()
-        hyp = ans.ocr_text.strip()
+        from text_normalize import normalize_for_metrics
+        # Both sides are flattened first: the reference is typed as prose
+        # while OCR output carries one line break per written line, so
+        # without this every line wrap and hyphen-split word counted as a
+        # transcription error and inflated both metrics.
+        ref = normalize_for_metrics(body.reference_text)
+        hyp = normalize_for_metrics(ans.ocr_text)
         ans.cer = round(compute_cer(ref, hyp), 4)
         ans.wer = round(compute_wer(ref, hyp), 4)
         logger.info(
@@ -2006,7 +2109,7 @@ def enqueue_exam_submissions(
     Add all 'submitted' submissions for an exam to the background OCR/grade queue.
     Submissions already in the queue or already processed are not re-added.
     """
-    from job_queue import QUEUE_STATE as _qs, enqueue_submission
+    from job_queue import _STATE as _qs, enqueue_submission
 
     exam = db.get(m.Exam, exam_id)
     if not exam:
@@ -2041,6 +2144,62 @@ def enqueue_exam_submissions(
         label   = f"{student.full_name} (#{sub.id})" if student else f"#{sub.id}"
         enqueue_submission(sub.id, sub.exam_id, label)
         enqueued += 1
+
+    return QueueEnqueueResult(
+        enqueued=enqueued,
+        already_pending=already,
+        queue_size=_qs.pending(),
+    )
+
+
+@router.post("/queue/reprocess", response_model=QueueEnqueueResult)
+def reprocess_selected_submissions(
+    body: ReprocessRequest,
+    db: Session = Depends(get_db),
+) -> QueueEnqueueResult:
+    """
+    Re-run OCR + grading for a chosen set of submissions, in the background.
+
+    Unlike /queue/enqueue/{exam_id}, this accepts already-graded submissions:
+    each one is put back to 'submitted' so the worker picks it up, which is
+    what re-processing after an OCR change requires. Returning immediately
+    also keeps the request short — the synchronous bulk endpoint can run for
+    minutes and gets cut off by a proxy (Cloudflare 524) long before it
+    finishes, even though the work continues server-side.
+    """
+    from job_queue import _STATE as _qs, enqueue_submission
+
+    if not body.submission_ids:
+        raise HTTPException(status_code=400, detail="No submissions selected.")
+
+    # IDs already waiting in the queue, so a double-click doesn't queue twice.
+    pending_ids: set[int] = set()
+    temp: list[dict] = []
+    while not _qs.queue.empty():
+        try:
+            j = _qs.queue.get_nowait()
+            temp.append(j)
+            pending_ids.add(j["submission_id"])
+        except Exception:
+            break
+    for j in temp:
+        _qs.queue.put_nowait(j)
+
+    enqueued = 0
+    already  = 0
+    for sub_id in body.submission_ids:
+        sub = db.get(m.Submission, sub_id)
+        if not sub or sub.status == "draft":
+            continue
+        if sub.id in pending_ids:
+            already += 1
+            continue
+        sub.status = "submitted"          # the worker only picks these up
+        student = db.get(m.Student, sub.student_id)
+        label   = f"{student.full_name} (#{sub.id})" if student else f"#{sub.id}"
+        enqueue_submission(sub.id, sub.exam_id, label)
+        enqueued += 1
+    db.commit()
 
     return QueueEnqueueResult(
         enqueued=enqueued,
@@ -2624,7 +2783,9 @@ def export_grades_csv(exam_id: int, db: Session = Depends(get_db)) -> Response:
 
     Columns: student_id, student_name, question_order, question_prompt,
              question_type, max_points, ai_score, teacher_score, final_score,
-             groq_confidence, omr_confidence, cer, wer, status
+             groq_confidence, omr_confidence, cer, wer, status,
+             ai_band, ai_band_probability, ai_spread (essays with a
+             structured rubric only; experimental classifier)
     """
     exam = db.get(m.Exam, exam_id)
     if not exam:
@@ -2649,6 +2810,7 @@ def export_grades_csv(exam_id: int, db: Session = Depends(get_db)) -> Response:
         "question_order", "question_prompt", "question_type",
         "max_points", "ai_score", "teacher_score", "final_score",
         "groq_confidence", "omr_confidence", "cer", "wer", "status",
+        "ai_band", "ai_band_probability", "ai_spread",
     ])
 
     for sub in submissions:
@@ -2664,8 +2826,11 @@ def export_grades_csv(exam_id: int, db: Session = Depends(get_db)) -> Response:
         for q in questions:
             ans = answers_by_q.get(q.id)
             final = None
+            band_prob = ""
             if ans:
                 final = ans.teacher_score if ans.teacher_score is not None else ans.ai_score
+                if ans.ai_band and ans.ai_band_probs_json:
+                    band_prob = round(json.loads(ans.ai_band_probs_json)[ans.ai_band], 4)
             writer.writerow([
                 sid, name,
                 q.order_index, q.prompt[:80], q.question_type,
@@ -2678,6 +2843,9 @@ def export_grades_csv(exam_id: int, db: Session = Depends(get_db)) -> Response:
                 ans.cer             if ans else "",
                 ans.wer             if ans else "",
                 ans.status          if ans else "not_submitted",
+                (ans.ai_band or "") if ans else "",
+                band_prob,
+                ans.ai_spread if ans and ans.ai_spread is not None else "",
             ])
 
     csv_bytes = buf.getvalue().encode("utf-8-sig")  # BOM for Excel compatibility
@@ -2790,7 +2958,10 @@ async def import_questions(
       choices         — mcq only; pipe-separated choice text, e.g. "Oxygen|Carbon Dioxide|Nitrogen|Hydrogen"
                          (position maps to bubble letter: 1st = A, 2nd = B, ...)
       correct_answer  — required for mcq (a letter matching a choices position, e.g. "B"),
-                         tf ("True" or "False"), and identification (the expected answer text)
+                         tf ("True" or "False"), and identification (the accepted answers,
+                         pipe-separated, e.g. "Rizal|Jose Rizal")
+      case_sensitive  — identification only, optional; "yes"/"true"/"1" makes exact-match
+                         scoring compare capitalization (default: not case-sensitive)
 
     Rows are assigned order_index starting after the current highest question index.
     Skips rows with an invalid question_type, missing rubric_text (essay), or missing
@@ -2823,6 +2994,7 @@ async def import_questions(
         rubric  = (row.get("rubric_text") or "").strip()
         correct = (row.get("correct_answer") or "").strip()
         choices_raw = (row.get("choices") or "").strip()
+        case_sensitive = (row.get("case_sensitive") or "").strip().lower() in ("yes", "true", "1", "y")
         try:
             max_pts = float((row.get("max_points") or "10").strip())
         except ValueError:
@@ -2839,7 +3011,7 @@ async def import_questions(
             errors.append(f"Row {i}: missing rubric_text for essay question — skipped")
             continue
 
-        if qtype in ("mcq", "tf", "identification") and not correct:
+        if _missing_correct_answer(qtype, correct):
             errors.append(f"Row {i}: missing correct_answer for {qtype} question — skipped")
             continue
 
@@ -2861,6 +3033,7 @@ async def import_questions(
             question_type=qtype,
             choices_json=choices_json,
             correct_answer=correct or None,
+            case_sensitive=case_sensitive and qtype == "identification",
         ))
         next_order += 1
         created += 1
@@ -3072,6 +3245,7 @@ def duplicate_exam(exam_id: int, db: Session = Depends(get_db)) -> m.Exam:
             max_points=q.max_points,
             choices_json=q.choices_json,
             correct_answer=q.correct_answer,
+            case_sensitive=q.case_sensitive,
             region_json=None,  # template not copied
         ))
 

@@ -106,6 +106,23 @@ def _groq_call_with_retry(messages: list[dict], max_tokens: int = 512, temperatu
                 temperature=temperature,
                 max_tokens=max_tokens,
             )
+            # gpt-oss-120b spends part of max_tokens on hidden reasoning, and
+            # a generation that hits the cap comes back truncated rather than
+            # failing — log what it actually used so the caps below can be set
+            # from measurements instead of estimates. finish_reason 'length'
+            # means the cap was hit.
+            usage = getattr(response, "usage", None)
+            if usage is not None:
+                details = getattr(usage, "completion_tokens_details", None)
+                logger.info(
+                    "[Groq] %s tokens: prompt %s, completion %s (reasoning %s) of %d budget — finish=%s",
+                    _GROQ_MODEL,
+                    getattr(usage, "prompt_tokens", "?"),
+                    getattr(usage, "completion_tokens", "?"),
+                    getattr(details, "reasoning_tokens", "?") if details else "?",
+                    max_tokens,
+                    response.choices[0].finish_reason,
+                )
             return response.choices[0].message.content.strip()
         except Exception as exc:
             last_exc = exc
@@ -130,9 +147,12 @@ def grade_answer(
     rubric: str,
     max_points: float,
     ocr_text: str,
+    clean_text: bool = False,
+    max_tokens: int = 512,
 ) -> GradeResult:
     """
     Send a student answer to Groq and return a score + constructive feedback.
+    This is the HOLISTIC path — one overall score, no per-criterion breakdown.
 
     Parameters
     ----------
@@ -140,6 +160,13 @@ def grade_answer(
     rubric          : The marking criteria (from ExamQuestion.rubric_text).
     max_points      : Maximum achievable score for this question.
     ocr_text        : OCR-extracted student answer.
+    clean_text      : True only for input with no OCR/transcription step —
+                       see grade_answer_structured()'s docstring. Defaults
+                       to False; every existing call site is unaffected.
+    max_tokens      : Output token cap. Defaults to 512 (unchanged live
+                       behavior) — pass higher for reasoning-model headroom
+                       when clean_text=True, same truncation risk that
+                       previously affected the structured path.
 
     Returns
     -------
@@ -151,18 +178,26 @@ def grade_answer(
         max_points=max_points,
         ocr_text=ocr_text.strip() or "(no answer written)",
     )
+    system_prompt = _SYSTEM_PROMPT + (
+        (_CLEAN_TEXT_CONFIDENCE_NOTE + _CALIBRATION_NOTE) if clean_text
+        else _TRANSCRIBED_TEXT_NOTE
+    )
 
     raw = _groq_call_with_retry(
         messages=[
-            {"role": "system", "content": _SYSTEM_PROMPT},
+            {"role": "system", "content": system_prompt},
             {"role": "user",   "content": user_msg},
         ],
-        max_tokens=512,
+        max_tokens=max_tokens,
         temperature=0.2,
     )
     logger.debug("Groq raw response: %s", raw)
 
     score, feedback, confidence = _parse_response(raw, max_points)
+    # Whole points for live grading; research runs (clean_text=True) keep the
+    # model's fractional score — see grade_answer_structured.
+    if not clean_text:
+        score = _whole_points(score, max_points)
     return GradeResult(score=score, feedback=feedback, confidence=confidence)
 
 
@@ -242,6 +277,63 @@ band of the level you judged the answer to match.
 
 Do NOT compute or report a total/overall score — only per-criterion scores.
 Always respond with valid JSON only — no extra text before or after."""
+
+# Appended to the system prompt only when clean_text=True (e.g. digitally-typed
+# text with no OCR/transcription step involved, such as DREsS_New essays) —
+# the base confidence instruction above asks the model to weigh BOTH text
+# clarity and rubric-judgment clarity; for clean text, the first factor is a
+# non-issue for every input, and leaving it in appears to compress confidence
+# into a narrow, high-clustered range that doesn't track actual accuracy.
+# Appended for LIVE grading (clean_text=False), where the answer text came
+# from handwriting OCR. Without it, rubric criteria about spelling and
+# mechanics end up scoring the transcription rather than the student: on five
+# real submissions, every error the grader quoted as justification was an OCR
+# artifact — "instruc. tions" (a line-break hyphen read as a period), "and
+# and" (a duplicated line boundary), "crowdedand" (a lost space at a join),
+# "evint"/"showrd"/"ceremong" (misreads) — and those essays scored 5-10 out
+# of 20 on Writing Mechanics because of it.
+_TRANSCRIBED_TEXT_NOTE = """
+
+IMPORTANT — the answer text is an automatic transcription of the student's
+handwriting, not what the student typed. Transcription introduces errors the
+student did not make:
+- misread words that look like odd spellings ("evint" for "event")
+- lost or extra spaces, so words run together or split apart
+- words broken across a line ending, sometimes with a stray "." or "-"
+- an occasional repeated or partial fragment of a line
+
+When a criterion concerns spelling, grammar, punctuation, mechanics or
+neatness, judge only what survives transcription: sentence and paragraph
+structure, how ideas are ordered and connected, sentence completeness,
+and consistent patterns of error. Do NOT lower a score for isolated odd
+spellings, joined or split words, stray characters, or duplicated
+fragments, and do not quote such items as evidence in your justification —
+they are far more likely to be transcription artifacts than student errors.
+Neatness of handwriting cannot be judged from text at all: score that on
+the organisation of the writing instead."""
+
+_CLEAN_TEXT_CONFIDENCE_NOTE = """
+
+Note: the text below is clean, digitally-typed text, not a scanned or
+handwritten submission — there is no transcription/OCR risk here. Do NOT
+factor text legibility into your confidence score at all. Base confidence
+purely on how clear-cut the rubric-level judgment is for this criterion, and
+use the FULL 0.0-1.0 range, including values below 0.5, for genuinely
+ambiguous or borderline cases."""
+
+# Also appended only when clean_text=True — addresses a separate, observed
+# problem: scores against this rubric never reached the top level's numeric
+# band across a 500-essay real test, even for essays independently rated
+# Excellent by human experts. This is a known LLM-grading failure mode
+# (hedging toward the middle of a scale rather than committing to extremes).
+_CALIBRATION_NOTE = """
+
+Important: do not default to the middle of the scale out of excess caution.
+Grading models often under-use the top and bottom levels even when clearly
+warranted. If the answer genuinely demonstrates the qualities described in
+the top level for a criterion, confidently assign a score in that band —
+do not hold back just because it is the highest level. Likewise, do not
+hesitate to assign the lowest level when an answer clearly warrants it."""
 
 _STRUCTURED_USER_TEMPLATE = """\
 ## Question
@@ -404,6 +496,8 @@ def grade_answer_structured(
     criteria: list[dict],
     max_points: float,
     ocr_text: str,
+    clean_text: bool = False,
+    few_shot_examples: str | None = None,
 ) -> StructuredGradeResult:
     """
     Grade an essay answer criterion-by-criterion in a single Groq call.
@@ -411,6 +505,11 @@ def grade_answer_structured(
     The model scores each criterion independently and is explicitly told not
     to compute a total; the total returned here is always summed in Python
     from the per-criterion scores, never trusted from the model's output.
+
+    clean_text: pass True only for input known to have no OCR/transcription
+    step (e.g. DREsS_New essays) — appends a clarifying confidence note.
+    Defaults to False, so every existing call site (real OCR'd submissions)
+    is completely unaffected.
     """
     criteria_block = _render_criteria_for_prompt(criteria)
     user_msg = _STRUCTURED_USER_TEMPLATE.format(
@@ -418,10 +517,16 @@ def grade_answer_structured(
         criteria_block=criteria_block,
         ocr_text=ocr_text.strip() or "(no answer written)",
     )
+    system_prompt = _STRUCTURED_SYSTEM_PROMPT + (
+        (_CLEAN_TEXT_CONFIDENCE_NOTE + _CALIBRATION_NOTE) if clean_text
+        else _TRANSCRIBED_TEXT_NOTE
+    )
+    if few_shot_examples:
+        system_prompt += "\n\n" + few_shot_examples
 
     raw = _groq_call_with_retry(
         messages=[
-            {"role": "system", "content": _STRUCTURED_SYSTEM_PROMPT},
+            {"role": "system", "content": system_prompt},
             {"role": "user",   "content": user_msg},
         ],
         # gpt-oss-120b is a reasoning model: part of this budget is spent on
@@ -434,10 +539,15 @@ def grade_answer_structured(
     logger.debug("Groq raw structured response: %s", raw)
 
     items = _parse_structured_response(raw, criteria)
+    # Live grading reports whole points per criterion (so the total is whole
+    # too). Research runs over clean, already-digital text (clean_text=True —
+    # the DREsS classifier work) keep the model's fractional scores, since the
+    # trained band model and its published numbers were built on those.
     criteria_scores = [
         CriterionScore(
             criterion=i["criterion"], max_points=i["max_points"],
-            score=i["score"], justification=i["justification"], level=i.get("level", ""),
+            score=i["score"] if clean_text else _whole_points(i["score"], i["max_points"]),
+            justification=i["justification"], level=i.get("level", ""),
         )
         for i in items
     ]
@@ -464,6 +574,8 @@ def grade_essay(
     rubric_criteria_json: str | None,
     max_points: float,
     ocr_text: str,
+    clean_text: bool = False,
+    few_shot_examples: str | None = None,
 ) -> EssayGradeResult:
     """
     Single entry point essay-grading call sites should use in place of
@@ -472,6 +584,13 @@ def grade_essay(
     holistic rubric_text prompt, and finally to a generic instruction if
     neither is present — the same three-level fallback the call sites
     already relied on implicitly before this feature existed.
+
+    clean_text: passed through to grade_answer_structured() — True only for
+    input with no OCR/transcription step (see its docstring). Defaults to
+    False; every existing call site is unaffected.
+    few_shot_examples: optional worked-example text appended to the system
+    prompt (structured path only) — None by default, so every existing
+    call site is unaffected.
     """
     criteria: list[dict] | None = None
     if rubric_criteria_json:
@@ -484,7 +603,8 @@ def grade_essay(
 
     if criteria:
         try:
-            r = grade_answer_structured(question_prompt, criteria, max_points, ocr_text)
+            r = grade_answer_structured(question_prompt, criteria, max_points, ocr_text,
+                                         clean_text=clean_text, few_shot_examples=few_shot_examples)
             return EssayGradeResult(
                 score=r.score,
                 feedback=r.feedback,
@@ -497,6 +617,7 @@ def grade_essay(
 
     r = grade_answer(
         question_prompt, rubric_text or "Grade for content and clarity.", max_points, ocr_text,
+        clean_text=clean_text, max_tokens=2048 if clean_text else 512,
     )
     return EssayGradeResult(score=r.score, feedback=r.feedback, confidence=r.confidence, criteria_scores_json=None)
 
@@ -510,6 +631,32 @@ def grade_essay(
 # run-on lines. Here is the reformatted text:" or "Treaty of Maastricht does
 # not match, however a possible correction is: ...". If any of these leak
 # through, the "corrected" text is unusable and unsafe to grade against.
+# How much shorter than the raw transcription a "correction" may be before
+# it's treated as content loss rather than cleanup. Real cleanups change a
+# few characters; a truncated generation drops whole sentences.
+def _whole_points(value: float, max_points: float) -> float:
+    """
+    Round a score to whole points, half up, clamped to [0, max_points].
+
+    The model is free to answer 2.8/5; teachers read and override scores in
+    whole points, so the stored score is rounded rather than shown as a
+    decimal. A fractional max (e.g. 2.5) rounds DOWN to the nearest whole
+    point it allows, so a criterion can never exceed its own maximum.
+    """
+    import math
+    cap = math.floor(float(max_points))
+    return float(max(0, min(cap, math.floor(float(value) + 0.5))))
+
+
+_MIN_CORRECTION_LENGTH_RATIO = 0.95
+
+# Ceiling on the OCR-correction budget. A cap is never "spent" unless the
+# model generates that far, so this is headroom for unusually long reasoning
+# rather than a cost — it's bounded only to stop a looping generation from
+# running for minutes and eating the free tier's per-minute allowance. The
+# per-call budget still scales with the text's length; see correct_ocr_text.
+_MAX_CORRECTION_TOKENS = 16384
+
 _RUNAWAY_MARKERS = (
     "here is the reformatted",
     "the above response",
@@ -637,7 +784,10 @@ def correct_id_text(raw_text: str) -> str:
                 {"role": "user",   "content": f"Correct this short answer OCR text:\n\n{raw_text}"},
             ],
             temperature=0.1,
-            max_tokens=100,
+            # gpt-oss-120b is a reasoning model: hidden reasoning tokens count
+            # against this cap, and garbled inputs make it reason much longer
+            # than clean ones — 100 and 512 both still returned empty text.
+            max_tokens=2048,
         )
         if not corrected.strip():
             logger.warning(
@@ -678,7 +828,12 @@ def correct_ocr_text(raw_text: str) -> str:
                 {"role": "user",   "content": f"Correct this OCR text:\n\n{raw_text}"},
             ],
             temperature=0.1,
-            max_tokens=min(2048, len(raw_text) * 2 + 200),
+            # gpt-oss-120b reasons before answering and that reasoning counts
+            # against this cap, so the budget has to cover BOTH. The old
+            # min(2048, ...) cut a 1279-char essay off mid-sentence and the
+            # truncated text was stored as the student's answer. Roughly one
+            # token per 3 characters of echo-back, plus room to think.
+            max_tokens=min(_MAX_CORRECTION_TOKENS, len(raw_text) // 3 + 3000),
         )
         if not corrected.strip():
             logger.warning(
@@ -690,6 +845,16 @@ def correct_ocr_text(raw_text: str) -> str:
             logger.warning(
                 "OCR correction looked like a runaway/self-narrating response "
                 "(using raw text instead): %r", corrected[:200],
+            )
+            return raw_text
+        # A character-level cleanup returns what it was given, so a much
+        # shorter reply means content was lost — a truncated generation, or
+        # the model summarising instead of correcting. Either way the raw
+        # transcription is the safer thing to grade and to report CER on.
+        if len(corrected) < len(raw_text) * _MIN_CORRECTION_LENGTH_RATIO:
+            logger.warning(
+                "OCR correction lost content (%d → %d chars) — using raw text instead.",
+                len(raw_text), len(corrected),
             )
             return raw_text
         logger.info("OCR correction: %d → %d chars", len(raw_text), len(corrected))

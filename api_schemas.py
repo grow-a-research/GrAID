@@ -105,7 +105,8 @@ class ExamQuestionCreate(BaseModel):
     rubric_criteria_json: str | None = None
     max_points: float = Field(default=10.0, ge=0)
     choices_json: str | None = None                 # MCQ only — JSON list of strings
-    correct_answer: str | None = None               # MCQ letter, "True"/"False", or id string
+    correct_answer: str | None = None               # MCQ letter, "True"/"False", or "|"-separated accepted answers
+    case_sensitive: bool = False                    # identification only
 
 
 class ExamQuestionUpdate(BaseModel):
@@ -116,6 +117,7 @@ class ExamQuestionUpdate(BaseModel):
     max_points: float | None = Field(None, ge=0)
     choices_json: str | None = None
     correct_answer: str | None = None
+    case_sensitive: bool | None = None
     order_index: int | None = Field(None, ge=1)
 
 
@@ -132,6 +134,7 @@ class ExamQuestionRead(BaseModel):
     max_points: float
     choices_json: str | None
     correct_answer: str | None
+    case_sensitive: bool
     region_json: str | None
 
 
@@ -197,6 +200,11 @@ class SubmissionAnswerRead(BaseModel):
     omr_confidence: float | None
     # Phase 16 — Groq grading confidence (essay only, None for other types)
     groq_confidence: float | None
+    # Suggested band from the ordinal classification model (essay with a
+    # structured rubric only; experimental — see band_classifier.py)
+    ai_band: str | None = None
+    ai_band_probs_json: str | None = None
+    ai_spread: float | None = None
     # Phase 21 — Laplacian variance of the answer crop (OCR scan clarity proxy)
     ocr_clarity: float | None
     # Computed: teacher_score takes priority over ai_score
@@ -388,6 +396,11 @@ class QueueEnqueueResult(BaseModel):
     enqueued: int
     already_pending: int = 0
     queue_size: int
+
+
+class ReprocessRequest(BaseModel):
+    """Submissions the teacher picked for a re-run of OCR + grading."""
+    submission_ids: list[int]
 
 
 # --- Phase 10: Batch scan upload ---

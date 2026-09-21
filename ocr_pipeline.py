@@ -99,9 +99,24 @@ def load_models(force_local: bool = False) -> None:
     except Exception:
         print("[Models] Surya CUDA move failed — running on CPU.")
 
-    bnb_config = BitsAndBytesConfig(
-        load_in_8bit=True,
-    )
+    # Quantization is env-selectable so a bigger-VRAM host can trade memory
+    # for fidelity without a code change. Default "8bit" is exactly what this
+    # pipeline has always loaded (~8-10GB for the 7B model, fits a 16GB card);
+    # "none" keeps full precision (~17GB, needs 24GB+) and "4bit" shrinks
+    # further for larger models. Unset behaves identically to before.
+    quant = os.getenv("QWEN_QUANT", "8bit").strip().lower()
+    if quant in ("none", "off", "bf16", "fp16", "full"):
+        bnb_config = None
+    elif quant == "4bit":
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.float16,
+        )
+    else:
+        if quant != "8bit":
+            print(f"[Models] Unknown QWEN_QUANT={quant!r} — falling back to 8bit")
+        bnb_config = BitsAndBytesConfig(load_in_8bit=True)
 
     print(f"[Models] Loading Qwen processor ({QWEN_MODEL_ID})...")
     # Pinned to the "slow" (pure-PIL) image processor on purpose: transformers
@@ -113,7 +128,7 @@ def load_models(force_local: bool = False) -> None:
         QWEN_MODEL_ID, trust_remote_code=True, use_fast=False,
     )
 
-    print("[Models] Loading Qwen model in 8-bit (this may take several minutes)...")
+    print(f"[Models] Loading Qwen model ({quant}) — this may take several minutes...")
     # Pinned to a single GPU on purpose: this 7B model only needs ~8-10GB in
     # 8-bit, which fits on one card with room to spare. device_map="auto"
     # would split it across all visible GPUs, adding PCIe cross-GPU transfer
@@ -312,6 +327,18 @@ _OCR_BATCH_SIZE = int(os.getenv("QWEN_OCR_BATCH_SIZE", "8"))
 _LINE_TOKENS = 128
 _MAX_LINE_TOKENS = 640
 
+# Blocks the model from emitting the same token n-gram twice within one
+# line's generation. Greedy decoding (do_sample=False, required for
+# deterministic/reproducible OCR) has no built-in defense against looping on
+# a repeated phrase when a crop is ambiguous or hard to read — confirmed on a
+# real submission where a single normal-height line crop generated the same
+# ~12-word clause on repeat until it hit its token budget. 8 tokens is
+# roughly 5-8 words for this tokenizer: short enough to interrupt a
+# multi-word phrase loop quickly, long enough that a student's own short
+# legitimate repetition (e.g. "very very tired") won't trigger it, since
+# that's a 1-token n-gram repeat, not an 8-token one.
+_NO_REPEAT_NGRAM_SIZE = int(os.getenv("QWEN_NO_REPEAT_NGRAM_SIZE", "8"))
+
 
 def qwen_ocr_lines(
     line_images: list[Image.Image],
@@ -402,6 +429,7 @@ def qwen_ocr_lines(
                 **inputs,
                 max_new_tokens=batch_max_tokens,
                 do_sample=False,
+                no_repeat_ngram_size=_NO_REPEAT_NGRAM_SIZE,
                 output_scores=True,
                 return_dict_in_generate=True,
             )
@@ -424,6 +452,79 @@ def qwen_ocr_lines(
             texts.append((text.strip(), confidence))
 
     return texts
+
+
+# ---------------------------------------------------------------------------
+# Duplicate-line collapsing
+# ---------------------------------------------------------------------------
+
+# How much word overlap two consecutive transcribed lines need before
+# they're treated as duplicate/overlapping reads of the same physical line
+# rather than two genuinely different lines that happen to share some
+# vocabulary. merge_overlapping_boxes() only merges *boxes* whose vertical
+# extent overlaps >70% -- deliberately conservative, since box geometry
+# alone can't reliably tell "two detections of the same line" apart from
+# "two genuinely adjacent lines with natural overlap from ascenders/
+# descenders bleeding into the neighboring box". Confirmed on real
+# submission data (181 answers, 91 consecutive line-pairs sampled): true
+# duplicate pairs scored 0.5+ word-overlap about 74% of the time, while
+# genuinely distinct adjacent lines only false-positive at 0.5 about 5% of
+# the time. A lower threshold catches more true duplicates but starts
+# discarding real, distinct student content -- not an acceptable tradeoff.
+_LINE_DEDUP_WORD_OVERLAP = float(os.getenv("OCR_LINE_DEDUP_OVERLAP", "0.5"))
+
+
+def _line_word_overlap(a: str, b: str) -> float:
+    """Word-set Jaccard similarity between two transcribed lines."""
+    wa = set(a.lower().split())
+    wb = set(b.lower().split())
+    if not wa or not wb:
+        return 0.0
+    return len(wa & wb) / len(wa | wb)
+
+
+def _dedupe_overlapping_lines(
+    line_results: list[tuple[str, float]],
+) -> list[tuple[str, float]]:
+    """
+    Collapse consecutive Qwen line-transcriptions that are duplicate/
+    overlapping reads of the same physical line of handwriting.
+
+    When two Surya boxes both end up covering (most of) the same physical
+    line -- close but under merge_overlapping_boxes()'s 70% threshold --
+    Qwen transcribes each one independently, producing two different
+    partial/overlapping reads of the same handwriting rather than one clean
+    read. This collapses those pairs back down to one line, using the
+    transcribed *text* as the duplicate signal instead of box geometry
+    (confirmed more reliable — see _LINE_DEDUP_WORD_OVERLAP).
+
+    Not a perfect reconstruction: when two reads of the same line disagree
+    (one garbled, one more complete), this keeps whichever one Qwen was more
+    confident in and discards the other outright, rather than trying to
+    splice them word-by-word -- safer than risking a garbled interleaving,
+    but it does mean the lower-confidence read's content is lost even on the
+    rare case it was the more accurate one.
+
+    Clusters transitively by *original* adjacency (line i vs. line i+1, not
+    each new line vs. whatever ended up surviving so far): a run of several
+    boxes all catching slices of the same physical line typically overlaps
+    in a staircase -- line i overlaps i+1, i+1 overlaps i+2, etc. -- without
+    every pair in the run directly overlapping each other. Comparing each
+    line only to the last *kept* line breaks that chain as soon as one pair
+    gets collapsed, since the next comparison then skips over the dropped
+    line entirely and lands on a non-adjacent pair with much lower overlap.
+    """
+    if not line_results:
+        return []
+    clusters: list[list[tuple[str, float]]] = [[line_results[0]]]
+    for i in range(1, len(line_results)):
+        prev_text = line_results[i - 1][0]
+        curr_text, curr_conf = line_results[i]
+        if _line_word_overlap(prev_text, curr_text) >= _LINE_DEDUP_WORD_OVERLAP:
+            clusters[-1].append((curr_text, curr_conf))
+        else:
+            clusters.append([(curr_text, curr_conf)])
+    return [max(cluster, key=lambda tc: tc[1]) for cluster in clusters]
 
 
 # ---------------------------------------------------------------------------
@@ -506,18 +607,28 @@ def run_ocr_pipeline(
         f"[Timing] Qwen transcription of {len(line_crops)} line(s) took "
         f"{time.perf_counter() - t_qwen:.2f}s"
     )
+    line_results = [(t, c) for t, c in line_results if t and t.strip()]
+    n_before_dedup = len(line_results)
+    line_results = _dedupe_overlapping_lines(line_results)
+    if len(line_results) < n_before_dedup:
+        print(
+            f"[LineDedup] collapsed {n_before_dedup} line(s) to {len(line_results)} "
+            f"(overlap >= {_LINE_DEDUP_WORD_OVERLAP})"
+        )
     # A crop with real ink but no actual legible content (e.g. an erased/
     # scratched-out note that still leaves a visible smudge) still passes
     # _has_ink() — it has ink — but the transcription prompt forces Qwen to
     # guess at it anyway rather than return nothing. That guess should come
     # out with a low confidence score even when the rest of the page reads
-    # confidently. Text is never dropped/altered here, though — a single
-    # low-probability token can drag a whole line's score down even when
-    # only one word in that line is actually bad (confidence is a per-LINE
-    # minimum, not per-word), so auto-deleting on this signal risks losing
-    # real student content along with genuine hallucinations. Instead this
-    # only flags the answer for human review upstream (see callers) —
-    # full_text always contains everything Qwen produced, unmodified.
+    # confidently. Content is never dropped/altered on *this* signal — a
+    # single low-probability token can drag a whole line's score down even
+    # when only one word in that line is actually bad (confidence is a
+    # per-LINE minimum, not per-word), so auto-deleting on low confidence
+    # alone risks losing real student content along with genuine
+    # hallucinations. Instead this only flags the answer for human review
+    # upstream (see callers). The only content actually dropped from
+    # full_text is duplicate/overlapping line reads via
+    # _dedupe_overlapping_lines() above.
     #
     # 0.15 is based on one observed real example (submission #11): a
     # hallucinated line scored 0.095 while every genuine line on the same
@@ -529,8 +640,6 @@ def run_ocr_pipeline(
     clean_lines: list[str] = []
     low_confidence = False
     for text, conf in line_results:
-        if not text or not text.strip():
-            continue
         # Log every line's own confidence (not just the aggregate) so a
         # specific bad line — like a hallucinated word — can be identified
         # directly from the log instead of guessed at from min/mean.

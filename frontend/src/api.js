@@ -135,6 +135,9 @@ export const api = {
   queue: {
     enqueue: (examId) => req('POST', `${V1}/queue/enqueue/${examId}`),
     status:  ()       => req('GET',  `${V1}/queue/status`),
+    // Re-run OCR + grading for chosen submissions, including already-graded
+    // ones; returns immediately and the work happens in the background queue.
+    reprocess: (ids)  => req('POST', `${V1}/queue/reprocess`, { submission_ids: ids }),
   },
 
   // ── Legacy OCR (Phase 2) ───────────────────────────────────────────────────

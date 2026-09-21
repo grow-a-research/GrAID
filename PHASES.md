@@ -184,6 +184,7 @@ Fixes for known issues discovered during testing.
 - Add `correct_answer` column for MCQ / T-F / Identification correct answer storage
 - MCQ / T-F question creation UI in Exams tab (radio for type, choices input for MCQ)
 - Auto-scoring for Identification via regex + fuzzy matching (no Groq needed)
+  *(superseded by exact match — see Phase 22)*
 - Auto-scoring for MCQ / T-F via exact match (no Groq needed)
 - Groq grading skipped for MCQ / T-F / Identification (use deterministic scoring)
 - PDF layout: MCQ renders lettered bubbles; T-F renders True/False bubbles; essay renders ruled box
@@ -241,6 +242,7 @@ Fixes for known issues discovered during testing.
   below override note after saving
 - Configurable fuzzy match thresholds for Identification via query params `fuzzy_full` (default
   0.85) and `fuzzy_partial` (default 0.60) on `POST /submissions/{id}/grade`
+  *(removed — see Phase 22)*
 - Groq retry with exponential backoff (`_MAX_RETRIES=3`, base delay 2 s, doubles each attempt)
   applied to all Groq calls (grade, correct_ocr_text, analyze_exam, analyze_student)
 - `GET /exams/{id}/grades/csv` — BOM-encoded CSV grade sheet (per-student × per-question)
@@ -340,3 +342,18 @@ Fixes for known issues discovered during testing.
   automatically calls enqueue + starts 2-second polling
 - Submissions tab: "Processing queue" panel with live progress bar, animated
   "Processing: …" indicator, and "Enqueue all" button
+
+---
+
+## Phase 22 — Identification Exact-Match Scoring ✅
+- Replaced fuzzy matching (0.85 full / 0.60 half credit) with exact match against
+  teacher-defined accepted answers — no partial credit, no similarity thresholds
+- Accepted answers stored `|`-separated in the existing `correct_answer` column
+  (e.g. `Rizal | Jose Rizal | Dr. Jose Rizal`); a student answer earns full points if it
+  matches any one of them, otherwise 0 and is flagged `identification_no_match`
+- Per-question `case_sensitive` flag (migration `0011`, default off); leading/trailing
+  whitespace trimmed and internal whitespace collapsed before comparing, nothing else normalized
+- Shared scoring in `identification_scoring.py`, used by single grading, bulk processing, and
+  the background queue; `fuzzy_full` / `fuzzy_partial` query params removed
+- Exams tab: accepted-answers field + case-sensitive checkbox; question CSV gains optional
+  `case_sensitive` column

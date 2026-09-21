@@ -1,0 +1,30 @@
+# Dependencies for the Vast.ai GPU host only (vast_ocr_server.py + ocr_pipeline.py + id_ocr.py).
+#
+# Deliberately NOT the full requirements.txt:
+#   - torch / torchvision are EXCLUDED on purpose. The Vast template ships a build
+#     matched to its CUDA version; reinstalling can replace it with one that can't
+#     drive the GPU (symptom: torch.cuda.is_available() becomes False).
+#   - sqlalchemy / alembic / groq / fpdf2 / qrcode / pandas / scikit-learn /
+#     statsmodels are excluded — grading, scoring and the classifier run in the
+#     local backend, never on the OCR server.
+#
+# Usage on a brand-new instance (see VAST_AI_DEMO_CHECKLIST.md Part 4):
+#   pip install -r requirements-vast.txt
+# Then re-check the GPU:
+#   python3 -c "import torch; print(torch.cuda.is_available())"
+
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+python-multipart>=0.0.9
+requests>=2.31.0
+
+pillow>=10.2.0,<11.0.0
+opencv-python-headless>=4.10.0.0
+numpy>=1.26.4
+
+transformers>=4.47.0
+accelerate>=1.0.0
+bitsandbytes>=0.44.1
+qwen-vl-utils>=0.0.8
+
+surya-ocr==0.13.1

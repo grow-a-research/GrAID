@@ -74,6 +74,11 @@ export default function SubmissionsPage() {
   const [bulkProcessing, setBulkProcessing] = useState(false)
   const [bulkResult, setBulkResult] = useState(null)
 
+  // reprocess (re-run OCR + grading on chosen submissions, e.g. after an OCR fix)
+  const [selectedForReprocess, setSelectedForReprocess] = useState([])
+  const [reprocessing, setReprocessing] = useState(false)
+  const [reprocessMsg, setReprocessMsg] = useState('')
+
   // background queue
   const [queueStatus, setQueueStatus] = useState(null)
   const queuePollRef = useRef(null)
@@ -99,6 +104,10 @@ export default function SubmissionsPage() {
   // Loads the submission list whenever the shared selected exam changes — covers both
   // an explicit pick here and arriving with an exam already selected from Exams/Results.
   useEffect(() => {
+    // A reprocess selection belongs to one exam's list — drop it when the
+    // list changes, so nothing is queued from a previously viewed exam.
+    setSelectedForReprocess([])
+    setReprocessMsg('')
     if (!selectedExam) { setSubmissions([]); return }
     api.exams.submissions(selectedExam.id).then(setSubmissions).catch(() => setSubmissions([]))
   }, [selectedExam?.id])
@@ -185,6 +194,29 @@ export default function SubmissionsPage() {
       setSubmissions(await api.exams.submissions(selectedExam.id))
     } catch (err) { setBulkResult({ error: err.message }) }
     setBulkProcessing(false)
+  }
+
+  function toggleReprocess(id) {
+    setSelectedForReprocess(prev =>
+      prev.includes(id) ? prev.filter(x => x !== id) : [...prev, id]
+    )
+  }
+
+  async function reprocessSelected() {
+    if (selectedForReprocess.length === 0) return
+    setReprocessing(true); setReprocessMsg('')
+    try {
+      const result = await api.queue.reprocess(selectedForReprocess)
+      setReprocessMsg(
+        `Queued ${result.enqueued} submission${result.enqueued !== 1 ? 's' : ''}` +
+        (result.already_pending ? ` (${result.already_pending} already waiting)` : '') +
+        ' — processing in the background.'
+      )
+      setSelectedForReprocess([])
+      startQueuePolling()
+      if (selectedExam) setSubmissions(await api.exams.submissions(selectedExam.id))
+    } catch (err) { setReprocessMsg(`Error: ${err.message}`) }
+    setReprocessing(false)
   }
 
   const startQueuePolling = useCallback(() => {
@@ -433,11 +465,29 @@ export default function SubmissionsPage() {
         {/* Submission list */}
         {selectedExam && (
           <div className="flex flex-col gap-2">
-            <div className={tw.label}>{selectedExam.exam_code} — {submissions.length} submission(s)</div>
+            <div className="flex items-center justify-between gap-2">
+              <div className={tw.label}>{selectedExam.exam_code} — {submissions.length} submission(s)</div>
+              {submissions.length > 0 && (
+                <button type="button"
+                  className="text-xs text-zinc-500 hover:text-zinc-300 transition"
+                  onClick={() => setSelectedForReprocess(
+                    selectedForReprocess.length === submissions.length ? [] : submissions.map(s => s.id)
+                  )}>
+                  {selectedForReprocess.length === submissions.length ? 'Clear selection' : 'Select all'}
+                </button>
+              )}
+            </div>
             {submissions.length === 0
               ? <Empty text="No submissions yet." />
               : submissions.map(s => (
                 <div key={s.id} className={`${selectedSub?.id === s.id ? tw.rowActive : tw.row} flex items-center gap-2`}>
+                  <input
+                    type="checkbox"
+                    title="Select for reprocessing"
+                    className="shrink-0 accent-zinc-400"
+                    checked={selectedForReprocess.includes(s.id)}
+                    onChange={() => toggleReprocess(s.id)}
+                  />
                   <button type="button" className="flex-1 text-left flex items-center justify-between gap-2"
                     onClick={() => pickSub(s)}>
                     <div>
@@ -453,6 +503,28 @@ export default function SubmissionsPage() {
                 </div>
               ))
             }
+          </div>
+        )}
+
+        {/* Reprocess chosen submissions (re-runs OCR + grading, even if already graded) */}
+        {selectedExam && selectedForReprocess.length > 0 && (
+          <div className={`${tw.card} flex flex-col gap-2`}>
+            <div className={tw.label}>Reprocess selected</div>
+            <p className={tw.muted}>
+              {selectedForReprocess.length} submission{selectedForReprocess.length !== 1 ? 's' : ''} selected —
+              OCR and grading run again in the background, replacing their current results.
+            </p>
+            <button
+              className={tw.btnPrimary}
+              onClick={reprocessSelected}
+              disabled={reprocessing}>
+              {reprocessing ? 'Queueing…' : `Reprocess ${selectedForReprocess.length} selected`}
+            </button>
+          </div>
+        )}
+        {reprocessMsg && (
+          <div className={`text-xs ${reprocessMsg.startsWith('Error') ? 'text-red-400' : 'text-emerald-400'}`}>
+            {reprocessMsg}
           </div>
         )}
 

@@ -37,9 +37,28 @@ function ScanImage({ src, alt, notFoundText }) {
 function ProcessedPaperPanel({ submissionId, answers, hasPaper }) {
   const [activeTab, setActiveTab] = useState('aligned')
   const [page, setPage] = useState(1)
+  const [filePages, setFilePages] = useState([])
 
-  const pages = [...new Set(answers.map(a => a.page_number).filter(Boolean))].sort()
-  if (pages.length === 0) pages.push(1)
+  // Page buttons come from the pages actually UPLOADED, not from the answers:
+  // a two-page essay is stored as one answer (page_number 1), so deriving the
+  // list from answers hid page 2 even though its aligned scan exists.
+  useEffect(() => {
+    let cancelled = false
+    setFilePages([])
+    setPage(1)
+    api.submissions.get(submissionId)
+      .then(sub => {
+        if (cancelled) return
+        const nums = [...new Set((sub.files || []).map(f => f.page_number).filter(Boolean))]
+        setFilePages(nums.sort((a, b) => a - b))
+      })
+      .catch(() => { /* fall back to answer page numbers below */ })
+    return () => { cancelled = true }
+  }, [submissionId])
+
+  const answerPages = [...new Set(answers.map(a => a.page_number).filter(Boolean))]
+    .sort((a, b) => a - b)
+  const pages = filePages.length ? filePages : (answerPages.length ? answerPages : [1])
   const multiPage = pages.length > 1
 
   return (
@@ -197,6 +216,7 @@ function FlagBadge({ flag, answerId, submissionId, onFlagChange }) {
     omr_low_confidence:     'Low OMR confidence',
     omr_no_detection:       'No bubble detected',
     identification_no_match:'No match',
+    identification_ocr_unreadable:'Unreadable OCR',
     manual:                 'Manual flag',
     verified:               'Verified',
   }[flag.flag_reason] ?? flag.flag_reason
@@ -244,10 +264,12 @@ function FlagBadge({ flag, answerId, submissionId, onFlagChange }) {
 }
 
 // Backend sends identification results as one sentence, e.g.
-// "Expected: Lapulapu. Your answer: Lapu Lapu. Accepted (fuzzy match 94%)."
+// "Expected: Rizal | Jose Rizal. Your answer: Jose Rizal. Exact match."
 // Parse it back into parts so the UI can show a scannable layout instead of
 // a wall of text. Returns null (caller falls back to the raw sentence) if
-// the format doesn't match what the backend currently produces.
+// the format doesn't match what the backend currently produces. The
+// 'accepted' / 'partial' kinds only occur on answers graded before scoring
+// switched from fuzzy to exact match.
 function parseIdentificationResult(feedback) {
   if (!feedback) return null
   const m = feedback.match(/^Expected:\s*(.*?)\.\s*Your answer:\s*(.*?)\.\s*(.*)$/s)
@@ -283,6 +305,47 @@ function parseCriteriaFeedback(feedback) {
     })
   }
   return rows.length > 0 ? rows : null
+}
+
+const BAND_ORDER = ['Poor', 'Fair', 'Good', 'Excellent']
+const BAND_STYLE = {
+  Poor:      'bg-red-900/40 border-red-700 text-red-300',
+  Fair:      'bg-amber-900/40 border-amber-700 text-amber-300',
+  Good:      'bg-sky-900/40 border-sky-700 text-sky-300',
+  Excellent: 'bg-emerald-900/40 border-emerald-700 text-emerald-300',
+}
+
+// Suggested band from the ordinal classification model. Display only — the
+// model is experimental on live essays, so it never auto-flags. A "close call"
+// note appears when the top two bands are within 10 percentage points.
+function SuggestedBand({ band, probsJson }) {
+  let probs = {}
+  try { probs = probsJson ? JSON.parse(probsJson) : {} } catch { probs = {} }
+  const ranked = BAND_ORDER.filter(b => probs[b] != null).sort((a, b) => probs[b] - probs[a])
+  const closeCall = ranked.length >= 2 && probs[ranked[0]] - probs[ranked[1]] < 0.10
+  return (
+    <div className="mb-3">
+      <div className="flex items-center gap-2 flex-wrap">
+        <span className="text-xs text-zinc-500">Suggested band</span>
+        <span className={`text-xs rounded border px-1.5 py-0.5 font-medium ${BAND_STYLE[band] ?? 'border-zinc-700 text-zinc-300'}`}>
+          {band}{probs[band] != null && ` · ${Math.round(probs[band] * 100)}%`}
+        </span>
+        {closeCall && (
+          <span className="text-xs text-amber-400">close call with {ranked[1]} ({Math.round(probs[ranked[1]] * 100)}%)</span>
+        )}
+        <span className="text-[10px] uppercase tracking-wide text-zinc-600">experimental</span>
+      </div>
+      {ranked.length > 0 && (
+        <div className="flex gap-3 mt-1">
+          {BAND_ORDER.map(b => (
+            <span key={b} className={`text-[11px] font-mono tabular-nums ${b === band ? 'text-zinc-300' : 'text-zinc-600'}`}>
+              {b} {Math.round((probs[b] ?? 0) * 100)}%
+            </span>
+          ))}
+        </div>
+      )}
+    </div>
+  )
 }
 
 function AnswerCard({ answer, question, flag, onOverrideSaved, onFlagChange }) {
@@ -506,6 +569,8 @@ function AnswerCard({ answer, question, flag, onOverrideSaved, onFlagChange }) {
           )}
         </div>
       )}
+      {/* Suggested band from the ordinal classification model (essay, structured rubric only) */}
+      {answer.ai_band && <SuggestedBand band={answer.ai_band} probsJson={answer.ai_band_probs_json} />}
 
       {/* No-detection badge: OMR ran but detected nothing */}
       {answer.omr_confidence == null && (qtype === 'mcq' || qtype === 'tf') && answer.status === 'needs_review' && (

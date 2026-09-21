@@ -10,6 +10,14 @@
       "port": 8000
     },
     {
+      "name": "backend-band-test",
+      "runtimeExecutable": "C:\\Users\\ASUS\\OneDrive\\Desktop\\Files\\John\\GrAID-Repo\\venv\\Scripts\\python.exe",
+      "runtimeArgs": [
+        "C:\\Users\\ASUS\\AppData\\Local\\Temp\\claude\\C--Users-ASUS-OneDrive-Desktop-Files-John-GrAID-Repo\\db4b8843-d326-4cc9-841d-3355139139ff\\scratchpad\\run_band_test_backend.py"
+      ],
+      "port": 8000
+    },
+    {
       "name": "frontend-dev",
       "runtimeExecutable": "npm",
       "runtimeArgs": ["run", "dev", "--prefix", "C:\\Users\\ASUS\\OneDrive\\Desktop\\Files\\John\\GrAID-Repo\\frontend"],

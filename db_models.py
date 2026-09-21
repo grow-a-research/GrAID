@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint, false
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from database import Base
@@ -90,8 +90,10 @@ class ExamQuestion(Base):
     # MCQ choices as JSON list of strings, e.g. ["Paris", "London", "Berlin", "Rome"]
     choices_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     # Correct answer: letter for MCQ ("A"/"B"/"C"/"D"), "True"/"False" for tf,
-    # or the expected string for identification.
+    # or, for identification, the teacher's accepted answers separated by "|".
     correct_answer: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Identification only — whether exact-match scoring compares case.
+    case_sensitive: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
     # Bounding-box region on the template page for Phase 5 template-aware cropping.
     # JSON: {"page": 1, "x1": 0, "y1": 0, "x2": 0, "y2": 0}
     # Nullable — populated in Phase 4 when the template is generated.
@@ -159,6 +161,14 @@ class SubmissionAnswer(Base):
     # {criterion, max_points, score, justification}. Populated only when the
     # question has a structured rubric (rubric_criteria_json); NULL otherwise.
     ai_criteria_scores_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Suggested performance band (Poor/Fair/Good/Excellent) from the ordinal
+    # classification model in band_classifier.py — EXPERIMENTAL, essays with a
+    # structured rubric only. Probabilities are a JSON object band -> 0-1;
+    # spread is the highest minus lowest criterion percentage.
+    ai_band: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    ai_band_probs_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    ai_spread: Mapped[float | None] = mapped_column(Float, nullable=True)
+    ai_band_model_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
     # OCR quality metrics (populated when reference text is available)
     cer: Mapped[float | None] = mapped_column(Float, nullable=True)
     wer: Mapped[float | None] = mapped_column(Float, nullable=True)
@@ -208,7 +218,8 @@ class FlagLog(Base):
         ForeignKey("submission_answers.id"), unique=True, index=True
     )
     # Reason code: essay_score_zero | essay_low_confidence | omr_low_confidence |
-    #              omr_no_detection | identification_no_match | manual | verified
+    #              omr_no_detection | identification_no_match |
+    #              identification_ocr_unreadable | manual | verified
     flag_reason: Mapped[str] = mapped_column(String(64))
     # Whether this was raised automatically (True) or by the teacher (False/None)
     auto_flagged: Mapped[bool] = mapped_column(Boolean, default=True)

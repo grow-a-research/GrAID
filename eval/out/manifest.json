@@ -1,0 +1,34 @@
+{
+  "generated_at": "2026-09-20T17:27:32.994959+00:00",
+  "database": "C:\\Users\\ASUS\\OneDrive\\Desktop\\Files\\John\\GrAID-Repo\\data\\app.db",
+  "exam_id": 15,
+  "git_commit": "af9e68a2e979bc94b0141c4d25e3b73a5f23b143",
+  "working_tree_dirty": true,
+  "workbook_rows": 250,
+  "routed_to_review": 3,
+  "empty_ocr_items": [
+    "S261-Q04",
+    "S264-Q06",
+    "S267-Q05",
+    "S267-Q06"
+  ],
+  "shuffle_seed": 20260921,
+  "sheet_rows": 250,
+  "crops_written": 250,
+  "crops_missing": [],
+  "professor_workbook": {
+    "file": "_regression_test.xlsx",
+    "answers": 250,
+    "shuffle_seed": 20260921,
+    "missing_crops": []
+  },
+  "recheck_workbook": {
+    "file": "Professor_Recheck_ID-1.xlsx",
+    "items": 80,
+    "disagreements": 40,
+    "agreements": 40,
+    "seed": 20260922,
+    "first_pass": "C:\\Users\\ASUS\\OneDrive\\Desktop\\Files\\John\\GrAID-Repo\\eval\\out\\Professor_Judgment_ID-1.xlsx",
+    "key_file": "recheck_key_DO_NOT_SEND.csv"
+  }
+}

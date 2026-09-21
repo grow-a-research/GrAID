@@ -149,10 +149,17 @@ def get_ai_features_for_essay(
     rubric_criteria_json: str,
     max_points: float,
     essay_text: str,
+    clean_text: bool = False,
+    few_shot_examples: str | None = None,
 ) -> AIFeatures:
     """
     Run one essay through the existing AI grader (ai_grader.grade_essay) and
     reduce its per-criterion output to the 3 classifier inputs.
+
+    clean_text: pass True only when essay_text has no OCR/transcription step
+    (e.g. DREsS_New essays) — see grade_answer_structured()'s docstring.
+    few_shot_examples: optional worked-example text appended to the system
+    prompt — None by default, existing callers unaffected.
 
     Requires GROQ_API_KEY to be set (same as the rest of the system).
     """
@@ -162,6 +169,8 @@ def get_ai_features_for_essay(
         rubric_criteria_json=rubric_criteria_json,
         max_points=max_points,
         ocr_text=essay_text,
+        clean_text=clean_text,
+        few_shot_examples=few_shot_examples,
     )
     if not result.criteria_scores_json:
         raise RuntimeError(
@@ -282,13 +291,20 @@ def summarize_formula(result) -> str:
     numbers (right order of magnitude, wrong value).
     """
     p = result.params
+    pvalues = result.pvalues
     threshold_names = [name for name in p.index if name not in ("score_pct", "confidence", "spread")]
     thresholds = result.model.transform_threshold_params(p.values)[1:-1]  # drop -inf/+inf bounds
 
     lines = ["Trained formula:",
              f"  z = ({p['score_pct']:.4f} x Score%) + ({p['confidence']:.4f} x Confidence) "
              f"+ ({p['spread']:.4f} x Spread)",
-             "Thresholds:"]
+             "",
+             "Coefficient significance (p < 0.05 = statistically significant):"]
+    for feat in ("score_pct", "confidence", "spread"):
+        sig = "significant" if pvalues[feat] < 0.05 else "NOT significant"
+        lines.append(f"  {feat}: coef={p[feat]:.4f}, p={pvalues[feat]:.4f}  ({sig})")
+    lines.append("")
+    lines.append("Thresholds:")
     for name, thresh in zip(threshold_names, thresholds):
         lines.append(f"  {name}: {thresh:.4f}")
     return "\n".join(lines)

@@ -36,3 +36,25 @@ classification_model/dress_shared_subset_candidates.pdf
 classification_model/dress_shared_scores_template.csv
 classification_model/dress_shared_scores_entry.xlsx
 classification_model/dress_data/
+
+# node_modules anywhere (not just frontend)
+node_modules/
+
+# Local OCR scratch dumps (contain real student essay text)
+content_*.txt
+whole_*.txt
+box-crop_*.txt
+
+# Local benchmark output (contains Vast.ai host + student answers)
+bench_*.json
+
+# node_modules anywhere (not just frontend)
+node_modules/
+
+# Local OCR scratch dumps (contain real student essay text)
+content_*.txt
+whole_*.txt
+box-crop_*.txt
+
+# Local benchmark output (contains Vast.ai host + student answers)
+bench_*.json

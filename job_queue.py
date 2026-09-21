@@ -13,7 +13,6 @@ get_status()             — return a dict describing current queue state
 from __future__ import annotations
 
 import asyncio
-import difflib
 import json
 import logging
 import time
@@ -116,6 +115,7 @@ def _process_job_sync(job: dict) -> None:
     import numpy as np
     import ocr_pipeline
     from ai_grader import EssayGradeResult, correct_ocr_text, grade_essay
+    from identification_scoring import score_identification
     from ocr_alignment import crop_content_area, crop_region, detect_and_warp
     from omr_engine import LOW_CONFIDENCE_THRESHOLD, MULTIPLE_MARKS_LABEL, detect_omr
     from PIL import Image, ImageOps
@@ -176,6 +176,9 @@ def _process_job_sync(job: dict) -> None:
         dest_dir     = data_root / str(sub.id)
         dest_dir.mkdir(parents=True, exist_ok=True)
         now = datetime.now(timezone.utc)
+        # Questions already written during THIS run — a later page continues
+        # them instead of overwriting (mirrors _merge_page_text in api_v1.py).
+        written_questions: set[int] = set()
 
         # ── OCR ──────────────────────────────────────────────────────────────
         for sf in files:
@@ -223,10 +226,14 @@ def _process_job_sync(job: dict) -> None:
                                 else "done"
                             )
                         else:
-                            crop        = crop_region(warped, region, template_spec)
+                            crop        = crop_region(
+                                warped, region, template_spec,
+                                snap_to_box=(qtype == "identification"),
+                                top_padding_mm=_TOP_PAD_MM.get(qtype, _DEFAULT_TOP_PAD_MM),
+                            )
                             ocr_clarity = _laplacian_var(crop)
                             t_ocr = time.perf_counter()
-                            ocr_text, boxes, _, ocr_low_conf = ocr_pipeline.run_ocr_pipeline(crop, include_boxed_image=False)
+                            ocr_text, boxes, ocr_low_conf = _ocr_answer_crop(crop, qtype)
                             logger.info(
                                 "[Timing] submission %d q%d: remote OCR call took %.2fs",
                                 submission_id, q.id, time.perf_counter() - t_ocr,
@@ -240,15 +247,17 @@ def _process_job_sync(job: dict) -> None:
                                     "submission %d q%d: OCR returned empty text — retrying once",
                                     submission_id, q.id,
                                 )
-                                ocr_text, boxes, _, ocr_low_conf = ocr_pipeline.run_ocr_pipeline(crop, include_boxed_image=False)
+                                ocr_text, boxes, ocr_low_conf = _ocr_answer_crop(crop, qtype)
 
-                            if qtype not in ("mcq", "tf") and ocr_text.strip():
-                                t_corr = time.perf_counter()
-                                ocr_text = correct_ocr_text(ocr_text)
-                                logger.info(
-                                    "[Timing] submission %d q%d: Groq OCR-correction call took %.2fs",
-                                    submission_id, q.id, time.perf_counter() - t_corr,
-                                )
+                            # Identification answers keep the raw OCR text: exact-match
+                            # scoring needs what the student actually wrote, and Groq
+                            # correction can't tell an OCR slip from a student's own
+                            # misspelling (it both removed and granted credit that way).
+                            # Essays keep the transcription as OCR'd as well —
+                            # see run_submission_ocr in api_v1.py.
+                            if qtype not in ("mcq", "tf", "identification") and ocr_text.strip():
+                                from text_normalize import strip_printed_prompt
+                                ocr_text = strip_printed_prompt(ocr_text, q.prompt)
                             boxes_data = json.dumps(
                                 [{"x1": b[0], "y1": b[1], "x2": b[2], "y2": b[3]}
                                  for b in boxes]
@@ -264,7 +273,9 @@ def _process_job_sync(job: dict) -> None:
                             db, sub.id, q.id, sf.page_number,
                             ocr_text, boxes_data, ans_status,
                             omr_confidence, ocr_clarity, now,
+                            append=q.id in written_questions,
                         )
+                        written_questions.add(q.id)
                         if qtype not in ("mcq", "tf") and ocr_low_conf:
                             _flag(ans, "ocr_low_confidence", db)
 
@@ -372,30 +383,12 @@ def _process_job_sync(job: dict) -> None:
                     ans.status = "graded"
 
             elif qtype == "identification":
-                correct = (question.correct_answer or "").strip()
-                given   = ans.ocr_text.strip()
-                max_pts = question.max_points if question else 1.0
-                if correct.lower() == given.lower():
-                    score   = max_pts
-                    verdict = "Exact match."
-                else:
-                    ratio = difflib.SequenceMatcher(
-                        None, correct.lower(), given.lower()
-                    ).ratio()
-                    if ratio >= 0.85:
-                        score   = max_pts
-                        verdict = f"Accepted (fuzzy {ratio:.0%})."
-                    elif ratio >= 0.60:
-                        score   = max_pts * 0.5
-                        verdict = f"Partial credit (fuzzy {ratio:.0%})."
-                    else:
-                        score   = 0.0
-                        verdict = f"Incorrect (fuzzy {ratio:.0%})."
-                ans.ai_score    = score
-                ans.ai_feedback = f"Expected: {correct}. Your answer: {given}. {verdict}"
-                ans.status      = "graded"
-                if score == 0.0:
-                    _flag(ans, "identification_no_match", db)
+                score, ans.ai_feedback = score_identification(
+                    question.correct_answer, ans.ocr_text,
+                    question.max_points, question.case_sensitive,
+                )
+                ans.ai_score = score
+                _flag_identification(ans, question.correct_answer, score, db)
 
             ans.updated_at = now
 
@@ -429,6 +422,26 @@ def _save_png(img, path: Path) -> None:
     path.write_bytes(buf.getvalue())
 
 
+# Per-question-type top margin for answer crops — see api_v1.py's copy.
+_DEFAULT_TOP_PAD_MM = 0.5
+_TOP_PAD_MM = {"essay": -1.5}
+
+
+def _ocr_answer_crop(crop, qtype: str) -> tuple[str, list, bool]:
+    """OCR one answer crop (mirrors _ocr_answer_crop in api_v1.py): identification
+    boxes go to the single-line path, essays to the two-scale pass, everything
+    else to the plain pipeline."""
+    import ocr_pipeline
+    if qtype == "identification":
+        from id_ocr_client import run_identification_ocr
+        return run_identification_ocr(crop)
+    if qtype == "essay":
+        from essay_ocr import run_essay_ocr
+        return run_essay_ocr(crop)
+    text, boxes, _, low_conf = ocr_pipeline.run_ocr_pipeline(crop, include_boxed_image=False)
+    return text, boxes, low_conf
+
+
 def _flag(ans, reason: str, db) -> None:
     """Idempotent auto-flag helper (mirrors _auto_flag in api_v1.py)."""
     import db_models as m
@@ -446,10 +459,33 @@ def _flag(ans, reason: str, db) -> None:
         ))
 
 
+def _flag_identification(ans, correct_answer, score: float, db) -> None:
+    """Status + auto-flag for a scored identification answer (mirrors
+    _flag_identification in api_v1.py). Must run before ans.status is
+    overwritten, since it reads the OCR step's needs_review status."""
+    import db_models as m
+    from identification_scoring import looks_unreadable
+    if score > 0.0:
+        ans.status = "graded"
+        # Drop a stale auto-flag from an earlier grade; keep manual or reviewed ones.
+        db.query(m.FlagLog).filter(
+            m.FlagLog.submission_answer_id == ans.id,
+            m.FlagLog.auto_flagged.is_(True),
+            m.FlagLog.review_decision.is_(None),
+        ).delete(synchronize_session=False)
+    elif ans.status == "needs_review" or looks_unreadable(correct_answer, ans.ocr_text):
+        ans.status = "needs_review"
+        _flag(ans, "identification_ocr_unreadable", db)
+    else:
+        ans.status = "graded"
+        _flag(ans, "identification_no_match", db)
+
+
 def _upsert_answer(
     db, sub_id, q_id, page_num,
     ocr_text, boxes_data, ans_status,
     omr_conf, ocr_clarity, now,
+    append: bool = False,
 ):
     import db_models as m
     existing = (
@@ -461,7 +497,10 @@ def _upsert_answer(
         .first()
     )
     if existing:
-        existing.ocr_text       = ocr_text
+        # append=True means a later page of the same submission in this run:
+        # a two-page essay continues its answer instead of replacing it.
+        from routers.api_v1 import _merge_page_text
+        existing.ocr_text       = _merge_page_text(existing.ocr_text, ocr_text, append)
         existing.boxes_json     = boxes_data
         existing.status         = ans_status
         existing.omr_confidence = omr_conf

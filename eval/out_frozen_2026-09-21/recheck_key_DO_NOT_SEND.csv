@@ -1,0 +1,81 @@
+﻿item_id,group,pass1_judgment,graid_credited,graid_ocr,answer_key
+S269-Q07,agreement,Correct,1,Demilitarization,Demilitarization
+S267-Q10,agreement,Correct,1,positive peace,Positive Peace
+S256-Q09,disagreement,Incorrect,1,culture of peace,Culture of Peace
+S250-Q09,agreement,Incorrect,0,Culture peace,Culture of Peace
+S246-Q05,agreement,Incorrect,0,non Rcsistance,Nonviolent Resistance
+S246-Q01,disagreement,Incorrect,1,Civil Disobedience,Civil Disobedience
+S254-Q02,disagreement,Correct,0,Johan Cultury,Johan Galtung
+S256-Q08,disagreement,Incorrect,1,militarization,Militarization
+S253-Q07,agreement,Correct,1,Demilitarization,Demilitarization
+S257-Q04,agreement,Incorrect,0,-,Military-Industrial Complex
+S245-Q04,agreement,Correct,1,Military-Industrial Complex,Military-Industrial Complex
+S261-Q06,disagreement,Correct,0,JUSTICE,Restorative Justice
+S250-Q10,agreement,Correct,1,positive peace,Positive Peace
+S252-Q09,agreement,Correct,1,Culture of Peace,Culture of Peace
+S246-Q07,agreement,Incorrect,0,Pemilitanization,Demilitarization
+S249-Q01,agreement,Correct,1,Civil Disobedience,Civil Disobedience
+S262-Q04,disagreement,Correct,0,Military Industrial complex,Military-Industrial Complex
+S252-Q03,disagreement,Correct,0,Human scarcity,Human Security
+S269-Q02,agreement,Correct,1,Johan Galtung,Johan Galtung
+S255-Q05,disagreement,Correct,0,Non Violent Resistance,Nonviolent Resistance
+S253-Q05,agreement,Incorrect,0,Non violent Resistance,Nonviolent Resistance
+S261-Q08,disagreement,Incorrect,1,Militarization,Militarization
+S252-Q05,disagreement,Correct,0,Non violent Resistance,Nonviolent Resistance
+S250-Q07,disagreement,Correct,0,Delimitanization,Demilitarization
+S266-Q04,disagreement,Correct,0,MILITARY - INDUSTRIAL COMPLEX,Military-Industrial Complex
+S247-Q03,disagreement,Correct,0,Human secuity,Human Security
+S263-Q02,agreement,Incorrect,0,Johan Gatung,Johan Galtung
+S246-Q02,agreement,Correct,1,Johan Galtung,Johan Galtung
+S247-Q07,agreement,Incorrect,0,Militarization,Demilitarization
+S263-Q06,agreement,Correct,1,Restorative justice,Restorative Justice
+S265-Q02,agreement,Incorrect,0,muv he he,Johan Galtung
+S254-Q09,disagreement,Incorrect,1,Culture of Peace,Culture of Peace
+S260-Q07,agreement,Correct,1,Demilitarization,Demilitarization
+S268-Q09,agreement,Correct,1,culture of peace,Culture of Peace
+S247-Q08,agreement,Correct,1,militarization,Militarization
+S251-Q10,disagreement,Incorrect,1,Positive Peace,Positive Peace
+S250-Q04,disagreement,Incorrect,1,Military-Industrial Complex,Military-Industrial Complex
+S261-Q04,agreement,Incorrect,0,,Military-Industrial Complex
+S254-Q05,agreement,Correct,1,Nonviolent Resistance,Nonviolent Resistance
+S267-Q02,disagreement,Correct,0,Johan Graltung,Johan Galtung
+S262-Q10,disagreement,Correct,0,Positin Peace,Positive Peace
+S265-Q05,agreement,Incorrect,0,Ang haba,Nonviolent Resistance
+S264-Q04,agreement,Incorrect,0,compIcx,Military-Industrial Complex
+S264-Q07,disagreement,Correct,0,Militarization,Demilitarization
+S260-Q03,disagreement,Incorrect,1,Human Security,Human Security
+S250-Q02,disagreement,Correct,0,Johan Galburg,Johan Galtung
+S251-Q01,disagreement,Incorrect,1,Civil Disobedience,Civil Disobedience
+S259-Q03,agreement,Incorrect,0,DEGREE,Human Security
+S249-Q02,disagreement,Correct,0,Johan Fulung,Johan Galtung
+S248-Q05,disagreement,Correct,0,non violent resistance,Nonviolent Resistance
+S245-Q05,agreement,Correct,1,Nonviolent Resistance,Nonviolent Resistance
+S262-Q03,disagreement,Incorrect,1,Human Security,Human Security
+S258-Q07,disagreement,Correct,0,RESTORATIVE JUSTICE,Demilitarization
+S246-Q03,agreement,Correct,1,Human Security,Human Security
+S247-Q05,disagreement,Correct,0,non violent resistance,Nonviolent Resistance
+S261-Q05,disagreement,Incorrect,1,nonviolent resistance,Nonviolent Resistance
+S246-Q04,disagreement,Correct,0,military - Industrial Complex,Military-Industrial Complex
+S251-Q08,disagreement,Incorrect,1,MILITARIZATION,Militarization
+S252-Q02,agreement,Correct,1,Johan Galtung,Johan Galtung
+S248-Q01,agreement,Incorrect,0,Disobedience,Civil Disobedience
+S245-Q08,disagreement,Incorrect,1,militarization,Militarization
+S260-Q04,disagreement,Correct,0,Military Industrial complex,Military-Industrial Complex
+S251-Q04,agreement,Incorrect,0,Industrial Complex,Military-Industrial Complex
+S269-Q05,agreement,Correct,1,Nonviolent Resistance,Nonviolent Resistance
+S260-Q08,agreement,Correct,1,militarization,Militarization
+S259-Q08,agreement,Incorrect,0,Cinema,Militarization
+S253-Q04,disagreement,Correct,0,Military - Industrial Complex,Military-Industrial Complex
+S254-Q07,disagreement,Correct,0,Delimitarizabn,Demilitarization
+S262-Q08,agreement,Correct,1,Militarization,Militarization
+S259-Q04,agreement,Incorrect,0,WORK,Military-Industrial Complex
+S251-Q09,disagreement,Incorrect,1,Culture of Peace,Culture of Peace
+S256-Q05,disagreement,Correct,0,non violent Resistance,Nonviolent Resistance
+S263-Q05,disagreement,Correct,0,Non violent Resistance,Nonviolent Resistance
+S265-Q07,disagreement,Correct,0,Restorative Justice,Demilitarization
+S260-Q05,agreement,Correct,1,Nonviolent resistance,Nonviolent Resistance
+S249-Q03,agreement,Correct,1,Human security,Human Security
+S255-Q02,disagreement,Incorrect,1,Johan Galtung,Johan Galtung
+S258-Q03,agreement,Incorrect,0,ESPINA,Human Security
+S248-Q03,disagreement,Correct,0,Human secuity,Human Security
+S245-Q03,agreement,Correct,1,Human Security,Human Security
