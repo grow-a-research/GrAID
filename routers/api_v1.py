@@ -46,6 +46,7 @@ from api_schemas import (
     ExamStats,
     FlagCreate,
     FlagLogRead,
+    FlagLogWithContext,
     FlagReview,
     FlagStats,
     ImportResult,
@@ -812,6 +813,9 @@ def run_submission_ocr(
                     qtype = (q.question_type or "essay")
                     omr_confidence: float | None = None
                     ocr_low_conf = False
+                    # Stays None on the OMR branch, which has no transcription
+                    # confidence to report.
+                    ocr_conf: float | None = None
 
                     if qtype in ("mcq", "tf") and region.get("bubbles"):
                         # ── Phase 13: OMR bubble-fill detection ───────────────
@@ -844,7 +848,7 @@ def run_submission_ocr(
                         )
                         ocr_clarity_val: float | None = _crop_clarity(crop)
                         t_ocr = time.perf_counter()
-                        ocr_text, boxes, ocr_low_conf = _ocr_answer_crop(crop, qtype)
+                        ocr_text, boxes, ocr_low_conf, ocr_conf = _ocr_answer_crop(crop, qtype)
                         logger.info(
                             "[Timing] submission %d q%d: remote OCR call took %.2fs",
                             submission_id, q.id, time.perf_counter() - t_ocr,
@@ -857,7 +861,7 @@ def run_submission_ocr(
                                 "submission %d q%d: OCR returned empty text — retrying once",
                                 submission_id, q.id,
                             )
-                            ocr_text, boxes, ocr_low_conf = _ocr_answer_crop(crop, qtype)
+                            ocr_text, boxes, ocr_low_conf, ocr_conf = _ocr_answer_crop(crop, qtype)
                         # Essays keep the transcription as OCR'd too. The Groq
                         # correction step was a LAYOUT cleaner (merge wrapped
                         # lines, split paragraphs, strip a printed prompt), and
@@ -897,6 +901,13 @@ def run_submission_ocr(
                         existing.status         = ans_status
                         existing.omr_confidence = omr_confidence
                         existing.ocr_clarity    = ocr_clarity_val if qtype not in ("mcq", "tf") else None
+                        # A later page keeps the run's weakest reading — the
+                        # answer is as uncertain as its least-confident page.
+                        if ocr_conf is not None:
+                            existing.ocr_confidence = (
+                                ocr_conf if existing.ocr_confidence is None
+                                else min(existing.ocr_confidence, ocr_conf)
+                            )
                         existing.updated_at     = now
                         if ocr_low_conf:
                             _auto_flag(existing, "ocr_low_confidence", db)
@@ -913,6 +924,7 @@ def run_submission_ocr(
                             status=ans_status,
                             omr_confidence=omr_confidence,
                             ocr_clarity=ocr_clarity_val if qtype not in ("mcq", "tf") else None,
+                            ocr_confidence=ocr_conf,
                         )
                         db.add(answer)
                         db.flush()
@@ -1467,24 +1479,28 @@ def _merge_page_text(previous: str | None, new_text: str, already_written: bool)
     return f"{previous.rstrip()}\n\n{new_text.lstrip()}"
 
 
-def _ocr_answer_crop(crop, qtype: str) -> tuple[str, list, bool]:
+def _ocr_answer_crop(crop, qtype: str) -> tuple[str, list, bool, float | None]:
     """
     OCR one answer crop by question type: identification boxes go to the
     single-line endpoint (whole box, no line detection — see id_ocr.py),
     essays run the two-scale pass (see essay_ocr.py), anything else takes the
     plain pipeline.
 
-    Returns (text, boxes, low_confidence).
+    Returns (text, boxes, low_confidence, ocr_confidence). The last element is
+    the numeric transcription confidence, and is None on every path that does
+    not report one — only essays need it, for the combined OCR + grading
+    confidence (see answer_confidence).
     """
     import ocr_pipeline  # imported per-call, like the rest of this module's uses
     if qtype == "identification":
         from id_ocr_client import run_identification_ocr
-        return run_identification_ocr(crop)
+        text, boxes, low_conf = run_identification_ocr(crop)
+        return text, boxes, low_conf, None
     if qtype == "essay":
         from essay_ocr import run_essay_ocr
-        return run_essay_ocr(crop)
+        return run_essay_ocr(crop, return_confidence=True)
     text, boxes, _, low_conf = ocr_pipeline.run_ocr_pipeline(crop, include_boxed_image=False)
-    return text, boxes, low_conf
+    return text, boxes, low_conf, None
 
 
 def _auto_flag(
@@ -1649,8 +1665,13 @@ def grade_submission(
                 ans.status                 = "graded"
                 if result.score == 0.0:
                     _auto_flag(ans, "essay_score_zero", db)
-                elif result.confidence < 0.4:
-                    _auto_flag(ans, "essay_low_confidence", db)
+                else:
+                    # Combined transcription + grading confidence: the answer is only as trustworthy as its weakest stage. Replaces the standalone groq-confidence rule, and stays silent when neither stage reported a number (see answer_confidence).
+                    from answer_confidence import flag_reason
+                    _conf_reason = flag_reason(ans.ocr_confidence, result.confidence)
+                    if _conf_reason:
+                        ans.status = "needs_review"
+                        _auto_flag(ans, _conf_reason, db)
                 # Fallback OCR that couldn't be matched to a single real
                 # question was graded against generic placeholders above —
                 # flag it so the teacher knows this score isn't against the
@@ -1867,6 +1888,8 @@ def _run_bulk_process(exam_id: int, db: Session) -> BulkProcessResult:
                             qtype  = (q.question_type or "essay")
                             omr_confidence: float | None = None
                             ocr_low_conf = False
+                            # Stays None on the OMR branch below.
+                            ocr_conf: float | None = None
 
                             if qtype in ("mcq", "tf") and region.get("bubbles"):
                                 label, conf, _ = detect_omr(warped, region, template_spec)
@@ -1887,7 +1910,7 @@ def _run_bulk_process(exam_id: int, db: Session) -> BulkProcessResult:
                                     snap_to_box=(qtype == "identification"),
                                     top_padding_mm=_TOP_PAD_MM.get(qtype, _DEFAULT_TOP_PAD_MM),
                                 )
-                                ocr_text, boxes, ocr_low_conf = _ocr_answer_crop(crop, qtype)
+                                ocr_text, boxes, ocr_low_conf, ocr_conf = _ocr_answer_crop(crop, qtype)
                                 # Identification and essays both keep the raw
                                 # transcription — see run_submission_ocr.
                                 if qtype == "essay":
@@ -1916,6 +1939,11 @@ def _run_bulk_process(exam_id: int, db: Session) -> BulkProcessResult:
                                 existing.boxes_json     = boxes_data
                                 existing.status         = ans_status
                                 existing.omr_confidence = omr_confidence
+                                if ocr_conf is not None:
+                                    existing.ocr_confidence = (
+                                        ocr_conf if existing.ocr_confidence is None
+                                        else min(existing.ocr_confidence, ocr_conf)
+                                    )
                                 existing.updated_at     = now
                                 if ocr_low_conf:
                                     _auto_flag(existing, "ocr_low_confidence", sub_db)
@@ -1928,6 +1956,7 @@ def _run_bulk_process(exam_id: int, db: Session) -> BulkProcessResult:
                                     boxes_json=boxes_data,
                                     status=ans_status,
                                     omr_confidence=omr_confidence,
+                                    ocr_confidence=ocr_conf,
                                 )
                                 sub_db.add(new_ans)
                                 if ocr_low_conf:
@@ -2008,8 +2037,13 @@ def _run_bulk_process(exam_id: int, db: Session) -> BulkProcessResult:
                     ans.status                  = "graded"
                     if result.score == 0.0:
                         _auto_flag(ans, "essay_score_zero", sub_db)
-                    elif result.confidence < 0.4:
-                        _auto_flag(ans, "essay_low_confidence", sub_db)
+                    else:
+                        # Combined transcription + grading confidence: the answer is only as trustworthy as its weakest stage. Replaces the standalone groq-confidence rule, and stays silent when neither stage reported a number (see answer_confidence).
+                        from answer_confidence import flag_reason
+                        _conf_reason = flag_reason(ans.ocr_confidence, result.confidence)
+                        if _conf_reason:
+                            ans.status = "needs_review"
+                            _auto_flag(ans, _conf_reason, sub_db)
                     if ans.question_id is None and question is None:
                         ans.status = "needs_review"
                         _auto_flag(ans, "fallback_ocr_ambiguous_question", sub_db)
@@ -2478,6 +2512,57 @@ def exam_flag_stats(exam_id: int, db: Session = Depends(get_db)) -> FlagStats:
         precision=round(precision, 4) if precision is not None else None,
         recall=round(recall, 4)    if recall    is not None else None,
     )
+
+
+@router.get("/exams/{exam_id}/flags", response_model=list[FlagLogWithContext])
+def list_exam_flags(exam_id: int, db: Session = Depends(get_db)) -> list[FlagLogWithContext]:
+    """
+    Every flagged answer for an exam, with student/question context attached,
+    for the exam-wide "flagged answers" review UI. Excludes pure 'verified'
+    rows (those mark a TN on an answer that was never actually flagged).
+    """
+    exam = db.get(m.Exam, exam_id)
+    if not exam:
+        raise HTTPException(status_code=404, detail="Exam not found")
+
+    rows = (
+        db.query(m.FlagLog, m.SubmissionAnswer, m.Submission, m.Student, m.ExamQuestion)
+        .join(m.SubmissionAnswer, m.FlagLog.submission_answer_id == m.SubmissionAnswer.id)
+        .join(m.Submission, m.SubmissionAnswer.submission_id == m.Submission.id)
+        .join(m.Student, m.Submission.student_id == m.Student.id)
+        .outerjoin(m.ExamQuestion, m.SubmissionAnswer.question_id == m.ExamQuestion.id)
+        .filter(
+            m.Submission.exam_id == exam_id,
+            m.FlagLog.flag_reason != "verified",
+        )
+        .all()
+    )
+
+    results = [
+        FlagLogWithContext(
+            id=flag.id,
+            submission_answer_id=flag.submission_answer_id,
+            submission_id=sub.id,
+            student_name=student.full_name,
+            student_id=student.student_id,
+            question_order_index=question.order_index if question else None,
+            question_prompt=question.prompt if question else None,
+            question_type=question.question_type if question else None,
+            ai_score=ans.ai_score,
+            teacher_score=ans.teacher_score,
+            flag_reason=flag.flag_reason,
+            auto_flagged=flag.auto_flagged,
+            auto_flagged_at=flag.auto_flagged_at,
+            reviewed_by=flag.reviewed_by,
+            review_decision=flag.review_decision,
+            reviewed_at=flag.reviewed_at,
+            created_at=flag.created_at,
+        )
+        for flag, ans, sub, student, question in rows
+    ]
+    # Unreviewed flags first (need attention), newest first within each group.
+    results.sort(key=lambda f: (f.review_decision is not None, -f.auto_flagged_at.timestamp()))
+    return results
 
 
 # ---------------------------------------------------------------------------

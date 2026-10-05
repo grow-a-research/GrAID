@@ -183,6 +183,12 @@ class SubmissionAnswer(Base):
     # Phase 21 — Laplacian variance of the answer crop (proxy for OCR scan clarity).
     # Higher = sharper / more legible. None for OMR (MCQ/TF) answers.
     ocr_clarity: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # Qwen's lowest line confidence for this answer's transcription (0–1) — the
+    # numeric behind the low_confidence flag, persisted so the combined
+    # OCR+grading confidence can be recomputed and reported per answer.
+    # None on MCQ/TF, and on answers OCR'd by a server build that predates the
+    # field (see _run_remote_ocr_pipeline) — None means unknown, never "low".
+    ocr_confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, onupdate=_utcnow)

@@ -211,6 +211,9 @@ def _process_job_sync(job: dict) -> None:
                         qtype  = (q.question_type or "essay")
                         omr_confidence: float | None = None
                         ocr_clarity:    float | None = None
+                        # Stays None on the OMR branch below, which has no
+                        # transcription confidence to report.
+                        ocr_conf:       float | None = None
 
                         if qtype in ("mcq", "tf") and region.get("bubbles"):
                             label, conf, _ = detect_omr(warped, region, template_spec)
@@ -233,7 +236,7 @@ def _process_job_sync(job: dict) -> None:
                             )
                             ocr_clarity = _laplacian_var(crop)
                             t_ocr = time.perf_counter()
-                            ocr_text, boxes, ocr_low_conf = _ocr_answer_crop(crop, qtype)
+                            ocr_text, boxes, ocr_low_conf, ocr_conf = _ocr_answer_crop(crop, qtype)
                             logger.info(
                                 "[Timing] submission %d q%d: remote OCR call took %.2fs",
                                 submission_id, q.id, time.perf_counter() - t_ocr,
@@ -247,7 +250,7 @@ def _process_job_sync(job: dict) -> None:
                                     "submission %d q%d: OCR returned empty text — retrying once",
                                     submission_id, q.id,
                                 )
-                                ocr_text, boxes, ocr_low_conf = _ocr_answer_crop(crop, qtype)
+                                ocr_text, boxes, ocr_low_conf, ocr_conf = _ocr_answer_crop(crop, qtype)
 
                             # Identification answers keep the raw OCR text: exact-match
                             # scoring needs what the student actually wrote, and Groq
@@ -274,6 +277,7 @@ def _process_job_sync(job: dict) -> None:
                             ocr_text, boxes_data, ans_status,
                             omr_confidence, ocr_clarity, now,
                             append=q.id in written_questions,
+                            ocr_conf=ocr_conf,
                         )
                         written_questions.add(q.id)
                         if qtype not in ("mcq", "tf") and ocr_low_conf:
@@ -342,8 +346,25 @@ def _process_job_sync(job: dict) -> None:
                 ans.status                  = "graded"
                 if result.score == 0.0:
                     _flag(ans, "essay_score_zero", db)
-                elif result.confidence < 0.4:
-                    _flag(ans, "essay_low_confidence", db)
+                else:
+                    # Combined transcription + grading confidence: the answer is
+                    # only as trustworthy as its weakest stage. Replaces the
+                    # standalone groq-confidence rule, and stays silent when
+                    # neither stage reported a number (see answer_confidence).
+                    from answer_confidence import combined_confidence, flag_reason
+                    reason = flag_reason(ans.ocr_confidence, result.confidence)
+                    combined = combined_confidence(ans.ocr_confidence, result.confidence)
+                    logger.info(
+                        "submission %d ans%d: confidence ocr=%s groq=%.2f combined=%s%s",
+                        submission_id, ans.id,
+                        f"{ans.ocr_confidence:.3f}" if ans.ocr_confidence is not None else "n/a",
+                        result.confidence,
+                        f"{combined:.2f}" if combined is not None else "n/a",
+                        f" — flagged ({reason})" if reason else "",
+                    )
+                    if reason:
+                        ans.status = "needs_review"
+                        _flag(ans, reason, db)
                 if ans.question_id is None and question is None:
                     ans.status = "needs_review"
                     _flag(ans, "fallback_ocr_ambiguous_question", db)
@@ -427,19 +448,24 @@ _DEFAULT_TOP_PAD_MM = 0.5
 _TOP_PAD_MM = {"essay": -1.5}
 
 
-def _ocr_answer_crop(crop, qtype: str) -> tuple[str, list, bool]:
+def _ocr_answer_crop(crop, qtype: str) -> tuple[str, list, bool, float | None]:
     """OCR one answer crop (mirrors _ocr_answer_crop in api_v1.py): identification
     boxes go to the single-line path, essays to the two-scale pass, everything
-    else to the plain pipeline."""
+    else to the plain pipeline.
+
+    The 4th element is the numeric OCR confidence, or None where the path does
+    not report one — only the essay path needs it, for the combined
+    OCR + grading confidence (see answer_confidence)."""
     import ocr_pipeline
     if qtype == "identification":
         from id_ocr_client import run_identification_ocr
-        return run_identification_ocr(crop)
+        text, boxes, low_conf = run_identification_ocr(crop)
+        return text, boxes, low_conf, None
     if qtype == "essay":
         from essay_ocr import run_essay_ocr
-        return run_essay_ocr(crop)
+        return run_essay_ocr(crop, return_confidence=True)
     text, boxes, _, low_conf = ocr_pipeline.run_ocr_pipeline(crop, include_boxed_image=False)
-    return text, boxes, low_conf
+    return text, boxes, low_conf, None
 
 
 def _flag(ans, reason: str, db) -> None:
@@ -486,6 +512,7 @@ def _upsert_answer(
     ocr_text, boxes_data, ans_status,
     omr_conf, ocr_clarity, now,
     append: bool = False,
+    ocr_conf: float | None = None,
 ):
     import db_models as m
     existing = (
@@ -505,6 +532,13 @@ def _upsert_answer(
         existing.status         = ans_status
         existing.omr_confidence = omr_conf
         existing.ocr_clarity    = ocr_clarity
+        # A later page that appends text keeps the run's weakest reading —
+        # the answer is as uncertain as its least-confident page.
+        if ocr_conf is not None:
+            existing.ocr_confidence = (
+                ocr_conf if existing.ocr_confidence is None
+                else min(existing.ocr_confidence, ocr_conf)
+            )
         existing.updated_at     = now
         ans = existing
     else:
@@ -517,6 +551,7 @@ def _upsert_answer(
             status=ans_status,
             omr_confidence=omr_conf,
             ocr_clarity=ocr_clarity,
+            ocr_confidence=ocr_conf,
         )
         db.add(ans)
     db.commit()

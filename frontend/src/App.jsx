@@ -6,6 +6,7 @@ import ExamsPage       from './pages/ExamsPage'
 import SubmissionsPage from './pages/SubmissionsPage'
 import ResultsPage     from './pages/ResultsPage'
 import AnalyticsPage   from './pages/AnalyticsPage'
+import FlaggedAnswersPage from './pages/FlaggedAnswersPage'
 import { WorkflowProvider, useWorkflow } from './context/WorkflowContext'
 
 const API_BASE = import.meta.env.VITE_API_BASE ?? 'http://127.0.0.1:8000'
@@ -26,6 +27,7 @@ const WORKFLOW_TABS = [
 // Secondary: not part of the core setup → exam cycle.
 const MORE_TABS = [
   { id: 'analytics', label: 'Analytics', desc: 'Class overview, per-exam question breakdown, and individual student score tracker.' },
+  { id: 'flagged',   label: 'Flagged Answers', desc: 'Every flagged answer for an exam in one list, for review without opening each submission individually.' },
   { id: 'ocr',       label: 'OCR Tool',  desc: 'Raw OCR test — upload an image and inspect Surya line detection + Qwen2.5-VL transcription output.' },
 ]
 
@@ -82,7 +84,7 @@ function Breadcrumb({ tab }) {
 }
 
 function AppShell() {
-  const [tab, setTab]         = useState('classes')
+  const { activeTab: tab, setActiveTab: setTab } = useWorkflow()
   const [moreOpen, setMoreOpen] = useState(false)
 
   const allTabs   = [...SETUP_TABS, ...WORKFLOW_TABS, ...MORE_TABS]
@@ -159,6 +161,7 @@ function AppShell() {
         {tab === 'submissions' && <SubmissionsPage />}
         {tab === 'results'     && <ResultsPage />}
         {tab === 'analytics'   && <AnalyticsPage />}
+        {tab === 'flagged'     && <FlaggedAnswersPage />}
         {tab === 'ocr'         && <OcrPage />}
       </main>
     </div>

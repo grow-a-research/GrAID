@@ -534,9 +534,16 @@ def _dedupe_overlapping_lines(
 def run_ocr_pipeline(
     original: Image.Image,
     include_boxed_image: bool = True,
-) -> tuple[str, list[tuple[int, int, int, int]], Image.Image, bool]:
+    return_confidence: bool = False,
+):
     """
     Run the full OCR pipeline on a single PIL image.
+
+    return_confidence is additive on purpose: with the default False this
+    returns the same 4-tuple every existing caller unpacks, and only callers
+    that opt in get the 5th element. The GPU host runs a manually uploaded
+    copy of this module (see id_ocr.py), so changing the default arity would
+    break it the moment the two copies drift apart.
 
     include_boxed_image controls whether the remote path (see
     _run_remote_ocr_pipeline) bothers building/transmitting the annotated
@@ -559,11 +566,18 @@ def run_ocr_pipeline(
                           blank/erased ink, or just genuinely hard-to-read
                           handwriting) — callers should flag the answer for
                           human review rather than act on this themselves.
+        confidence      – only when return_confidence=True: the lowest line
+                          confidence on the page as a float, or None when no
+                          line produced text (and, on the remote path, when
+                          the OCR server is an older build that does not send
+                          it — see _run_remote_ocr_pipeline).
     """
     assert MODELS is not None
 
     if REMOTE_OCR_URL:
-        return _run_remote_ocr_pipeline(original, include_boxed_image)
+        return _run_remote_ocr_pipeline(
+            original, include_boxed_image, return_confidence=return_confidence
+        )
 
     if os.getenv("SURYA_RAW_DETECT") == "1":
         det_img = original.convert("RGB")
@@ -652,6 +666,7 @@ def run_ocr_pipeline(
     full_text = "\n".join(clean_lines).strip()
 
     confidences = [c for t, c in line_results if t and t.strip()]
+    page_confidence = min(confidences) if confidences else None
     if confidences:
         low = sum(1 for c in confidences if c < 0.5)
         print(
@@ -660,16 +675,26 @@ def run_ocr_pipeline(
             f"({low}/{len(confidences)} line(s) below 0.50)"
         )
 
+    if return_confidence:
+        return full_text, boxes_sorted, boxed, low_confidence, page_confidence
     return full_text, boxes_sorted, boxed, low_confidence
 
 
 def _run_remote_ocr_pipeline(
     original: Image.Image,
     include_boxed_image: bool = True,
-) -> tuple[str, list[tuple[int, int, int, int]], Image.Image, bool]:
+    return_confidence: bool = False,
+):
     """Send the image to the remote OCR server and adapt its response
     to the same (full_text, boxes, boxed_image, low_confidence) shape as
-    the local pipeline."""
+    the local pipeline.
+
+    The numeric "confidence" field was added to the server after the
+    low_confidence flag, and the GPU host runs a manually uploaded copy of
+    vast_ocr_server.py — so an older host simply omits it. That is reported
+    as None rather than guessed at, and callers must treat None as "unknown",
+    never as "low".
+    """
     buf = io.BytesIO()
     original.convert("RGB").save(buf, format="PNG")
     buf.seek(0)
@@ -694,4 +719,15 @@ def _run_remote_ocr_pipeline(
         # the real annotated image, and it always passes True.
         boxed = original
 
-    return data.get("text", ""), boxes, boxed, bool(data.get("low_confidence", False))
+    low_conf = bool(data.get("low_confidence", False))
+    if return_confidence:
+        raw = data.get("confidence")
+        confidence = float(raw) if isinstance(raw, (int, float)) else None
+        if confidence is None:
+            print(
+                "[OCR confidence] remote server did not return a numeric "
+                "confidence — treating as unknown (re-upload vast_ocr_server.py "
+                "to the GPU host to enable it)"
+            )
+        return data.get("text", ""), boxes, boxed, low_conf, confidence
+    return data.get("text", ""), boxes, boxed, low_conf

@@ -18,15 +18,6 @@
       "port": 8000
     },
     {
-      "name": "frontend-against-test-backend",
-      "runtimeExecutable": "cmd",
-      "runtimeArgs": [
-        "/c",
-        "set VITE_API_BASE=http://127.0.0.1:8011&& npm run dev --prefix C:\\Users\\ASUS\\OneDrive\\Desktop\\Files\\John\\GrAID-Repo\\frontend -- --port 5199"
-      ],
-      "port": 5199
-    },
-    {
       "name": "frontend-dev",
       "runtimeExecutable": "npm",
       "runtimeArgs": ["run", "dev", "--prefix", "C:\\Users\\ASUS\\OneDrive\\Desktop\\Files\\John\\GrAID-Repo\\frontend"],

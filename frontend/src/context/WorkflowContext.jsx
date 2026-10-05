@@ -6,6 +6,7 @@ import { createContext, useContext, useState, useCallback } from 'react'
 const WorkflowContext = createContext(null)
 
 export function WorkflowProvider({ children }) {
+  const [activeTab, setActiveTab] = useState('classes')
   const [selectedClass, setSelectedClassState] = useState(null)
   const [selectedExam, setSelectedExamState] = useState(null)
   const [selectedSubmission, setSelectedSubmissionState] = useState(null)
@@ -55,6 +56,7 @@ export function WorkflowProvider({ children }) {
 
   return (
     <WorkflowContext.Provider value={{
+      activeTab, setActiveTab,
       selectedClass, selectClass,
       selectedExam, selectExam, updateSelectedExam,
       selectedSubmission, selectSubmission, updateSelectedSubmission,

@@ -179,13 +179,21 @@ def _drop_top_edge_sliver(
 
 def run_essay_ocr(
     crop: Image.Image,
-) -> tuple[str, list[tuple[int, int, int, int]], bool]:
+    return_confidence: bool = False,
+):
     """
     OCR one essay crop at each scale in ESSAY_OCR_SCALES, returning the pass
     with the most unique content as (text, boxes, low_confidence). Boxes are
     always in the original crop's coordinates.
+
+    With return_confidence=True a 4th element is appended: the winning pass's
+    lowest line confidence (or None when the OCR server is too old to report
+    it). Additive for the same reason as run_ocr_pipeline's own flag — the
+    existing 3-tuple callers are left untouched. The confidence returned is
+    the one belonging to the pass that actually produced the text, not the
+    best across passes, so it describes the transcription being graded.
     """
-    best: tuple[int, str, list, bool] | None = None
+    best: tuple[int, str, list, bool, float | None] | None = None
     for factor in ESSAY_OCR_SCALES:
         if factor == 1.0:
             image = crop
@@ -194,7 +202,9 @@ def run_essay_ocr(
                 (max(1, int(crop.width * factor)), max(1, int(crop.height * factor))),
                 Image.LANCZOS,
             )
-        text, boxes, _, low_conf = ocr_pipeline.run_ocr_pipeline(image, include_boxed_image=False)
+        text, boxes, _, low_conf, conf = ocr_pipeline.run_ocr_pipeline(
+            image, include_boxed_image=False, return_confidence=True
+        )
         if factor != 1.0:
             boxes = [tuple(int(v / factor) for v in box) for box in boxes]
         text, boxes = _drop_blank_boxes(crop, text, boxes)
@@ -205,11 +215,14 @@ def run_essay_ocr(
             factor, len(boxes), len(text), score,
         )
         if best is None or score > best[0]:
-            best = (score, text, boxes, low_conf)
+            best = (score, text, boxes, low_conf, conf)
 
     assert best is not None
-    _, text, boxes, low_conf = best
+    _, text, boxes, low_conf, conf = best
     # Hand the grader prose, not one fragment per written line — see
     # text_normalize.join_wrapped_lines for why this matters to the
     # Organization and Writing Mechanics criteria.
-    return join_wrapped_lines(text, boxes), boxes, low_conf
+    joined = join_wrapped_lines(text, boxes)
+    if return_confidence:
+        return joined, boxes, low_conf, conf
+    return joined, boxes, low_conf

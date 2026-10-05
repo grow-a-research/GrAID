@@ -99,6 +99,7 @@ export const api = {
     duplicate: (examId) => req('POST', `${V1}/exams/${examId}/duplicate`),
     gradesCsvUrl: (examId) => `${V1}/exams/${examId}/grades/csv`,
     flagStats: (examId) => req('GET', `${V1}/exams/${examId}/flagstats`),
+    flags: (examId) => req('GET', `${V1}/exams/${examId}/flags`),
     rubrics: {
       import: (examId, file) => upload(`${V1}/exams/${examId}/rubrics/import`, file),
       clear: (examId) => req('DELETE', `${V1}/exams/${examId}/rubrics`),

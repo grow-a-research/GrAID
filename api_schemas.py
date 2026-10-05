@@ -207,6 +207,11 @@ class SubmissionAnswerRead(BaseModel):
     ai_spread: float | None = None
     # Phase 21 — Laplacian variance of the answer crop (OCR scan clarity proxy)
     ocr_clarity: float | None
+    # Qwen's lowest line confidence for this transcription (0–1). None on
+    # MCQ/TF, and on answers OCR'd before the field existed — None is
+    # "unknown", not "low". Pairs with groq_confidence to form the combined
+    # confidence the review flag uses (see answer_confidence.py).
+    ocr_confidence: float | None = None
     # Computed: teacher_score takes priority over ai_score
     @property
     def final_score(self) -> float | None:
@@ -350,6 +355,29 @@ class FlagReview(BaseModel):
 class FlagCreate(BaseModel):
     """Body for manually flagging an answer."""
     flag_reason: str = "manual"
+
+
+class FlagLogWithContext(BaseModel):
+    """A flag row enriched with student/question context, for the exam-wide flagged-answers list."""
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    submission_answer_id: int
+    submission_id: int
+    student_name: str
+    student_id: str          # external school ID
+    question_order_index: int | None
+    question_prompt: str | None
+    question_type: str | None
+    ai_score: float | None
+    teacher_score: float | None
+    flag_reason: str
+    auto_flagged: bool
+    auto_flagged_at: datetime
+    reviewed_by: str | None
+    review_decision: str | None
+    reviewed_at: datetime | None
+    created_at: datetime
 
 
 class FlagStats(BaseModel):

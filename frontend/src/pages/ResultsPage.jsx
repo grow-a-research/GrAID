@@ -2,12 +2,31 @@ import { useEffect, useState } from 'react'
 import { api } from '../api'
 import { tw, ErrorBox, Empty } from '../ui'
 import { useWorkflow } from '../context/WorkflowContext'
+import { REASON_LABELS, DECISION_COLOR } from '../flagLabels'
 
 const PAPER_TABS = [
   { id: 'aligned',  label: 'Aligned scan',   hint: 'perspective-corrected' },
   { id: 'original', label: 'Original scan',  hint: 'as uploaded' },
   { id: 'pdf',      label: 'Student PDF',    hint: 'generated paper' },
 ]
+
+// Mirrors answer_confidence.py — the two stage thresholds the review flag uses.
+// Kept in sync by hand; both sides read the same defaults the backend ships
+// with (OCR_MIN_LINE_CONFIDENCE / GROQ_MIN_CONFIDENCE). Display only: the flag
+// itself is always decided server-side.
+const OCR_CONF_MIN  = 0.15
+const GROQ_CONF_MIN = 0.40
+
+// combined = min(each confidence divided by its OWN threshold). Dividing first
+// is what makes the minimum valid — the two raw numbers are on different
+// scales, so a perfectly normal OCR reading of 0.30 would otherwise swamp a
+// grading confidence of 0.90. Returns null when neither stage reported one.
+function combinedConfidenceOf(ocrConf, groqConf) {
+  const margins = []
+  if (ocrConf != null) margins.push(ocrConf / OCR_CONF_MIN)
+  if (groqConf != null) margins.push(groqConf / GROQ_CONF_MIN)
+  return margins.length ? Math.min(...margins) : null
+}
 
 // Scan previews can be multi-MB and slow over a constrained connection (e.g. the
 // Cloudflare tunnel used for remote demos) — without this, a slow-loading <img>
@@ -166,12 +185,6 @@ function ScoreBar({ score, max, color = 'emerald' }) {
 function FlagBadge({ flag, answerId, submissionId, onFlagChange }) {
   const [busy, setBusy] = useState(false)
 
-  const decisionColor = {
-    confirmed_error: 'border-red-700 bg-red-950/40 text-red-300',
-    false_positive:  'border-zinc-700 bg-zinc-800/40 text-zinc-400',
-    verified:        'border-emerald-800 bg-emerald-950/30 text-emerald-400',
-  }
-
   async function act(decision) {
     setBusy(true)
     try {
@@ -210,22 +223,13 @@ function FlagBadge({ flag, answerId, submissionId, onFlagChange }) {
     )
   }
 
-  const reasonLabel = {
-    essay_score_zero:       'Zero score',
-    essay_low_confidence:   'Low AI confidence',
-    omr_low_confidence:     'Low OMR confidence',
-    omr_no_detection:       'No bubble detected',
-    identification_no_match:'No match',
-    identification_ocr_unreadable:'Unreadable OCR',
-    manual:                 'Manual flag',
-    verified:               'Verified',
-  }[flag.flag_reason] ?? flag.flag_reason
+  const reasonLabel = REASON_LABELS[flag.flag_reason] ?? flag.flag_reason
 
   return (
     <div className={`mt-2 pt-2 border-t border-zinc-800 flex flex-col gap-1.5`}>
       <div className="flex items-center gap-2 flex-wrap">
         <span className={`text-xs rounded border px-1.5 py-0.5 ${
-          flag.review_decision ? decisionColor[flag.review_decision] : 'border-amber-700 bg-amber-950/40 text-amber-300'
+          flag.review_decision ? DECISION_COLOR[flag.review_decision] : 'border-amber-700 bg-amber-950/40 text-amber-300'
         }`}>
           {flag.review_decision ? {
             confirmed_error: '✗ Confirmed error',
@@ -307,47 +311,6 @@ function parseCriteriaFeedback(feedback) {
   return rows.length > 0 ? rows : null
 }
 
-const BAND_ORDER = ['Poor', 'Fair', 'Good', 'Excellent']
-const BAND_STYLE = {
-  Poor:      'bg-red-900/40 border-red-700 text-red-300',
-  Fair:      'bg-amber-900/40 border-amber-700 text-amber-300',
-  Good:      'bg-sky-900/40 border-sky-700 text-sky-300',
-  Excellent: 'bg-emerald-900/40 border-emerald-700 text-emerald-300',
-}
-
-// Suggested band from the ordinal classification model. Display only — the
-// model is experimental on live essays, so it never auto-flags. A "close call"
-// note appears when the top two bands are within 10 percentage points.
-function SuggestedBand({ band, probsJson }) {
-  let probs = {}
-  try { probs = probsJson ? JSON.parse(probsJson) : {} } catch { probs = {} }
-  const ranked = BAND_ORDER.filter(b => probs[b] != null).sort((a, b) => probs[b] - probs[a])
-  const closeCall = ranked.length >= 2 && probs[ranked[0]] - probs[ranked[1]] < 0.10
-  return (
-    <div className="mb-3">
-      <div className="flex items-center gap-2 flex-wrap">
-        <span className="text-xs text-zinc-500">Suggested band</span>
-        <span className={`text-xs rounded border px-1.5 py-0.5 font-medium ${BAND_STYLE[band] ?? 'border-zinc-700 text-zinc-300'}`}>
-          {band}{probs[band] != null && ` · ${Math.round(probs[band] * 100)}%`}
-        </span>
-        {closeCall && (
-          <span className="text-xs text-amber-400">close call with {ranked[1]} ({Math.round(probs[ranked[1]] * 100)}%)</span>
-        )}
-        <span className="text-[10px] uppercase tracking-wide text-zinc-600">experimental</span>
-      </div>
-      {ranked.length > 0 && (
-        <div className="flex gap-3 mt-1">
-          {BAND_ORDER.map(b => (
-            <span key={b} className={`text-[11px] font-mono tabular-nums ${b === band ? 'text-zinc-300' : 'text-zinc-600'}`}>
-              {b} {Math.round((probs[b] ?? 0) * 100)}%
-            </span>
-          ))}
-        </div>
-      )}
-    </div>
-  )
-}
-
 function AnswerCard({ answer, question, flag, onOverrideSaved, onFlagChange }) {
   const [scoreInput, setScoreInput] = useState(
     answer.teacher_score != null ? String(answer.teacher_score) : ''
@@ -382,6 +345,8 @@ function AnswerCard({ answer, question, flag, onOverrideSaved, onFlagChange }) {
   try { rubricCriteria = question?.rubric_criteria_json ? JSON.parse(question.rubric_criteria_json) : [] } catch {}
 
   const idResult = qtype === 'identification' ? parseIdentificationResult(answer.ai_feedback) : null
+
+  const combinedConfidence = combinedConfidenceOf(answer.ocr_confidence, answer.groq_confidence)
 
   async function saveOverride(e) {
     e.preventDefault()
@@ -572,8 +537,62 @@ function AnswerCard({ answer, question, flag, onOverrideSaved, onFlagChange }) {
           )}
         </div>
       )}
-      {/* Suggested band from the ordinal classification model (essay, structured rubric only) */}
-      {answer.ai_band && <SuggestedBand band={answer.ai_band} probsJson={answer.ai_band_probs_json} />}
+
+      {/* OCR (transcription) confidence — essay / identification.
+          Deliberately NOT rendered as a percentage: this is Qwen's lowest
+          per-token probability, where genuine handwriting sits around
+          0.28–0.60 and the review threshold is 0.15. Showing "30%" next to a
+          grading confidence of "90%" invites reading the transcription as
+          poor when it is entirely normal, so the bar is scaled against the
+          threshold instead and the raw value is shown as a number. */}
+      {answer.ocr_confidence != null && (
+        <div className="flex items-center gap-2 mb-3">
+          <span className="text-xs text-zinc-500">OCR confidence</span>
+          <div className="flex-1 max-w-[120px] h-1.5 rounded-full bg-zinc-800 relative">
+            <div
+              className={`h-1.5 rounded-full transition-all ${
+                answer.ocr_confidence < OCR_CONF_MIN ? 'bg-red-500' :
+                answer.ocr_confidence < OCR_CONF_MIN * 2 ? 'bg-amber-500' : 'bg-emerald-500'
+              }`}
+              style={{
+                // Full bar at 3x the threshold; the marker below sits at 1x.
+                width: `${Math.min(100, (answer.ocr_confidence / (OCR_CONF_MIN * 3)) * 100)}%`,
+              }}
+            />
+            {/* Threshold marker so the number has a visible reference point */}
+            <div className="absolute top-[-2px] h-[10px] w-px bg-zinc-500" style={{ left: '33.33%' }} />
+          </div>
+          <span className={`text-xs font-mono tabular-nums ${
+            answer.ocr_confidence < OCR_CONF_MIN ? 'text-red-400' :
+            answer.ocr_confidence < OCR_CONF_MIN * 2 ? 'text-amber-400' : 'text-emerald-400'
+          }`}>
+            {answer.ocr_confidence.toFixed(2)}
+          </span>
+          <span className="text-[10px] text-zinc-600">min {OCR_CONF_MIN}</span>
+          {answer.ocr_confidence < OCR_CONF_MIN && (
+            <span className="text-xs rounded bg-amber-900/50 border border-amber-700 text-amber-300 px-1.5 py-0.5">
+              low confidence
+            </span>
+          )}
+        </div>
+      )}
+
+      {/* Combined confidence — the actual input to the review flag. Only
+          meaningful when both stages reported a number (essays). */}
+      {answer.ocr_confidence != null && answer.groq_confidence != null && (
+        <div className="flex items-center gap-2 mb-3">
+          <span className="text-xs text-zinc-500">Combined</span>
+          <span className={`text-xs font-mono tabular-nums ${
+            combinedConfidence < 1 ? 'text-red-400' :
+            combinedConfidence < 1.5 ? 'text-amber-400' : 'text-emerald-400'
+          }`}>
+            {combinedConfidence.toFixed(2)}×
+          </span>
+          <span className="text-[10px] text-zinc-600">
+            weakest stage vs its own threshold — below 1.00× goes to review
+          </span>
+        </div>
+      )}
 
       {/* No-detection badge: OMR ran but detected nothing */}
       {answer.omr_confidence == null && (qtype === 'mcq' || qtype === 'tf') && answer.status === 'needs_review' && (

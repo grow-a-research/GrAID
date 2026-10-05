@@ -86,7 +86,17 @@ async def ocr(file: UploadFile = File(...), include_boxed_image: bool = True) ->
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid image: {e}") from e
 
-    full_text, boxes, boxed, low_confidence = ocr_pipeline.run_ocr_pipeline(original)
+    # return_confidence is passed positionally-by-keyword so this still works
+    # against an ocr_pipeline.py copy that predates the parameter: if the
+    # upload of the two files ever drifts, the TypeError is caught and the
+    # response simply omits "confidence", which the client treats as unknown.
+    try:
+        full_text, boxes, boxed, low_confidence, confidence = ocr_pipeline.run_ocr_pipeline(
+            original, return_confidence=True
+        )
+    except TypeError:
+        full_text, boxes, boxed, low_confidence = ocr_pipeline.run_ocr_pipeline(original)
+        confidence = None
     # Every grading call site discards the annotated debug image — only the
     # OCR Tool page actually displays it. Skipping the PNG encode + base64
     # (which inflates size ~33%) saves real time on both ends of the wire
@@ -97,6 +107,7 @@ async def ocr(file: UploadFile = File(...), include_boxed_image: bool = True) ->
         "boxes": [list(b) for b in boxes],
         "boxed_image_png_base64": boxed_b64,
         "low_confidence": low_confidence,
+        "confidence": confidence,
     })
     # Everything from receiving the upload to building the response — compare
     # this against the local machine's round-trip time for the same request

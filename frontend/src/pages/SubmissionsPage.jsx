@@ -59,6 +59,8 @@ export default function SubmissionsPage() {
   const [camOpen,     setCamOpen]     = useState(false) // viewfinder active
   const [camErr,      setCamErr]      = useState('')
   const [captured,    setCaptured]    = useState(null)  // blob URL preview
+  const [torchOn,     setTorchOn]     = useState(false) // flash currently lit
+  const [torchSupported, setTorchSupported] = useState(false)
   const hasCamera = typeof navigator !== 'undefined' && !!navigator.mediaDevices?.getUserMedia
 
   // process (OCR + grade)
@@ -131,8 +133,7 @@ export default function SubmissionsPage() {
   // switched to next, looking like the same scan had "leaked" onto other students.
   useEffect(() => {
     setUploadErr(''); setProcessErr('')
-    streamRef.current?.getTracks().forEach(t => t.stop())
-    streamRef.current = null
+    stopStream()
     setUploadFile(null); setCaptured(null)
     setCamOpen(false); setCamVisible(false); setCamErr('')
     if (!selectedSub) return
@@ -346,6 +347,25 @@ export default function SubmissionsPage() {
   }
 
   // ── Camera helpers ────────────────────────────────────────────────────────
+  // Every stop site goes through here so the torch is always switched off with
+  // the stream: on some Android devices the LED stays lit when the track is
+  // stopped while torch is still applied.
+  function stopStream() {
+    const track = streamRef.current?.getVideoTracks()[0]
+    if (track) {
+      // Best-effort only: the track may already be ending, in which case both
+      // the call and its promise can reject. Nothing to recover from either way.
+      try {
+        track.applyConstraints({ advanced: [{ torch: false }] })?.catch(() => {})
+      } catch {
+        // ignored
+      }
+    }
+    streamRef.current?.getTracks().forEach(t => t.stop())
+    streamRef.current = null
+    setTorchOn(false); setTorchSupported(false)
+  }
+
   function toggleCamera() {
     if (camVisible) {
       closeCamera()
@@ -363,8 +383,14 @@ export default function SubmissionsPage() {
       })
       streamRef.current = stream
       setCamOpen(true)
+      setTorchOn(false)
       setTimeout(() => {
         if (videoRef.current) videoRef.current.srcObject = stream
+        // Torch capability is usually not reported until the track is live, so
+        // probe here rather than straight after getUserMedia. It is absent on
+        // desktop and on iOS Safari, where the button simply never renders.
+        const caps = stream.getVideoTracks()[0]?.getCapabilities?.() ?? {}
+        setTorchSupported(!!caps.torch)
       }, 50)
     } catch (e) {
       setCamErr(`Camera error: ${e.message}. Try uploading a file instead.`)
@@ -372,9 +398,24 @@ export default function SubmissionsPage() {
   }
 
   function closeCamera() {
-    streamRef.current?.getTracks().forEach(t => t.stop())
-    streamRef.current = null
+    stopStream()
     setCamOpen(false); setCaptured(null); setCamErr('')
+  }
+
+  async function toggleTorch() {
+    const track = streamRef.current?.getVideoTracks()[0]
+    if (!track) return
+    const next = !torchOn
+    try {
+      await track.applyConstraints({ advanced: [{ torch: next }] })
+      setTorchOn(next)
+    } catch (e) {
+      // Some devices advertise torch but reject the constraint (commonly when
+      // another app holds the camera). Hide the control rather than leave a
+      // button that silently does nothing.
+      setCamErr(`Could not toggle flash: ${e.message}`)
+      setTorchSupported(false)
+    }
   }
 
   function capturePhoto() {
@@ -389,8 +430,7 @@ export default function SubmissionsPage() {
       setUploadFile(file)
       setCaptured(URL.createObjectURL(blob))
       // stop camera after capture
-      streamRef.current?.getTracks().forEach(t => t.stop())
-      streamRef.current = null
+      stopStream()
       setCamOpen(false)
     }, 'image/jpeg', 0.95)
   }
@@ -745,6 +785,14 @@ export default function SubmissionsPage() {
                         <button className={tw.btnPrimary} type="button" onClick={capturePhoto}>
                           Capture
                         </button>
+                        {torchSupported && (
+                          <button type="button" onClick={toggleTorch} aria-pressed={torchOn}
+                            className={torchOn
+                              ? 'rounded-lg border border-amber-400/60 bg-amber-400/15 px-4 py-2 text-sm text-amber-200 hover:bg-amber-400/25 transition'
+                              : tw.btnGhost}>
+                            {torchOn ? 'Flash on' : 'Flash off'}
+                          </button>
+                        )}
                         <button className={tw.btnGhost} type="button" onClick={closeCamera}>
                           Cancel
                         </button>
