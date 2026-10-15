@@ -2,6 +2,8 @@ import { useEffect, useState } from 'react'
 import { api } from '../api'
 import { tw, ErrorBox, Empty } from '../ui'
 import { useWorkflow } from '../context/WorkflowContext'
+import ClassPicker from '../components/ClassPicker'
+import ReleaseResultsCard from '../components/ReleaseResultsCard'
 import { REASON_LABELS, DECISION_COLOR } from '../flagLabels'
 
 const PAPER_TABS = [
@@ -147,13 +149,14 @@ function ProcessedPaperPanel({ submissionId, answers, hasPaper }) {
                   className="w-full rounded border border-zinc-800 bg-zinc-950"
                   style={{ height: '70vh' }}
                 />
-                <a
-                  href={api.submissions.paperUrl(submissionId)}
-                  download
+                <button
+                  type="button"
+                  onClick={() => api.download(api.submissions.paperUrl(submissionId), `paper_${submissionId}.pdf`)
+                    .catch(err => alert(`Download failed: ${err.message}`))}
                   className={`${tw.btnSm} self-start text-center`}
                 >
                   Download PDF
-                </a>
+                </button>
               </div>
             )
             : (
@@ -347,6 +350,22 @@ function AnswerCard({ answer, question, flag, onOverrideSaved, onFlagChange }) {
   const idResult = qtype === 'identification' ? parseIdentificationResult(answer.ai_feedback) : null
 
   const combinedConfidence = combinedConfidenceOf(answer.ocr_confidence, answer.groq_confidence)
+
+  // Waiting on the teacher: needs_review status and/or an unreviewed flag, not yet scored.
+  const needsAttention =
+    answer.teacher_score == null &&
+    (answer.status === 'needs_review' || (flag != null && !flag.review_decision))
+  const [reviewBusy, setReviewBusy] = useState(false)
+  async function setReviewed(on) {
+    setReviewBusy(true)
+    try {
+      const updated = on
+        ? await api.submissions.markReviewed(answer.submission_id, answer.id)
+        : await api.submissions.unmarkReviewed(answer.submission_id, answer.id)
+      onOverrideSaved(updated)
+    } catch (err) { alert(`Could not update: ${err.message}`) }
+    setReviewBusy(false)
+  }
 
   async function saveOverride(e) {
     e.preventDefault()
@@ -873,6 +892,24 @@ function AnswerCard({ answer, question, flag, onOverrideSaved, onFlagChange }) {
         )}
       </form>
 
+      {/* Review marker: shown while the answer still needs the teacher's attention */}
+      {answer.reviewed_at
+        ? (
+          <div className="mt-3 flex items-center justify-between gap-2 rounded-lg border border-emerald-900/50 bg-emerald-950/20 px-3 py-2 text-xs text-emerald-300">
+            <span>✓ Marked as reviewed</span>
+            <button type="button" className="text-zinc-400 underline underline-offset-2 hover:text-zinc-200"
+              onClick={() => setReviewed(false)} disabled={reviewBusy}>Undo</button>
+          </div>
+        )
+        : needsAttention && (
+          <div className="mt-3 flex items-center justify-between gap-2 rounded-lg border border-amber-700/40 bg-amber-950/20 px-3 py-2 text-xs text-amber-200">
+            <span>This answer is waiting for your review.</span>
+            <button type="button" className={tw.btnSm} onClick={() => setReviewed(true)} disabled={reviewBusy}>
+              {reviewBusy ? 'Saving…' : 'Mark reviewed'}
+            </button>
+          </div>
+        )}
+
       {/* Flag controls */}
       <FlagBadge
         flag={flag}
@@ -887,7 +924,8 @@ function AnswerCard({ answer, question, flag, onOverrideSaved, onFlagChange }) {
 export default function ResultsPage() {
   const {
     selectedClass, selectClass,
-    selectedExam, selectExam: pickExam,
+    selectedExam, selectExam: pickExam, updateSelectedExam,
+    focusAnswerId, setFocusAnswerId,
     selectedSubmission: selectedSub, selectSubmission: pickSub, updateSelectedSubmission: setSelectedSub,
   } = useWorkflow()
   const [classes, setClasses]           = useState([])
@@ -897,6 +935,9 @@ export default function ResultsPage() {
   const [questions, setQuestions]       = useState([])
   const [flags, setFlags]               = useState({})   // answerId → FlagLog | null
   const [flagStats, setFlagStats]       = useState(null)
+  const [examQuery, setExamQuery]       = useState('')
+  const [subQuery, setSubQuery]         = useState('')
+  const [flashAnswerId, setFlashAnswerId] = useState(null)
   const [grading, setGrading]           = useState(false)
   const [gradeErr, setGradeErr]         = useState('')
 
@@ -905,13 +946,29 @@ export default function ResultsPage() {
   // Re-loads the exam list whenever the shared selected class changes (including
   // arriving here with a class already picked from Exams/Submissions).
   useEffect(() => {
-    api.exams.list(selectedClass?.id).then(setExams).catch(() => setExams([]))
+    setExamQuery('')
+    if (!selectedClass) { setExams([]); return }
+    api.exams.list(selectedClass.id).then(setExams).catch(() => setExams([]))
   }, [selectedClass?.id])
+
+  // Arriving with an exam already picked on another tab: show its class too.
+  useEffect(() => {
+    if (selectedExam && !selectedClass && classes.length > 0) {
+      const cls = classes.find(c => c.id === selectedExam.class_id)
+      if (cls) selectClass(cls)
+    }
+  }, [classes, selectedExam?.id])
+
+  function changeClass(cls) {
+    if (!cls) pickExam(null)   // clearing the class also closes the exam
+    selectClass(cls)
+  }
 
   // Loads exam-level data (submission list, questions, flag stats) whenever the shared
   // selected exam changes — covers both an explicit pick here and arriving with an exam
   // already selected from Exams/Submissions.
   useEffect(() => {
+    setSubQuery('')
     if (!selectedExam) { setSubmissions([]); setQuestions([]); setFlagStats(null); return }
     api.exams.submissions(selectedExam.id).then(setSubmissions).catch(() => setSubmissions([]))
     api.exams.questions.list(selectedExam.id).then(setQuestions).catch(() => setQuestions([]))
@@ -933,6 +990,19 @@ export default function ResultsPage() {
       setFlags(flagMap)
     }).catch(() => { setAnswers([]); setFlags({}) })
   }, [selectedSub?.id])
+
+  // Arriving from the review queue: scroll to the answer and highlight it briefly.
+  useEffect(() => {
+    if (focusAnswerId == null || answers.length === 0) return
+    const target = answers.find(a => a.id === focusAnswerId)
+    if (!target) return
+    const el = document.getElementById(`answer-${focusAnswerId}`)
+    if (el) el.scrollIntoView({ behavior: 'smooth', block: 'center' })
+    setFlashAnswerId(focusAnswerId)
+    setFocusAnswerId(null)
+    const t = setTimeout(() => setFlashAnswerId(null), 2500)
+    return () => clearTimeout(t)
+  }, [focusAnswerId, answers])
 
   function handleFlagChange(answerId, updatedFlag) {
     setFlags(prev => ({ ...prev, [answerId]: updatedFlag }))
@@ -977,68 +1047,108 @@ export default function ResultsPage() {
   const hasAnyGrading = answers.some(a => a.ai_score != null)
   const hasOverrides  = answers.some(a => a.teacher_score != null)
 
+  const examQ = examQuery.trim().toLowerCase()
+  const filteredExams = examQ
+    ? exams.filter(ex => ex.title.toLowerCase().includes(examQ) || ex.exam_code.toLowerCase().includes(examQ))
+    : exams
+  const subQ = subQuery.trim().toLowerCase()
+  const filteredSubs = subQ
+    ? submissions.filter(s => s.student_name.toLowerCase().includes(subQ) || s.student_id.toLowerCase().includes(subQ))
+    : submissions
+
   return (
     <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">
       {/* Left panel — exam + submission selector */}
       <div className="flex flex-col gap-4">
         <h2 className={tw.heading}>Results</h2>
 
-        {/* Class filter — scopes the exam list below */}
-        <select className={tw.select} value={selectedClass?.id ?? ''}
-          onChange={e => {
-            const cls = classes.find(c => c.id === parseInt(e.target.value)) ?? null
-            selectClass(cls)
-          }}>
-          <option value="">All classes</option>
-          {classes.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
-        </select>
+        {/* One class selector scopes everything below it */}
+        <ClassPicker classes={classes} value={selectedClass} onChange={changeClass} />
 
+        {!selectedClass
+          ? <div className="flex h-28 items-center justify-center rounded-xl border border-dashed border-zinc-700 px-4 text-center">
+              <span className={tw.muted}>Select a class to see its exams and results.</span>
+            </div>
+          : <>
         <div className="flex flex-col gap-2">
-          <div className={tw.label}>Select exam{selectedClass ? ` — ${selectedClass.name}` : ''}</div>
-          {exams.length === 0
-            ? <Empty text="No exams in this class yet." />
-            : exams.map(ex => (
-              <button key={ex.id} type="button"
-                className={selectedExam?.id === ex.id ? tw.rowActive : tw.row}
-                onClick={() => pickExam(ex)}>
-                <div className="text-sm text-zinc-100">{ex.title}</div>
-                <span className="text-xs text-zinc-500">{ex.exam_code}</span>
-              </button>
-            ))
-          }
+          <div className={tw.label}>Exams in {selectedClass.name} ({exams.length})</div>
+          {exams.length > 0 && (
+            <input className={tw.input} placeholder="Search exams by title or code…"
+              value={examQuery} onChange={e => setExamQuery(e.target.value)} />
+          )}
+          <div className="flex max-h-56 flex-col gap-2 overflow-y-auto pr-1">
+            {exams.length === 0
+              ? <Empty text="No exams in this class yet." />
+              : filteredExams.length === 0
+                ? <div className="py-2 text-xs text-zinc-500">No matching exams.</div>
+                : filteredExams.map(ex => (
+                  <button key={ex.id} type="button"
+                    className={selectedExam?.id === ex.id ? tw.rowActive : tw.row}
+                    onClick={() => pickExam(ex)}>
+                    <div className="text-sm text-zinc-100">{ex.title}</div>
+                    <span className="text-xs text-zinc-500">{ex.exam_code}</span>
+                  </button>
+                ))
+            }
+          </div>
+          {!selectedExam && exams.length > 0 && (
+            <div className="text-xs text-zinc-500">Select an exam to view its results.</div>
+          )}
         </div>
 
         {selectedExam && (
           <button className={tw.btnSm}
             onClick={() => {
-              const a = document.createElement('a')
-              a.href = api.exams.gradesCsvUrl(selectedExam.id)
-              a.download = `grades_${selectedExam.exam_code}.csv`
-              document.body.appendChild(a); a.click(); a.remove()
+              api.download(api.exams.gradesCsvUrl(selectedExam.id), `grades_${selectedExam.exam_code}.csv`)
+                .catch(err => alert(`Download failed: ${err.message}`))
             }}>
             Download grade sheet (CSV)
           </button>
         )}
 
         {selectedExam && (
+          <ReleaseResultsCard exam={selectedExam} submissions={submissions}
+            onChanged={ex => {
+              updateSelectedExam(prev => ({ ...prev, results_released_at: ex.results_released_at }))
+              setExams(prev => prev.map(e => e.id === ex.id ? { ...e, results_released_at: ex.results_released_at } : e))
+            }} />
+        )}
+
+        {selectedExam && (
           <div className="flex flex-col gap-2">
             <div className={tw.label}>Submissions ({submissions.length})</div>
-            {submissions.length === 0
-              ? <Empty text="No submissions yet." />
-              : submissions.map(s => (
-                <button key={s.id} type="button"
-                  className={selectedSub?.id === s.id ? tw.rowActive : tw.row}
-                  onClick={() => pickSub(s)}>
-                  <div>
-                    <div className="text-sm text-zinc-100">{s.student_name}</div>
-                    <div className={tw.muted}>{s.student_id}</div>
-                  </div>
-                  <span className={tw.badge(s.status)}>{s.status}</span>
-                </button>
-              ))
-            }
+            {submissions.length > 0 && (
+              <input className={tw.input} placeholder="Search submissions by student name or ID…"
+                value={subQuery} onChange={e => setSubQuery(e.target.value)} />
+            )}
+            <div className="flex max-h-80 flex-col gap-2 overflow-y-auto pr-1">
+              {submissions.length === 0
+                ? <Empty text="No submissions yet." />
+                : filteredSubs.length === 0
+                  ? <div className="py-2 text-xs text-zinc-500">No matching submissions.</div>
+                  : filteredSubs.map(s => (
+                    <button key={s.id} type="button"
+                      className={selectedSub?.id === s.id ? tw.rowActive : tw.row}
+                      onClick={() => pickSub(s)}>
+                      <div>
+                        <div className="text-sm text-zinc-100">{s.student_name}</div>
+                        <div className={tw.muted}>{s.student_id}</div>
+                      </div>
+                      <span className="flex items-center gap-1.5">
+                        {s.is_late && (
+                          <span className="rounded-full bg-red-500/15 px-1.5 py-0.5 text-[10px] font-medium text-red-300"
+                            title="Submitted after the deadline">late</span>
+                        )}
+                        <span className={tw.badge(s.status)}>{s.status}</span>
+                      </span>
+                    </button>
+                  ))
+              }
+            </div>
           </div>
         )}
+          </>
+        }
       </div>
 
       {/* Right panel — results detail */}
@@ -1119,14 +1229,16 @@ export default function ResultsPage() {
             {answers.length === 0
               ? <Empty text="No OCR results yet. Process the paper in the Submissions tab first." />
               : answers.map(ans => (
-                <AnswerCard
-                  key={ans.id}
-                  answer={ans}
-                  question={ans.question_id ? qMap[ans.question_id] : null}
-                  flag={flags[ans.id] ?? null}
-                  onOverrideSaved={handleOverrideSaved}
-                  onFlagChange={handleFlagChange}
-                />
+                <div key={ans.id} id={`answer-${ans.id}`}
+                  className={flashAnswerId === ans.id ? 'rounded-xl ring-2 ring-amber-400 transition' : 'transition'}>
+                  <AnswerCard
+                    answer={ans}
+                    question={ans.question_id ? qMap[ans.question_id] : null}
+                    flag={flags[ans.id] ?? null}
+                    onOverrideSaved={handleOverrideSaved}
+                    onFlagChange={handleFlagChange}
+                  />
+                </div>
               ))
             }
           </>

@@ -10,6 +10,10 @@ export function WorkflowProvider({ children }) {
   const [selectedClass, setSelectedClassState] = useState(null)
   const [selectedExam, setSelectedExamState] = useState(null)
   const [selectedSubmission, setSelectedSubmissionState] = useState(null)
+  // Review queue navigation: narrow the queue to one question (from Item Analysis),
+  // and which answer to scroll to when opening a submission from the queue.
+  const [reviewQuestionId, setReviewQuestionId] = useState(null)
+  const [focusAnswerId, setFocusAnswerId] = useState(null)
 
   // Picking a specific class that the current exam doesn't belong to drops the
   // exam/submission selection — otherwise the Submissions/Results panels would
@@ -31,6 +35,7 @@ export function WorkflowProvider({ children }) {
   const selectExam = useCallback((exam) => {
     setSelectedExamState(exam)
     setSelectedSubmissionState(null)
+    setReviewQuestionId(null)
   }, [])
 
   // Refresh the currently-selected exam's own data (e.g. after generating a template)
@@ -52,6 +57,8 @@ export function WorkflowProvider({ children }) {
     setSelectedClassState(null)
     setSelectedExamState(null)
     setSelectedSubmissionState(null)
+    setReviewQuestionId(null)
+    setFocusAnswerId(null)
   }, [])
 
   return (
@@ -60,6 +67,8 @@ export function WorkflowProvider({ children }) {
       selectedClass, selectClass,
       selectedExam, selectExam, updateSelectedExam,
       selectedSubmission, selectSubmission, updateSelectedSubmission,
+      reviewQuestionId, setReviewQuestionId,
+      focusAnswerId, setFocusAnswerId,
       clearWorkflow,
     }}>
       {children}

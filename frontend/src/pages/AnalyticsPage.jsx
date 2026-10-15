@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { api } from '../api'
 import { tw, Empty } from '../ui'
+import { useWorkflow } from '../context/WorkflowContext'
 
 // ── Mini score bar ─────────────────────────────────────────────────────────────
 function Bar({ value, max, color = 'emerald' }) {
@@ -25,6 +26,180 @@ function Chip({ label, value, sub }) {
       <div className="text-xs text-zinc-500">{label}</div>
       <div className="text-xl font-bold text-zinc-100 tabular-nums">{value ?? '—'}</div>
       {sub && <div className="text-xs text-zinc-500">{sub}</div>}
+    </div>
+  )
+}
+
+// ── Item analysis card ────────────────────────────────────────────────────────
+// Conventional difficulty bands on the proportion answering correctly.
+function difficultyLabel(pct) {
+  if (pct == null) return '—'
+  if (pct > 80) return 'Easy'
+  if (pct >= 30) return 'Moderate'
+  return 'Hard'
+}
+
+function csvCell(v) {
+  const s = v == null ? '' : String(v)
+  return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s
+}
+
+const OUTCOME_STYLE = {
+  correct:   'text-emerald-400',
+  incorrect: 'text-rose-400',
+  blank:     'text-amber-400',
+}
+
+function ItemCard({ examId, examCode, q, exam }) {
+  const { selectExam, setReviewQuestionId, setActiveTab } = useWorkflow()
+  const [open, setOpen] = useState(false)
+  const [rows, setRows] = useState(null)
+  const [error, setError] = useState('')
+
+  async function toggle() {
+    const next = !open
+    setOpen(next)
+    if (next && rows === null) {
+      try { setRows(await api.exams.itemResponses(examId, q.question_id)) }
+      catch { setError('Could not load the source responses.') }
+    }
+  }
+
+  function exportCsv() {
+    const header = ['student_id', 'response', 'score', 'score_source', 'outcome', 'status']
+    const lines = [header.join(',')].concat(
+      rows.map(r => [r.student_id, r.response, r.score, r.score_source, r.outcome, r.status]
+        .map(csvCell).join(','))
+    )
+    const url = URL.createObjectURL(new Blob([lines.join('\r\n')], { type: 'text/csv' }))
+    const a = document.createElement('a')
+    a.href = url
+    a.download = `${examCode}_Q${q.order_index}_responses.csv`
+    a.click()
+    URL.revokeObjectURL(url)
+  }
+
+  const n = q.answer_count
+  const correctKey = (q.correct_answer || '').trim().toUpperCase()
+  const isChoice = q.choice_counts != null
+
+  return (
+    <div className={tw.card}>
+      <div className="flex justify-between items-start gap-3 mb-2">
+        <div className="flex-1">
+          <div className="text-xs font-semibold text-zinc-400">
+            Q{q.order_index} · {q.question_type}
+          </div>
+          <div className="text-sm text-zinc-200">{q.prompt}</div>
+        </div>
+        <div className="text-right shrink-0">
+          <div className="text-base font-bold text-zinc-100 tabular-nums">
+            {q.correct_count}
+            <span className="text-xs font-normal text-zinc-500"> / {n} correct</span>
+          </div>
+          <div className="text-xs text-zinc-500">
+            {q.pct_correct != null ? `${q.pct_correct}%` : '—'} · {difficultyLabel(q.pct_correct)}
+          </div>
+        </div>
+      </div>
+
+      {q.pct_correct != null && <Bar value={q.pct_correct} max={100} />}
+
+      <div className="mt-2 text-xs text-zinc-500 flex flex-wrap gap-x-4 gap-y-1">
+        <span>Correct = {q.correct_basis}</span>
+        <span>
+          Incorrect {q.incorrect_count}
+          {q.blank_count > 0 && ` (incl. ${q.blank_count} blank)`}
+        </span>
+        <span>Avg {q.avg_score ?? '—'} / {q.max_points}</span>
+        <span title="Upper 27% vs lower 27% of students by exam total. Higher = separates strong from weak students.">
+          Discrimination {q.discrimination_index != null ? q.discrimination_index : `n/a — ${q.discrimination_note}`}
+        </span>
+      </div>
+
+      {isChoice && (
+        <div className="mt-2 flex flex-wrap gap-2 text-xs">
+          {Object.entries(q.choice_counts).map(([label, count]) => (
+            <span key={label}
+              className={`px-2 py-0.5 rounded border tabular-nums ${
+                label === correctKey
+                  ? 'border-emerald-700 text-emerald-300'
+                  : 'border-zinc-700 text-zinc-400'}`}>
+              {label} · {count}{label === correctKey && ' ✓'}
+            </span>
+          ))}
+        </div>
+      )}
+
+      {q.needs_review_count > 0 && (
+        <div className="mt-2 flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-amber-400">
+          <span>
+            {q.needs_review_count} answer{q.needs_review_count > 1 ? 's' : ''} still need
+            teacher review — these counts may change.
+          </span>
+          {exam && (
+            <button type="button" className="font-medium underline underline-offset-2 hover:text-amber-200"
+              onClick={() => {
+                // Open the Needs review page on this exam, narrowed to this question.
+                selectExam(exam)
+                setReviewQuestionId(q.question_id)
+                setActiveTab('review')
+              }}>
+              Review {q.needs_review_count > 1 ? 'these' : 'it'} →
+            </button>
+          )}
+        </div>
+      )}
+
+      <button type="button" className={`${tw.btnSm} mt-3`} onClick={toggle}>
+        {open ? 'Hide source responses' : 'Show source responses'}
+      </button>
+
+      {open && (
+        <div className="mt-3">
+          {error && <div className="text-xs text-rose-400">{error}</div>}
+          {rows === null && !error && <div className={tw.muted}>Loading…</div>}
+          {rows && rows.length === 0 && <div className={tw.muted}>No graded submissions yet.</div>}
+          {rows && rows.length > 0 && (
+            <>
+              <div className="flex justify-between items-center mb-2">
+                <div className="text-xs text-zinc-500">
+                  {rows.length} graded submission{rows.length > 1 ? 's' : ''}. Blank answers count as incorrect.
+                </div>
+                <button type="button" className={tw.btnSm} onClick={exportCsv}>Export CSV</button>
+              </div>
+              <div className="overflow-x-auto">
+                <table className="w-full text-xs text-left">
+                  <thead className="text-zinc-500">
+                    <tr>
+                      <th className="py-1 pr-3 font-medium">Student ID</th>
+                      <th className="py-1 pr-3 font-medium">Response</th>
+                      <th className="py-1 pr-3 font-medium">Score</th>
+                      <th className="py-1 pr-3 font-medium">Scored by</th>
+                      <th className="py-1 pr-3 font-medium">Outcome</th>
+                      <th className="py-1 font-medium">Status</th>
+                    </tr>
+                  </thead>
+                  <tbody className="text-zinc-300">
+                    {rows.map(r => (
+                      <tr key={r.submission_id} className="border-t border-zinc-800 align-top">
+                        <td className="py-1 pr-3 tabular-nums">{r.student_id}</td>
+                        <td className="py-1 pr-3 max-w-xs whitespace-pre-wrap break-words">
+                          {r.response?.trim() ? r.response : <span className="text-zinc-600">(blank)</span>}
+                        </td>
+                        <td className="py-1 pr-3 tabular-nums">{r.score ?? '—'} / {q.max_points}</td>
+                        <td className="py-1 pr-3">{r.score_source}</td>
+                        <td className={`py-1 pr-3 ${OUTCOME_STYLE[r.outcome] || ''}`}>{r.outcome}</td>
+                        <td className="py-1">{r.status ?? '—'}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </>
+          )}
+        </div>
+      )}
     </div>
   )
 }
@@ -309,32 +484,18 @@ function ExamBreakdown() {
               color={data.avg_pct >= 75 ? 'emerald' : data.avg_pct >= 60 ? 'amber' : 'violet'} />
           )}
 
-          <div className={tw.label}>Per-question averages</div>
-          {data.questions.length === 0
+          <div className={tw.label}>Item analysis</div>
+          <div className="text-xs text-zinc-500 -mt-2">
+            Computed over the {data.graded_count} graded submission{data.graded_count === 1 ? '' : 's'}
+            {data.submission_count > data.graded_count &&
+              ` (${data.submission_count - data.graded_count} not graded yet are excluded)`}.
+            Blank answers count as incorrect. Open any item to see the student responses it was computed from.
+          </div>
+          {data.questions.length === 0 || data.graded_count === 0
             ? <Empty text="No questions or no graded answers yet." />
             : data.questions.map(q => (
-              <div key={q.question_id} className={tw.card}>
-                <div className="flex justify-between items-start gap-3 mb-2">
-                  <div className="flex-1">
-                    <div className="text-xs font-semibold text-zinc-400">Q{q.order_index}</div>
-                    <div className="text-sm text-zinc-200">{q.prompt}</div>
-                  </div>
-                  <div className="text-right shrink-0">
-                    <div className="text-base font-bold text-zinc-100 tabular-nums">
-                      {q.avg_score ?? '—'}
-                      <span className="text-xs font-normal text-zinc-500"> / {q.max_points}</span>
-                    </div>
-                    {q.answer_count > 0 && (
-                      <div className="text-xs text-zinc-500">
-                        min {q.min_score} · max {q.max_score} · n={q.answer_count}
-                      </div>
-                    )}
-                  </div>
-                </div>
-                {q.avg_score != null && (
-                  <Bar value={q.avg_score} max={q.max_points} />
-                )}
-              </div>
+              <ItemCard key={q.question_id} examId={data.exam_id} examCode={data.exam_code} q={q}
+                exam={exams.find(e => e.id === data.exam_id)} />
             ))
           }
 

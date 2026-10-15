@@ -39,11 +39,15 @@ from api_schemas import (
     EnrollmentCreate,
     EnrollmentRead,
     ExamCreate,
+    ExamAutoGradeUpdate,
+    ExamDeadlineUpdate,
+    ExamReleaseUpdate,
     ExamQuestionCreate,
     ExamQuestionRead,
     ExamQuestionUpdate,
     ExamRead,
     ExamStats,
+    ItemResponseRow,
     FlagCreate,
     FlagLogRead,
     FlagLogWithContext,
@@ -65,12 +69,40 @@ from api_schemas import (
     SubmissionRead,
     SubmissionStats,
     SubmissionSummary,
+    ReviewQueueItem,
+    RosterEntry,
     TeacherOverride,
 )
+from auth import require_teacher
 from database import get_db
 from identification_scoring import looks_unreadable, parse_accepted_answers, score_identification
 
-router = APIRouter(prefix="/api/v1", tags=["platform"])
+# Everything on this router is teacher-only. Students use routers/student_portal.py.
+router = APIRouter(prefix="/api/v1", tags=["platform"], dependencies=[Depends(require_teacher)])
+
+
+def _owned_class(db: Session, teacher: m.Teacher, class_id: int) -> m.CourseClass:
+    """Fetch a class; 404 when it does not exist or belongs to another teacher."""
+    row = db.get(m.CourseClass, class_id)
+    if not row or row.teacher_id != teacher.id:
+        raise HTTPException(status_code=404, detail="Class not found")
+    return row
+
+
+def _naive_utc(dt: datetime | None) -> datetime | None:
+    """Store datetimes as naive UTC, whatever offset the client sent."""
+    if dt is None:
+        return None
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt
+
+
+def _owned_exam(db: Session, teacher: m.Teacher, exam_id: int) -> m.Exam:
+    row = db.get(m.Exam, exam_id)
+    if not row or not row.course_class or row.course_class.teacher_id != teacher.id:
+        raise HTTPException(status_code=404, detail="Exam not found")
+    return row
 
 DATA_ROOT = Path(__file__).resolve().parent.parent / "data" / "submissions"
 
@@ -93,11 +125,15 @@ def _ensure_data_root() -> None:
 
 
 @router.post("/classes", response_model=CourseClassRead)
-def create_class(body: CourseClassCreate, db: Session = Depends(get_db)) -> m.CourseClass:
+def create_class(
+    body: CourseClassCreate,
+    db: Session = Depends(get_db),
+    teacher: m.Teacher = Depends(require_teacher),
+) -> m.CourseClass:
     existing = db.query(m.CourseClass).filter(m.CourseClass.code == body.code).first()
     if existing:
         raise HTTPException(status_code=409, detail=f"Class code already exists: {body.code}")
-    row = m.CourseClass(code=body.code.strip(), name=body.name.strip())
+    row = m.CourseClass(code=body.code.strip(), name=body.name.strip(), teacher_id=teacher.id)
     db.add(row)
     db.commit()
     db.refresh(row)
@@ -105,16 +141,22 @@ def create_class(body: CourseClassCreate, db: Session = Depends(get_db)) -> m.Co
 
 
 @router.get("/classes", response_model=list[CourseClassRead])
-def list_classes(db: Session = Depends(get_db)) -> list[m.CourseClass]:
-    return db.query(m.CourseClass).order_by(m.CourseClass.code).all()
+def list_classes(
+    db: Session = Depends(get_db), teacher: m.Teacher = Depends(require_teacher)
+) -> list[m.CourseClass]:
+    return (
+        db.query(m.CourseClass)
+        .filter(m.CourseClass.teacher_id == teacher.id)
+        .order_by(m.CourseClass.code)
+        .all()
+    )
 
 
 @router.get("/classes/{class_id}", response_model=CourseClassRead)
-def get_class(class_id: int, db: Session = Depends(get_db)) -> m.CourseClass:
-    row = db.get(m.CourseClass, class_id)
-    if not row:
-        raise HTTPException(status_code=404, detail="Class not found")
-    return row
+def get_class(
+    class_id: int, db: Session = Depends(get_db), teacher: m.Teacher = Depends(require_teacher)
+) -> m.CourseClass:
+    return _owned_class(db, teacher, class_id)
 
 
 # ---------------------------------------------------------------------------
@@ -173,10 +215,13 @@ def update_student(student_id: str, body: StudentUpdate, db: Session = Depends(g
 
 
 @router.post("/classes/{class_id}/enrollments", response_model=EnrollmentRead)
-def enroll_student(class_id: int, body: EnrollmentCreate, db: Session = Depends(get_db)) -> m.Enrollment:
-    course = db.get(m.CourseClass, class_id)
-    if not course:
-        raise HTTPException(status_code=404, detail="Class not found")
+def enroll_student(
+    class_id: int,
+    body: EnrollmentCreate,
+    db: Session = Depends(get_db),
+    teacher: m.Teacher = Depends(require_teacher),
+) -> m.Enrollment:
+    _owned_class(db, teacher, class_id)
     student = db.query(m.Student).filter(m.Student.student_id == body.student_id.strip()).first()
     if not student:
         raise HTTPException(status_code=404, detail=f"Student not found: {body.student_id}")
@@ -208,6 +253,59 @@ def list_enrolled_students(class_id: int, db: Session = Depends(get_db)) -> list
     )
 
 
+@router.get("/classes/{class_id}/roster", response_model=list[RosterEntry])
+def class_roster(
+    class_id: int, db: Session = Depends(get_db), teacher: m.Teacher = Depends(require_teacher)
+) -> list[RosterEntry]:
+    """Enrolled students with the access code each must enter in the student portal."""
+    _owned_class(db, teacher, class_id)
+    rows = (
+        db.query(m.Enrollment, m.Student)
+        .join(m.Student, m.Student.id == m.Enrollment.student_id)
+        .filter(m.Enrollment.class_id == class_id)
+        .order_by(m.Student.student_id)
+        .all()
+    )
+    return [
+        RosterEntry(
+            student_id=st.student_id,
+            full_name=st.full_name,
+            email=st.email,
+            access_code=en.access_code,
+            redeemed=en.redeemed_at is not None,
+            redeemed_at=en.redeemed_at,
+        )
+        for en, st in rows
+    ]
+
+
+@router.post("/classes/{class_id}/enrollments/{student_id}/regenerate-code", response_model=RosterEntry)
+def regenerate_access_code(
+    class_id: int,
+    student_id: str,
+    db: Session = Depends(get_db),
+    teacher: m.Teacher = Depends(require_teacher),
+) -> RosterEntry:
+    """Issue a fresh code for a student who has not redeemed theirs yet."""
+    _owned_class(db, teacher, class_id)
+    st = db.query(m.Student).filter(m.Student.student_id == student_id.strip()).first()
+    en = (
+        db.query(m.Enrollment)
+        .filter(m.Enrollment.class_id == class_id, m.Enrollment.student_id == (st.id if st else -1))
+        .first()
+    )
+    if not st or not en:
+        raise HTTPException(status_code=404, detail="Student is not enrolled in this class")
+    if en.redeemed_at is not None:
+        raise HTTPException(status_code=409, detail="This code was already redeemed by the student")
+    en.access_code = m.new_access_code()
+    db.commit()
+    return RosterEntry(
+        student_id=st.student_id, full_name=st.full_name, email=st.email,
+        access_code=en.access_code, redeemed=False, redeemed_at=None,
+    )
+
+
 @router.delete("/classes/{class_id}/enrollments/{student_id}", status_code=204)
 def unenroll_student(class_id: int, student_id: str, db: Session = Depends(get_db)) -> None:
     student = db.query(m.Student).filter(m.Student.student_id == student_id.strip()).first()
@@ -229,15 +327,14 @@ def bulk_enroll_students(
     class_id: int,
     body: dict,
     db: Session = Depends(get_db),
+    teacher: m.Teacher = Depends(require_teacher),
 ) -> BulkEnrollResult:
     """Enroll multiple students by a list of student_id strings.
 
     Body: {"student_ids": ["2024-0001", "2024-0002", ...]}
     Skips duplicates silently. Reports unknown IDs as errors.
     """
-    course = db.get(m.CourseClass, class_id)
-    if not course:
-        raise HTTPException(status_code=404, detail="Class not found")
+    _owned_class(db, teacher, class_id)
     student_ids: list[str] = body.get("student_ids", [])
     enrolled_count = 0
     skipped_count = 0
@@ -270,10 +367,10 @@ def bulk_enroll_students(
 
 
 @router.post("/exams", response_model=ExamRead)
-def create_exam(body: ExamCreate, db: Session = Depends(get_db)) -> m.Exam:
-    course = db.get(m.CourseClass, body.class_id)
-    if not course:
-        raise HTTPException(status_code=404, detail="Class not found")
+def create_exam(
+    body: ExamCreate, db: Session = Depends(get_db), teacher: m.Teacher = Depends(require_teacher)
+) -> m.Exam:
+    _owned_class(db, teacher, body.class_id)
     dup = (
         db.query(m.Exam)
         .filter(m.Exam.class_id == body.class_id, m.Exam.exam_code == body.exam_code.strip())
@@ -286,6 +383,7 @@ def create_exam(body: ExamCreate, db: Session = Depends(get_db)) -> m.Exam:
         exam_code=body.exam_code.strip(),
         title=body.title.strip(),
         description=body.description.strip() if body.description else None,
+        due_at=_naive_utc(body.due_at),
     )
     db.add(row)
     db.commit()
@@ -293,20 +391,103 @@ def create_exam(body: ExamCreate, db: Session = Depends(get_db)) -> m.Exam:
     return row
 
 
+@router.patch("/exams/{exam_id}/deadline", response_model=ExamRead)
+def set_exam_deadline(
+    exam_id: int,
+    body: ExamDeadlineUpdate,
+    db: Session = Depends(get_db),
+    teacher: m.Teacher = Depends(require_teacher),
+) -> m.Exam:
+    """Set the exam's deadline, or clear it with {"due_at": null}."""
+    exam = _owned_exam(db, teacher, exam_id)
+    new_due = _naive_utc(body.due_at)
+    if exam.auto_grade_started_at is not None:
+        raise HTTPException(
+            status_code=409,
+            detail="Automatic grading has already started for this exam, so its deadline can no longer change.",
+        )
+    if exam.auto_grade:
+        if new_due is None:
+            raise HTTPException(
+                status_code=422,
+                detail="Turn off automatic grading before removing the deadline (it grades after the deadline).",
+            )
+        if new_due <= _naive_utc(datetime.now(timezone.utc)):
+            raise HTTPException(
+                status_code=422,
+                detail="With automatic grading on, the deadline must be in the future.",
+            )
+    exam.due_at = new_due
+    db.commit()
+    db.refresh(exam)
+    return exam
+
+
+@router.patch("/exams/{exam_id}/auto-grade", response_model=ExamRead)
+def set_auto_grade(
+    exam_id: int,
+    body: ExamAutoGradeUpdate,
+    db: Session = Depends(get_db),
+    teacher: m.Teacher = Depends(require_teacher),
+) -> m.Exam:
+    """Turn automatic grading after the deadline on or off for this exam.
+
+    It needs a deadline in the future. Once on, students can't submit, edit or
+    unsubmit after the deadline, and the submitted papers are graded for you.
+    """
+    exam = _owned_exam(db, teacher, exam_id)
+    if exam.auto_grade_started_at is not None:
+        raise HTTPException(status_code=409, detail="Automatic grading already ran for this exam.")
+    if body.enabled:
+        if exam.due_at is None:
+            raise HTTPException(status_code=422, detail="Set a deadline first: automatic grading starts when it passes.")
+        if exam.due_at <= _naive_utc(datetime.now(timezone.utc)):
+            raise HTTPException(
+                status_code=422,
+                detail="The deadline has already passed. Use Process on the Submissions page instead.",
+            )
+    exam.auto_grade = body.enabled
+    db.commit()
+    db.refresh(exam)
+    return exam
+
+
+@router.patch("/exams/{exam_id}/results-release", response_model=ExamRead)
+def set_results_release(
+    exam_id: int,
+    body: ExamReleaseUpdate,
+    db: Session = Depends(get_db),
+    teacher: m.Teacher = Depends(require_teacher),
+) -> m.Exam:
+    """Release this exam's results to its students, or withdraw them."""
+    exam = _owned_exam(db, teacher, exam_id)
+    exam.results_released_at = _naive_utc(datetime.now(timezone.utc)) if body.released else None
+    db.commit()
+    db.refresh(exam)
+    return exam
+
+
 @router.get("/exams", response_model=list[ExamRead])
-def list_exams(class_id: int | None = None, db: Session = Depends(get_db)) -> list[m.Exam]:
-    q = db.query(m.Exam)
+def list_exams(
+    class_id: int | None = None,
+    db: Session = Depends(get_db),
+    teacher: m.Teacher = Depends(require_teacher),
+) -> list[m.Exam]:
+    q = (
+        db.query(m.Exam)
+        .join(m.CourseClass, m.CourseClass.id == m.Exam.class_id)
+        .filter(m.CourseClass.teacher_id == teacher.id)
+    )
     if class_id is not None:
         q = q.filter(m.Exam.class_id == class_id)
     return q.order_by(m.Exam.created_at.desc()).all()
 
 
 @router.get("/exams/{exam_id}", response_model=ExamRead)
-def get_exam(exam_id: int, db: Session = Depends(get_db)) -> m.Exam:
-    row = db.get(m.Exam, exam_id)
-    if not row:
-        raise HTTPException(status_code=404, detail="Exam not found")
-    return row
+def get_exam(
+    exam_id: int, db: Session = Depends(get_db), teacher: m.Teacher = Depends(require_teacher)
+) -> m.Exam:
+    return _owned_exam(db, teacher, exam_id)
 
 
 @router.get("/exams/{exam_id}/submissions", response_model=list[SubmissionSummary])
@@ -318,12 +499,18 @@ def list_exam_submissions(exam_id: int, db: Session = Depends(get_db)) -> list[S
     subs = db.query(m.Submission).filter(m.Submission.exam_id == exam_id).all()
     result = []
     for sub in subs:
+        late = bool(
+            exam.due_at and sub.submitted_at and sub.uploaded_by == "student" and sub.submitted_at > exam.due_at
+        )
         student = db.get(m.Student, sub.student_id)
         result.append(SubmissionSummary(
             id=sub.id,
             status=sub.status,
             student_id=student.student_id if student else "—",
             student_name=student.full_name if student else "—",
+            uploaded_by=sub.uploaded_by,
+            submitted_at=sub.submitted_at,
+            is_late=late,
             created_at=sub.created_at,
             updated_at=sub.updated_at,
         ))
@@ -645,6 +832,7 @@ async def upload_submission_file(
     )
     db.add(row)
     sub.status = "submitted"
+    sub.uploaded_by = "teacher"
     db.commit()
     db.refresh(row)
     return row
@@ -2172,6 +2360,79 @@ def teacher_override(
     return ans
 
 
+@router.post(
+    "/submissions/{submission_id}/answers/{answer_id}/reviewed",
+    response_model=SubmissionAnswerRead,
+)
+def mark_answer_reviewed(submission_id: int, answer_id: int, db: Session = Depends(get_db)) -> m.SubmissionAnswer:
+    """Mark an answer as reviewed by the teacher. A review marker only — status,
+    scores and grading data are untouched."""
+    ans = db.get(m.SubmissionAnswer, answer_id)
+    if not ans or ans.submission_id != submission_id:
+        raise HTTPException(status_code=404, detail="Answer not found")
+    ans.reviewed_at = datetime.now(timezone.utc).replace(tzinfo=None)
+    db.commit()
+    db.refresh(ans)
+    return ans
+
+
+@router.delete(
+    "/submissions/{submission_id}/answers/{answer_id}/reviewed",
+    response_model=SubmissionAnswerRead,
+)
+def unmark_answer_reviewed(submission_id: int, answer_id: int, db: Session = Depends(get_db)) -> m.SubmissionAnswer:
+    """Undo "Mark reviewed" (puts the answer back in the queue if it still needs attention)."""
+    ans = db.get(m.SubmissionAnswer, answer_id)
+    if not ans or ans.submission_id != submission_id:
+        raise HTTPException(status_code=404, detail="Answer not found")
+    ans.reviewed_at = None
+    db.commit()
+    db.refresh(ans)
+    return ans
+
+
+@router.get("/exams/{exam_id}/review-queue", response_model=list[ReviewQueueItem])
+def exam_review_queue(
+    exam_id: int,
+    db: Session = Depends(get_db),
+    teacher: m.Teacher = Depends(require_teacher),
+) -> list[ReviewQueueItem]:
+    """Every answer in this exam still waiting on the teacher, across students.
+
+    Same population and same definition as the Item Analysis "needs review"
+    counts, so the numbers there match what is listed here.
+    """
+    exam = _owned_exam(db, teacher, exam_id)
+    _subs, graded_subs, answers_by_key = _graded_answers(exam, db)
+    subs_by_id = {s.id: s for s in graded_subs}
+    questions = {q.id: q for q in exam.questions}
+    items: list[ReviewQueueItem] = []
+    for (sub_id, _qid), ans in answers_by_key.items():
+        if not _needs_attention(ans):
+            continue
+        sub = subs_by_id.get(sub_id)
+        student = db.get(m.Student, sub.student_id) if sub else None
+        q = questions.get(ans.question_id) if ans.question_id is not None else None
+        flagged = ans.flag is not None and ans.flag.review_decision is None
+        items.append(ReviewQueueItem(
+            answer_id=ans.id,
+            submission_id=sub_id,
+            student_id=student.student_id if student else "—",
+            student_name=student.full_name if student else "—",
+            question_id=ans.question_id,
+            question_order_index=q.order_index if q else None,
+            question_prompt=q.prompt if q else None,
+            question_type=q.question_type if q else None,
+            max_points=q.max_points if q else None,
+            ai_score=ans.ai_score,
+            reason=ans.flag.flag_reason if flagged else "needs_review",
+            flagged=flagged,
+            status=ans.status,
+        ))
+    items.sort(key=lambda i: (i.student_name.lower(), i.question_order_index or 0))
+    return items
+
+
 # ---------------------------------------------------------------------------
 # Phase 21 — Background processing queue
 # ---------------------------------------------------------------------------
@@ -2709,6 +2970,121 @@ def delete_class(class_id: int, db: Session = Depends(get_db)) -> None:
 # ---------------------------------------------------------------------------
 
 
+# Essays have no right/wrong answer, so an essay counts as "correct" when it
+# earns at least this share of its points (same 60% as the exam pass mark).
+# Every other question type is correct only at full marks.
+_ESSAY_CORRECT_FRACTION = 0.6
+# Below this many graded submissions a discrimination index is noise.
+_DISCRIMINATION_MIN_N = 10
+_SCORE_EPS = 1e-6
+
+
+def _final_score(ans: m.SubmissionAnswer | None) -> float | None:
+    """Teacher override if set, else the AI/OMR score; None when unscored."""
+    if ans is None:
+        return None
+    return ans.teacher_score if ans.teacher_score is not None else ans.ai_score
+
+
+def _correct_basis(q: m.ExamQuestion) -> str:
+    if (q.question_type or "essay") == "essay":
+        return f"≥ {round(_ESSAY_CORRECT_FRACTION * 100)}% of points"
+    return "full marks"
+
+
+def _classify_item(
+    q: m.ExamQuestion, ans: m.SubmissionAnswer | None
+) -> tuple[str, float | None]:
+    """
+    Returns (outcome, score) for one student's answer to one question.
+
+    outcome is "correct" | "incorrect" | "blank". Blank (no answer row, no
+    score, or nothing read from the paper) is reported separately but is
+    counted as incorrect by the callers. A teacher-assigned score is honoured
+    even when OCR read nothing.
+    """
+    score = _final_score(ans)
+    has_text = ans is not None and (ans.ocr_text or "").strip() != ""
+    teacher_scored = ans is not None and ans.teacher_score is not None
+    if score is None or (not has_text and not teacher_scored):
+        return "blank", score
+    need = q.max_points * (
+        _ESSAY_CORRECT_FRACTION if (q.question_type or "essay") == "essay" else 1.0
+    )
+    if q.max_points > 0 and score >= need - _SCORE_EPS:
+        return "correct", score
+    return "incorrect", score
+
+
+def _answer_resolved(ans: m.SubmissionAnswer) -> bool:
+    """The teacher has dealt with this answer: scored it, marked it reviewed,
+    or confirmed/dismissed its flag."""
+    if ans.teacher_score is not None or ans.reviewed_at is not None:
+        return True
+    return ans.flag is not None and ans.flag.review_decision is not None
+
+
+def _needs_attention(ans: m.SubmissionAnswer | None) -> bool:
+    """Waiting on the teacher: status needs_review and/or an unreviewed flag,
+    and not yet resolved. One definition shared by Item Analysis and the queue."""
+    if ans is None or _answer_resolved(ans):
+        return False
+    return ans.status == "needs_review" or (ans.flag is not None and ans.flag.review_decision is None)
+
+
+def _graded_answers(
+    exam: m.Exam, db: Session
+) -> tuple[list[m.Submission], list[m.Submission], dict[tuple[int, int | None], m.SubmissionAnswer]]:
+    """
+    (all submissions, graded submissions, answers keyed by (submission_id, question_id)).
+
+    Item analysis is computed over graded submissions only, so per-item counts
+    reconcile with the exam totals. If a question has more than one answer row
+    for a submission the most recent (highest id) wins.
+    """
+    submissions = db.query(m.Submission).filter(m.Submission.exam_id == exam.id).all()
+    graded_subs = [s for s in submissions if s.status == "graded"]
+    by_key: dict[tuple[int, int | None], m.SubmissionAnswer] = {}
+    if graded_subs:
+        rows = (
+            db.query(m.SubmissionAnswer)
+            .filter(m.SubmissionAnswer.submission_id.in_([s.id for s in graded_subs]))
+            .order_by(m.SubmissionAnswer.id)
+            .all()
+        )
+        for a in rows:
+            by_key[(a.submission_id, a.question_id)] = a
+    return submissions, graded_subs, by_key
+
+
+def _choice_label(ans: m.SubmissionAnswer | None) -> str:
+    """Which option a student marked on an MCQ/TF item, for distractor counts."""
+    from omr_engine import MULTIPLE_MARKS_LABEL
+
+    text = (ans.ocr_text or "").strip() if ans is not None else ""
+    if not text:
+        return "(blank)"
+    if text == MULTIPLE_MARKS_LABEL:
+        return "(multiple marks)"
+    return text.split()[0].upper()
+
+
+def _discrimination(pairs: list[tuple[float, float]]) -> float | None:
+    """
+    Upper-vs-lower 27% discrimination index from (exam_total, score_fraction)
+    pairs: mean fraction of the top group minus that of the bottom group.
+    For right/wrong items this is the classic (U - L) / n index.
+    """
+    n = len(pairs)
+    if n < _DISCRIMINATION_MIN_N:
+        return None
+    k = max(1, round(n * 0.27))
+    ranked = sorted(pairs, key=lambda p: p[0], reverse=True)
+    upper = [f for _, f in ranked[:k]]
+    lower = [f for _, f in ranked[-k:]]
+    return round(sum(upper) / k - sum(lower) / k, 2)
+
+
 def _exam_stats(exam: m.Exam, db: Session) -> ExamStats:
     """Compute analytics for a single exam."""
     questions = (
@@ -2720,46 +3096,73 @@ def _exam_stats(exam: m.Exam, db: Session) -> ExamStats:
     max_possible = sum(q.max_points for q in questions)
     pass_threshold = max_possible * 0.6
 
-    submissions = db.query(m.Submission).filter(m.Submission.exam_id == exam.id).all()
-    graded_subs = [s for s in submissions if s.status == "graded"]
+    submissions, graded_subs, answers_by_key = _graded_answers(exam, db)
 
     # Per-submission total scores
-    sub_totals: list[float] = []
-    for sub in graded_subs:
-        answers = db.query(m.SubmissionAnswer).filter(
-            m.SubmissionAnswer.submission_id == sub.id
-        ).all()
-        total = sum(
-            (a.teacher_score if a.teacher_score is not None else a.ai_score or 0.0)
-            for a in answers
+    totals_by_sub: dict[int, float] = {s.id: 0.0 for s in graded_subs}
+    for (sub_id, _qid), a in answers_by_key.items():
+        totals_by_sub[sub_id] += (
+            a.teacher_score if a.teacher_score is not None else a.ai_score or 0.0
         )
-        sub_totals.append(total)
+    sub_totals = [totals_by_sub[s.id] for s in graded_subs]
 
     avg_total = (sum(sub_totals) / len(sub_totals)) if sub_totals else None
     avg_pct   = (avg_total / max_possible * 100) if (avg_total is not None and max_possible > 0) else None
     pass_count = sum(1 for t in sub_totals if t >= pass_threshold)
     fail_count = len(sub_totals) - pass_count
 
-    # Per-question stats
+    # Per-question stats (item analysis)
     q_stats: list[QuestionStats] = []
     for q in questions:
-        answers = db.query(m.SubmissionAnswer).filter(
-            m.SubmissionAnswer.question_id == q.id
-        ).all()
-        scores = [
-            (a.teacher_score if a.teacher_score is not None else a.ai_score)
-            for a in answers
-            if (a.teacher_score is not None or a.ai_score is not None)
-        ]
+        qtype = q.question_type or "essay"
+        scores: list[float] = []
+        pairs: list[tuple[float, float]] = []
+        correct = incorrect = blank = needs_review = 0
+        choices: dict[str, int] = {}
+        for sub in graded_subs:
+            ans = answers_by_key.get((sub.id, q.id))
+            outcome, score = _classify_item(q, ans)
+            value = score if score is not None else 0.0
+            scores.append(value)
+            if q.max_points > 0:
+                pairs.append((totals_by_sub[sub.id], min(1.0, value / q.max_points)))
+            if outcome == "correct":
+                correct += 1
+            else:
+                incorrect += 1
+                if outcome == "blank":
+                    blank += 1
+            if _needs_attention(ans):
+                needs_review += 1
+            if qtype in ("mcq", "tf"):
+                label = _choice_label(ans)
+                choices[label] = choices.get(label, 0) + 1
+
+        n = len(graded_subs)
+        disc = _discrimination(pairs)
         q_stats.append(QuestionStats(
             question_id=q.id,
             order_index=q.order_index,
             prompt=q.prompt[:120],
             max_points=q.max_points,
-            avg_score=round(sum(scores) / len(scores), 2) if scores else None,
-            min_score=round(min(scores), 2) if scores else None,
-            max_score=round(max(scores), 2) if scores else None,
-            answer_count=len(scores),
+            avg_score=round(sum(scores) / n, 2) if n else None,
+            min_score=round(min(scores), 2) if n else None,
+            max_score=round(max(scores), 2) if n else None,
+            answer_count=n,
+            question_type=qtype,
+            correct_answer=q.correct_answer,
+            correct_basis=_correct_basis(q),
+            correct_count=correct,
+            incorrect_count=incorrect,
+            blank_count=blank,
+            needs_review_count=needs_review,
+            pct_correct=round(correct / n * 100, 1) if n else None,
+            discrimination_index=disc,
+            discrimination_note=(
+                None if disc is not None
+                else f"needs at least {_DISCRIMINATION_MIN_N} graded submissions (have {n})"
+            ),
+            choice_counts=dict(sorted(choices.items())) if qtype in ("mcq", "tf") else None,
         ))
 
     return ExamStats(
@@ -2805,6 +3208,57 @@ def exam_analytics(exam_id: int, db: Session = Depends(get_db)) -> ExamStats:
     if not exam:
         raise HTTPException(status_code=404, detail="Exam not found")
     return _exam_stats(exam, db)
+
+
+@router.get(
+    "/exams/{exam_id}/questions/{question_id}/responses",
+    response_model=list[ItemResponseRow],
+)
+def item_responses(
+    exam_id: int, question_id: int, db: Session = Depends(get_db)
+) -> list[ItemResponseRow]:
+    """
+    The source rows behind one item's analysis: every graded student's
+    response, score and outcome, classified exactly as _exam_stats counts them.
+    Students are identified by student ID only.
+    """
+    exam = db.get(m.Exam, exam_id)
+    if not exam:
+        raise HTTPException(status_code=404, detail="Exam not found")
+    q = db.get(m.ExamQuestion, question_id)
+    if not q or q.exam_id != exam_id:
+        raise HTTPException(status_code=404, detail="Question not found in this exam")
+
+    _, graded_subs, answers_by_key = _graded_answers(exam, db)
+    student_ids = {
+        s.id: s.student_id
+        for s in db.query(m.Student).filter(
+            m.Student.id.in_([sub.student_id for sub in graded_subs])
+        )
+    } if graded_subs else {}
+
+    rows: list[ItemResponseRow] = []
+    for sub in graded_subs:
+        ans = answers_by_key.get((sub.id, q.id))
+        outcome, score = _classify_item(q, ans)
+        if ans is not None and ans.teacher_score is not None:
+            source = "teacher"
+        elif score is not None:
+            source = "AI"
+        else:
+            source = "none"
+        rows.append(ItemResponseRow(
+            answer_id=ans.id if ans else None,
+            submission_id=sub.id,
+            student_id=student_ids.get(sub.student_id, "?"),
+            response=(ans.ocr_text if ans else None),
+            score=score,
+            score_source=source,
+            outcome=outcome,
+            status=(ans.status if ans else None),
+        ))
+    rows.sort(key=lambda r: r.student_id)
+    return rows
 
 
 @router.get("/students/{student_id}/analytics", response_model=StudentAnalytics)
@@ -3525,6 +3979,7 @@ async def batch_upload_submissions(
         )
         db.add(sf)
         sub.status = "submitted"
+        sub.uploaded_by = "teacher"
         sub.updated_at = now
         db.commit()
 

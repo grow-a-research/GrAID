@@ -10,7 +10,7 @@ from typing import AsyncIterator
 # logs) has no handler attached anywhere and prints nothing.
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s: %(message)s")
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -18,9 +18,13 @@ from PIL import Image, ImageOps
 from pydantic import BaseModel
 
 import ocr_pipeline
+from auth import require_teacher, router as auth_router
+from autograde import start_scheduler
 from database import init_db
 from job_queue import start_worker
 from routers.api_v1 import router as api_v1_router
+from routers.student_portal import router as student_router
+from routers.notifications_api import router as notifications_router
 
 _FRONTEND_DIST = Path(__file__).parent / "frontend" / "dist"
 
@@ -53,6 +57,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             raise
 
     await start_worker()
+    await start_scheduler()
     print("[Queue] Background OCR/grading queue worker started.")
 
     yield
@@ -67,7 +72,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+app.include_router(auth_router)
 app.include_router(api_v1_router)
+app.include_router(student_router)
+app.include_router(notifications_router)
 
 
 @app.get("/health")
@@ -75,7 +83,7 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
-@app.post("/extract", response_model=ExtractResponse)
+@app.post("/extract", response_model=ExtractResponse, dependencies=[Depends(require_teacher)])
 async def extract(file: UploadFile = File(...)) -> ExtractResponse:
     if ocr_pipeline.MODELS is None:
         raise HTTPException(status_code=503, detail="Models not loaded yet")

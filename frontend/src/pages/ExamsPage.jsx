@@ -2,6 +2,10 @@ import { useEffect, useRef, useState } from 'react'
 import { api } from '../api'
 import { tw, ErrorBox, Empty } from '../ui'
 import { useWorkflow } from '../context/WorkflowContext'
+import ClassPicker from '../components/ClassPicker'
+import DeadlineEditor from '../components/DeadlineEditor'
+import DeadlinePicker from '../components/DeadlinePicker'
+import { fmtDue, fromInputValue } from '../lib/dates'
 import RubricCriteriaEditor, { criterionMaxPoints, emptyCriterion } from '../components/RubricCriteriaEditor'
 import { toCsvFile } from '../lib/excelImport'
 
@@ -185,11 +189,13 @@ export default function ExamsPage() {
   const [exams, setExams] = useState([])
   const [questions, setQuestions] = useState([])
 
-  // create exam form
-  const [newClassId, setNewClassId] = useState('')
+  // exam list search + create exam form (the class comes from the class picker)
+  const [examQuery, setExamQuery] = useState('')
+  const [createdMsg, setCreatedMsg] = useState('')
   const [newCode, setNewCode] = useState('')
   const [newTitle, setNewTitle] = useState('')
   const [newDesc, setNewDesc] = useState('')
+  const [newDue, setNewDue] = useState('')   // datetime-local value, optional
   const [creating, setCreating] = useState(false)
   const [createErr, setCreateErr] = useState('')
 
@@ -246,7 +252,27 @@ export default function ExamsPage() {
   const [savingQ, setSavingQ] = useState(false)
   const [saveQErr, setSaveQErr] = useState('')
 
-  useEffect(() => { loadClasses(); loadExams(selectedClass?.id) }, [])
+  useEffect(() => { loadClasses() }, [])
+
+  // The exam list always follows the chosen class; no class → nothing listed.
+  useEffect(() => {
+    setExamQuery(''); setCreatedMsg(''); setCreateErr('')
+    if (!selectedClass) { setExams([]); return }
+    loadExams(selectedClass.id)
+  }, [selectedClass?.id])
+
+  // Arriving here with an exam already picked on another tab: show its class too.
+  useEffect(() => {
+    if (selected && !selectedClass && classes.length > 0) {
+      const cls = classes.find(c => c.id === selected.class_id)
+      if (cls) selectClass(cls)
+    }
+  }, [classes, selected?.id])
+
+  function changeClass(cls) {
+    if (!cls) pickExam(null)   // clearing the class also closes the exam on the right
+    selectClass(cls)
+  }
 
   // Loads question/template state for whichever exam is selected — runs on explicit
   // selection here, and also when arriving on this tab with an exam already picked
@@ -265,21 +291,25 @@ export default function ExamsPage() {
     try { setClasses(await api.classes.list()) } catch {}
   }
   async function loadExams(classId) {
-    try { setExams(await api.exams.list(classId || undefined)) } catch {}
+    try { setExams(await api.exams.list(classId)) } catch {}
   }
   async function createExam(e) {
     e.preventDefault()
-    if (!newClassId || !newCode.trim() || !newTitle.trim()) return
-    setCreating(true); setCreateErr('')
+    if (!selectedClass || !newCode.trim() || !newTitle.trim()) return
+    setCreating(true); setCreateErr(''); setCreatedMsg('')
     try {
       const exam = await api.exams.create({
-        class_id: parseInt(newClassId),
+        class_id: selectedClass.id,
         exam_code: newCode.trim(),
         title: newTitle.trim(),
         description: newDesc.trim() || undefined,
+        due_at: fromInputValue(newDue) ?? undefined,
       })
       setExams(prev => [...prev, exam])
-      setNewCode(''); setNewTitle(''); setNewDesc('')
+      pickExam(exam)   // open the new exam on the right so questions go to it
+      setExamQuery('')
+      setCreatedMsg(`Created "${exam.title}" — add its questions on the right.`)
+      setNewCode(''); setNewTitle(''); setNewDesc(''); setNewDue('')
     } catch (err) { setCreateErr(err.message) }
     setCreating(false)
   }
@@ -307,7 +337,7 @@ export default function ExamsPage() {
       }
       const q = await api.exams.questions.add(selected.id, body)
       setQuestions(prev => [...prev, q])
-      setQPrompt(''); setQPoints('10'); setQRubric(''); setQCriteria([])
+      setQPrompt(''); setQPoints(qType === 'essay' ? '10' : '1'); setQRubric(''); setQCriteria([])
       setQRubricParseErrors([])
       setQCorrect(''); setQCaseSensitive(false); setQChoices(['', '', '', ''])
     } catch (err) { setAddQErr(err.message) }
@@ -331,12 +361,14 @@ export default function ExamsPage() {
     setParsingFn(false)
   }
 
+  // Saves the file to disk instead of letting the browser preview it.
+  function saveFile(url, filename) {
+    api.download(url, filename).catch(err => alert(`Download failed: ${err.message}`))
+  }
+
   function downloadRubricPdf() {
     if (!selected) return
-    const url = api.exams.rubricPdfUrl(selected.id)
-    const a = document.createElement('a')
-    a.href = url; a.download = `exam_${selected.exam_code}_rubric.pdf`
-    document.body.appendChild(a); a.click(); a.remove()
+    saveFile(api.exams.rubricPdfUrl(selected.id), `exam_${selected.exam_code}_rubric.pdf`)
   }
   async function generateTemplate() {
     if (!selected) return
@@ -347,30 +379,25 @@ export default function ExamsPage() {
       setTemplateReady(true)
       // refresh question region_json
       setQuestions(await api.exams.questions.list(selected.id))
-    } catch (err) { setGenErr(err.message) }
+    } catch (err) { setGenErr(err.message); setGenning(false); return }
+    // Generation worked — also save the fresh PDF to disk.
+    try {
+      await api.download(api.exams.templatePdfUrl(selected.id), `exam_${selected.exam_code}_template.pdf`)
+    } catch (err) { setGenErr(`Template generated, but the download failed: ${err.message}`) }
     setGenning(false)
   }
   function downloadTemplate() {
     if (!selected) return
-    const url = api.exams.templatePdfUrl(selected.id)
-    const a = document.createElement('a')
-    a.href = url; a.download = `exam_${selected.exam_code}_template.pdf`
-    document.body.appendChild(a); a.click(); a.remove()
+    saveFile(api.exams.templatePdfUrl(selected.id), `exam_${selected.exam_code}_template.pdf`)
   }
   function downloadQuestionnaire() {
     if (!selected) return
-    const url = api.exams.questionnairePdfUrl(selected.id)
-    const a = document.createElement('a')
-    a.href = url; a.download = `exam_${selected.exam_code}_questionnaire.pdf`
-    document.body.appendChild(a); a.click(); a.remove()
+    saveFile(api.exams.questionnairePdfUrl(selected.id), `exam_${selected.exam_code}_questionnaire.pdf`)
   }
 
   function downloadAllPapers() {
     if (!selected) return
-    const url = api.exams.allPapersZipUrl(selected.id)
-    const a = document.createElement('a')
-    a.href = url; a.download = `${selected.exam_code}_papers.zip`
-    document.body.appendChild(a); a.click(); a.remove()
+    saveFile(api.exams.allPapersZipUrl(selected.id), `${selected.exam_code}_papers.zip`)
   }
 
   async function importQuestionsCsv(e) {
@@ -495,8 +522,9 @@ export default function ExamsPage() {
     } catch (err) { alert(`Delete failed: ${err.message}`) }
   }
 
-  const filteredExams = selectedClass
-    ? exams.filter(ex => ex.class_id === selectedClass.id)
+  const examQ = examQuery.trim().toLowerCase()
+  const filteredExams = examQ
+    ? exams.filter(ex => ex.title.toLowerCase().includes(examQ) || ex.exam_code.toLowerCase().includes(examQ))
     : exams
 
   return (
@@ -505,58 +533,68 @@ export default function ExamsPage() {
       <div className="flex flex-col gap-4">
         <h2 className={tw.heading}>Exams</h2>
 
-        <form onSubmit={createExam} className={`${tw.card} flex flex-col gap-3`}>
-          <div className={tw.label}>New exam</div>
-          <select className={tw.select} value={newClassId} onChange={e => setNewClassId(e.target.value)}>
-            <option value="">Select class…</option>
-            {classes.map(c => <option key={c.id} value={c.id}>{c.name} ({c.code})</option>)}
-          </select>
-          <input className={tw.input} placeholder="Exam code (e.g. MID1)"
-            value={newCode} onChange={e => setNewCode(e.target.value)} />
-          <input className={tw.input} placeholder="Title"
-            value={newTitle} onChange={e => setNewTitle(e.target.value)} />
-          <textarea className={tw.input} placeholder="Description (optional)" rows={2}
-            value={newDesc} onChange={e => setNewDesc(e.target.value)} />
-          <ErrorBox msg={createErr} />
-          <button className={tw.btnPrimary} type="submit" disabled={creating}>
-            {creating ? 'Creating…' : 'Create exam'}
-          </button>
-        </form>
+        <ClassPicker classes={classes} value={selectedClass} onChange={changeClass} />
 
-        <div className="flex flex-col gap-2">
-          <select className={tw.select} value={selectedClass?.id ?? ''}
-            onChange={e => {
-              const cls = classes.find(c => c.id === parseInt(e.target.value)) ?? null
-              selectClass(cls)
-              loadExams(cls?.id)
-            }}>
-            <option value="">All classes</option>
-            {classes.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
-          </select>
-
-          {filteredExams.length === 0
-            ? <Empty text="No exams yet." />
-            : filteredExams.map(ex => (
-              <div key={ex.id} className={`${selected?.id === ex.id ? tw.rowActive : tw.row} flex items-center gap-2`}>
-                <button type="button" className="flex-1 text-left flex items-center justify-between gap-2"
-                  onClick={() => pickExam(ex)}>
-                  <div>
-                    <div className="text-sm font-medium text-zinc-100">{ex.title}</div>
-                    <div className={tw.muted}>{ex.exam_code}</div>
-                  </div>
-                  {ex.template_spec_json
-                    ? <span className={tw.badge('ocr_done')}>template</span>
-                    : <span className={tw.badge('draft')}>no template</span>
-                  }
-                </button>
-                <button type="button" onClick={() => deleteExam(ex)}
-                  className="text-xs text-zinc-600 hover:text-red-400 transition shrink-0 px-1">
-                  ✕
-                </button>
+        {!selectedClass
+          ? <div className="flex h-28 items-center justify-center rounded-xl border border-dashed border-zinc-700 px-4 text-center">
+              <span className={tw.muted}>Select a class to see its exams or create a new one.</span>
+            </div>
+          : <>
+            <form onSubmit={createExam} className={`${tw.card} flex flex-col gap-3`}>
+              <div className={tw.label}>New exam in {selectedClass.name}</div>
+              <input className={tw.input} placeholder="Exam code (e.g. MID1)"
+                value={newCode} onChange={e => setNewCode(e.target.value)} />
+              <input className={tw.input} placeholder="Title"
+                value={newTitle} onChange={e => setNewTitle(e.target.value)} />
+              <textarea className={tw.input} placeholder="Description (optional)" rows={2}
+                value={newDesc} onChange={e => setNewDesc(e.target.value)} />
+              <div className="flex flex-col gap-1">
+                <span className="text-xs text-zinc-400">Deadline (optional)</span>
+                <DeadlinePicker value={newDue} onChange={setNewDue} />
               </div>
-            ))
-          }
-        </div>
+              <ErrorBox msg={createErr} />
+              {createdMsg && <div className="text-xs text-emerald-400">{createdMsg}</div>}
+              <button className={tw.btnPrimary} type="submit" disabled={creating}>
+                {creating ? 'Creating…' : 'Create exam'}
+              </button>
+            </form>
+
+            <div className="flex flex-col gap-2">
+              <div className={tw.label}>Exams in this class ({exams.length})</div>
+              {exams.length > 0 && (
+                <input className={tw.input} placeholder="Search exams by title or code…"
+                  value={examQuery} onChange={e => setExamQuery(e.target.value)} />
+              )}
+
+              {exams.length === 0
+                ? <Empty text="No exams in this class yet." />
+                : filteredExams.length === 0
+                  ? <div className="py-2 text-xs text-zinc-500">No matching exams.</div>
+                  : filteredExams.map(ex => (
+                    <div key={ex.id} className={`${selected?.id === ex.id ? tw.rowActive : tw.row} flex items-center gap-2`}>
+                      <button type="button" className="flex-1 text-left flex items-center justify-between gap-2"
+                        onClick={() => { setCreatedMsg(''); pickExam(ex) }}>
+                        <div>
+                          <div className="text-sm font-medium text-zinc-100">{ex.title}</div>
+                          <div className={tw.muted}>
+                            {ex.exam_code}{ex.due_at ? ` · due ${fmtDue(ex.due_at)}` : ''}
+                          </div>
+                        </div>
+                        {ex.template_spec_json
+                          ? <span className={tw.badge('ocr_done')}>template</span>
+                          : <span className={tw.badge('draft')}>no template</span>
+                        }
+                      </button>
+                      <button type="button" onClick={() => deleteExam(ex)}
+                        className="text-xs text-zinc-600 hover:text-red-400 transition shrink-0 px-1">
+                        ✕
+                      </button>
+                    </div>
+                  ))
+              }
+            </div>
+          </>
+        }
       </div>
 
       {/* Right: exam detail */}
@@ -573,7 +611,7 @@ export default function ExamsPage() {
               </h2>
               <div className="flex gap-2 flex-wrap justify-end">
                 <button className={tw.btnSmPrimary} onClick={generateTemplate} disabled={genning || questions.length === 0}>
-                  {genning ? 'Generating…' : templateReady ? 'Re-generate PDF' : 'Generate PDF template'}
+                  {genning ? 'Generating…' : templateReady ? 'Re-generate & download PDF' : 'Generate & download PDF template'}
                 </button>
                 {templateReady && (
                   <button className={tw.btnSm} onClick={downloadTemplate}>
@@ -604,6 +642,10 @@ export default function ExamsPage() {
               </div>
             </div>
             {selected.description && <p className={tw.muted}>{selected.description}</p>}
+            <DeadlineEditor exam={selected} onSaved={ex => {
+              setSelected(prev => ({ ...prev, ...ex }))
+              setExams(prev => prev.map(e => e.id === ex.id ? { ...e, ...ex } : e))
+            }} />
             <ErrorBox msg={genErr} />
             {templateReady && (
               <div className="rounded-lg border border-emerald-900/40 bg-emerald-950/20 px-3 py-2 text-xs text-emerald-300">
@@ -710,13 +752,16 @@ export default function ExamsPage() {
             <div className={tw.label}>Questions ({questions.length})</div>
 
             <form onSubmit={addQuestion} className={`${tw.card} flex flex-col gap-3`}>
-              <div className={tw.label}>Add question</div>
+              <div className={tw.label}>Add question to “{selected.title}”</div>
 
               {/* Question type selector */}
               <div className="flex gap-2 flex-wrap">
                 {[['essay','Essay'],['mcq','MCQ'],['tf','True / False'],['identification','Identification']].map(([val, label]) => (
                   <button key={val} type="button"
-                    onClick={() => { setQType(val); setQCorrect(''); setQChoices(['','','','']) }}
+                    onClick={() => {
+                      setQType(val); setQCorrect(''); setQChoices(['','','','']);
+                      setQPoints(val === 'essay' ? '10' : '1')
+                    }}
                     className={[
                       'rounded px-3 py-1 text-xs transition',
                       qType === val
@@ -823,8 +868,13 @@ export default function ExamsPage() {
               )}
 
               {!(qType === 'essay' && qRubricMode === 'structured') && (
-                <input className={tw.input} placeholder="Max points" type="number" min="0" step="0.5"
-                  value={qPoints} onChange={e => setQPoints(e.target.value)} />
+                <div className="relative">
+                  <input className={tw.input + ' pr-12'} placeholder="Max points" type="number" min="0" step="0.5"
+                    value={qPoints} onChange={e => setQPoints(e.target.value)} />
+                  <span className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-xs text-zinc-500">
+                    {parseFloat(qPoints) === 1 ? 'pt' : 'pts'}
+                  </span>
+                </div>
               )}
               <ErrorBox msg={addQErr} />
               <button className={tw.btnPrimary} type="submit"
@@ -962,8 +1012,13 @@ export default function ExamsPage() {
                           )}
 
                           {!(editQType === 'essay' && editQRubricMode === 'structured') && (
-                            <input className={tw.input} placeholder="Max points" type="number" min="0" step="0.5"
-                              value={editQPoints} onChange={e => setEditQPoints(e.target.value)} />
+                            <div className="relative">
+                              <input className={tw.input + ' pr-12'} placeholder="Max points" type="number" min="0" step="0.5"
+                                value={editQPoints} onChange={e => setEditQPoints(e.target.value)} />
+                              <span className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-xs text-zinc-500">
+                                {parseFloat(editQPoints) === 1 ? 'pt' : 'pts'}
+                              </span>
+                            </div>
                           )}
 
                           <ErrorBox msg={saveQErr} />

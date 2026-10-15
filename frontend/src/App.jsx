@@ -1,4 +1,7 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
+import { api, getSession } from './api'
+import LoginPage       from './pages/LoginPage'
+import StudentPortal   from './pages/StudentPortal'
 import OcrPage         from './pages/OcrPage'
 import ClassesPage     from './pages/ClassesPage'
 import StudentsPage    from './pages/StudentsPage'
@@ -7,6 +10,8 @@ import SubmissionsPage from './pages/SubmissionsPage'
 import ResultsPage     from './pages/ResultsPage'
 import AnalyticsPage   from './pages/AnalyticsPage'
 import FlaggedAnswersPage from './pages/FlaggedAnswersPage'
+import ReviewQueuePage from './pages/ReviewQueuePage'
+import NotificationBell from './components/NotificationBell'
 import { WorkflowProvider, useWorkflow } from './context/WorkflowContext'
 
 const API_BASE = import.meta.env.VITE_API_BASE ?? 'http://127.0.0.1:8000'
@@ -22,6 +27,7 @@ const WORKFLOW_TABS = [
   { id: 'exams',       label: 'Exams',       desc: 'Create exams, add questions, and generate printable PDF templates with ArUco markers.' },
   { id: 'submissions', label: 'Submissions', desc: 'Upload scanned papers and process them (OCR + AI grading).' },
   { id: 'results',     label: 'Results',     desc: 'View per-question OCR text, AI scores and feedback, and apply teacher overrides.' },
+  { id: 'review',      label: 'Needs review', desc: 'Every answer waiting on you — flagged or low confidence — across all students, in one list.' },
 ]
 
 // Secondary: not part of the core setup → exam cycle.
@@ -83,7 +89,7 @@ function Breadcrumb({ tab }) {
   )
 }
 
-function AppShell() {
+function AppShell({ session, onLogout }) {
   const { activeTab: tab, setActiveTab: setTab } = useWorkflow()
   const [moreOpen, setMoreOpen] = useState(false)
 
@@ -140,6 +146,15 @@ function AppShell() {
               )}
             </div>
 
+            <div className="flex items-center gap-2">
+              <NotificationBell />
+              <span className="text-xs text-zinc-500 hidden md:inline">{session.user.full_name}</span>
+              <button type="button" onClick={onLogout}
+                className="rounded-md border border-zinc-800 px-3 py-1.5 text-sm text-zinc-500 hover:text-zinc-300 hover:border-zinc-700 transition">
+                Log out
+              </button>
+            </div>
+
           </div>
         </div>
       </header>
@@ -162,16 +177,34 @@ function AppShell() {
         {tab === 'results'     && <ResultsPage />}
         {tab === 'analytics'   && <AnalyticsPage />}
         {tab === 'flagged'     && <FlaggedAnswersPage />}
+        {tab === 'review'      && <ReviewQueuePage />}
         {tab === 'ocr'         && <OcrPage />}
       </main>
     </div>
   )
 }
 
+// Role gate: students only ever render StudentPortal, teachers only AppShell.
+// The server enforces the same split; this just keeps the wrong UI from loading.
 export default function App() {
+  const [session, setSessionState] = useState(getSession())
+
+  useEffect(() => {
+    const sync = () => setSessionState(getSession())
+    window.addEventListener('graid-auth-changed', sync)
+    return () => window.removeEventListener('graid-auth-changed', sync)
+  }, [])
+
+  async function logout() {
+    await api.auth.logout()
+    setSessionState(null)
+  }
+
+  if (!session) return <LoginPage onAuthed={() => setSessionState(getSession())} />
+  if (session.role === 'student') return <StudentPortal session={session} onLogout={logout} />
   return (
     <WorkflowProvider>
-      <AppShell />
+      <AppShell session={session} onLogout={logout} />
     </WorkflowProvider>
   )
 }

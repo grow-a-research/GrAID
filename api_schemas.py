@@ -1,8 +1,20 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
+from typing import Annotated
 
-from pydantic import BaseModel, ConfigDict, EmailStr, Field
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, PlainSerializer
+
+
+def _utc_iso(d: datetime) -> str:
+    """Naive datetimes in this app are UTC; send them with a Z so browsers
+    convert to the viewer's local time instead of treating them as local."""
+    if d.tzinfo is None:
+        d = d.replace(tzinfo=timezone.utc)
+    return d.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+UtcDateTime = Annotated[datetime, PlainSerializer(_utc_iso, return_type=str, when_used="json")]
 
 
 # --- Course class ---
@@ -57,12 +69,34 @@ class EnrollmentRead(BaseModel):
     enrolled_at: datetime
 
 
+class RosterEntry(BaseModel):
+    student_id: str
+    full_name: str
+    email: str | None
+    access_code: str | None
+    redeemed: bool
+    redeemed_at: datetime | None
+
+
 # --- Exam ---
 class ExamCreate(BaseModel):
     class_id: int
     exam_code: str = Field(..., min_length=1, max_length=64)
     title: str = Field(..., min_length=1, max_length=255)
     description: str | None = None
+    due_at: datetime | None = None      # optional deadline (ISO 8601, any timezone)
+
+
+class ExamReleaseUpdate(BaseModel):
+    released: bool
+
+
+class ExamAutoGradeUpdate(BaseModel):
+    enabled: bool
+
+
+class ExamDeadlineUpdate(BaseModel):
+    due_at: datetime | None = None      # null clears the deadline
 
 
 class ExamRead(BaseModel):
@@ -74,6 +108,11 @@ class ExamRead(BaseModel):
     title: str
     description: str | None
     template_spec_json: str | None
+    due_at: UtcDateTime | None = None
+    results_released_at: UtcDateTime | None = None
+    auto_grade: bool = False
+    auto_grade_started_at: UtcDateTime | None = None
+    auto_grade_finished_at: UtcDateTime | None = None
     created_at: datetime
 
 
@@ -162,6 +201,7 @@ class SubmissionRead(BaseModel):
     exam_id: int
     student_id: int
     status: str
+    uploaded_by: str | None = None
     created_at: datetime
     updated_at: datetime
     files: list[SubmissionFileRead] = []
@@ -173,6 +213,9 @@ class SubmissionSummary(BaseModel):
     status: str
     student_id: str        # external school ID
     student_name: str
+    uploaded_by: str | None = None   # "student" | "teacher" | None
+    submitted_at: UtcDateTime | None = None
+    is_late: bool = False            # student submitted after the exam's deadline
     created_at: datetime
     updated_at: datetime
 
@@ -212,6 +255,7 @@ class SubmissionAnswerRead(BaseModel):
     # "unknown", not "low". Pairs with groq_confidence to form the combined
     # confidence the review flag uses (see answer_confidence.py).
     ocr_confidence: float | None = None
+    reviewed_at: datetime | None = None
     # Computed: teacher_score takes priority over ai_score
     @property
     def final_score(self) -> float | None:
@@ -241,7 +285,41 @@ class QuestionStats(BaseModel):
     avg_score: float | None
     min_score: float | None
     max_score: float | None
+    # Number of graded submissions the item was evaluated over. Blank and
+    # unscored answers are included (scored 0), so this equals
+    # ExamStats.graded_count and the per-item numbers reconcile with the totals.
     answer_count: int
+
+    # --- Item analysis ---
+    question_type: str = "essay"
+    correct_answer: str | None = None
+    # How "correct" was decided for this item, shown next to the counts.
+    correct_basis: str = ""
+    correct_count: int = 0
+    # Incorrect includes blank answers; blank_count is the blank subset of it.
+    incorrect_count: int = 0
+    blank_count: int = 0
+    # Answers still in needs_review — informational, counts may shift after review.
+    needs_review_count: int = 0
+    pct_correct: float | None = None          # difficulty index, 0–100
+    # Upper-vs-lower 27% group difference in score fraction (-1..1);
+    # None when too few graded submissions for it to mean anything.
+    discrimination_index: float | None = None
+    discrimination_note: str | None = None
+    # MCQ/TF only: how many students chose each option (incl. "(blank)").
+    choice_counts: dict[str, int] | None = None
+
+
+class ItemResponseRow(BaseModel):
+    """One student's response to one question — the source row behind item analysis."""
+    answer_id: int | None
+    submission_id: int
+    student_id: str
+    response: str | None
+    score: float | None
+    score_source: str          # "teacher" | "AI" | "none"
+    outcome: str               # "correct" | "incorrect" | "blank"
+    status: str | None         # SubmissionAnswer.status; None when no answer row exists
 
 
 class ExamStats(BaseModel):
@@ -378,6 +456,23 @@ class FlagLogWithContext(BaseModel):
     review_decision: str | None
     reviewed_at: datetime | None
     created_at: datetime
+
+
+class ReviewQueueItem(BaseModel):
+    """One answer waiting for the teacher: needs_review status and/or an unreviewed flag."""
+    answer_id: int
+    submission_id: int
+    student_id: str            # external school ID
+    student_name: str
+    question_id: int | None
+    question_order_index: int | None
+    question_prompt: str | None
+    question_type: str | None
+    max_points: float | None
+    ai_score: float | None
+    reason: str                # the flag reason, or "needs_review" when only the status applies
+    flagged: bool              # has an unreviewed flag
+    status: str
 
 
 class FlagStats(BaseModel):

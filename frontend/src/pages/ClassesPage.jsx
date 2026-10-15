@@ -86,6 +86,14 @@ export default function ClassesPage() {
     setUnenrollingId(null)
   }
 
+  async function regenerateCode(studentId) {
+    if (!selected) return
+    try {
+      const updated = await api.classes.regenerateCode(selected.id, studentId)
+      setEnrolled(prev => prev.map(s => s.student_id === studentId ? { ...s, ...updated } : s))
+    } catch (err) { alert(`Could not regenerate code: ${err.message}`) }
+  }
+
   async function deleteClass(cls) {
     if (!window.confirm(`Delete class "${cls.name}" (${cls.code})?\n\nThis will also delete all its exams, submissions, and uploaded scans. This cannot be undone.`)) return
     try {
@@ -217,7 +225,7 @@ export default function ClassesPage() {
           </button>
         </form>
 
-        <div className="flex flex-col gap-2">
+        <div className="flex max-h-[50vh] flex-col gap-2 overflow-y-auto pr-1">
           {classes.length === 0
             ? <Empty text="No classes yet." />
             : classes.map(cls => (
@@ -364,12 +372,24 @@ export default function ClassesPage() {
                 ? <Empty text="No students enrolled." />
                 : enrolledFiltered.length === 0
                   ? <div className="py-2 text-xs text-zinc-500">No matching students.</div>
-                  : <div className="flex flex-col gap-2">
+                  : <div className="flex max-h-[60vh] flex-col gap-2 overflow-y-auto pr-1">
                       {enrolledFiltered.map(s => (
                         <div key={s.id} className={`${tw.card} flex items-center justify-between gap-2`}>
                           <div>
                             <div className="text-sm text-zinc-100">{s.full_name}</div>
                             <div className={tw.muted}>{s.student_id}</div>
+                          </div>
+                          <div className="ml-auto flex items-center gap-2">
+                            {s.redeemed
+                              ? <span className="text-xs text-emerald-400">✓ joined</span>
+                              : <>
+                                  <code className="rounded bg-zinc-800 px-2 py-0.5 text-xs tracking-widest text-zinc-100"
+                                    title="Give this code to the student">{s.access_code}</code>
+                                  <button type="button" className={tw.btnSm}
+                                    onClick={() => navigator.clipboard?.writeText(s.access_code)}>Copy</button>
+                                  <button type="button" className={tw.btnSm}
+                                    onClick={() => regenerateCode(s.student_id)}>New code</button>
+                                </>}
                           </div>
                           <button type="button" onClick={() => unenrollStudent(s.student_id)}
                             disabled={unenrollingId === s.student_id}

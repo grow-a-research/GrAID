@@ -2,6 +2,7 @@ import { useEffect, useRef, useState, useCallback } from 'react'
 import { api } from '../api'
 import { tw, ErrorBox, Empty } from '../ui'
 import { useWorkflow } from '../context/WorkflowContext'
+import ClassPicker from '../components/ClassPicker'
 
 const STATUS_STEPS = ['draft', 'submitted', 'ocr_done', 'graded']
 
@@ -30,13 +31,20 @@ export default function SubmissionsPage() {
     selectedClass, selectClass,
     selectedExam, selectExam: pickExam,
     selectedSubmission: selectedSub, selectSubmission: pickSub, updateSelectedSubmission: setSelectedSub,
+    setActiveTab,
   } = useWorkflow()
   const [classes, setClasses] = useState([])
   const [exams, setExams] = useState([])
   const [submissions, setSubmissions] = useState([])
+  // The exam new submissions are created for is simply the selected exam.
+  const newExamId = selectedExam ? String(selectedExam.id) : ''
 
   // create
-  const [newExamId, setNewExamId] = useState('')
+  const [examQuery, setExamQuery] = useState('')
+  const [subQuery, setSubQuery] = useState('')
+  // review queue for the selected exam
+  const [queue, setQueue] = useState([])
+  const [onlyReview, setOnlyReview] = useState(false)
   const [newStudentId, setNewStudentId] = useState('')
   const [studentSearch, setStudentSearch] = useState('')
   const [enrolledStudents, setEnrolledStudents] = useState([])
@@ -93,17 +101,31 @@ export default function SubmissionsPage() {
   // Re-loads the exam list whenever the shared selected class changes (including
   // arriving here with a class already picked from Exams/Results).
   useEffect(() => {
-    api.exams.list(selectedClass?.id).then(setExams).catch(() => setExams([]))
+    setExamQuery('')
+    if (!selectedClass) { setExams([]); return }
+    api.exams.list(selectedClass.id).then(setExams).catch(() => setExams([]))
   }, [selectedClass?.id])
+
+  // Arriving with an exam already picked on another tab: show its class too.
+  useEffect(() => {
+    if (selectedExam && !selectedClass && classes.length > 0) {
+      const cls = classes.find(c => c.id === selectedExam.class_id)
+      if (cls) selectClass(cls)
+    }
+  }, [classes, selectedExam?.id])
+
+  function changeClass(cls) {
+    if (!cls) pickExam(null)   // clearing the class also closes the exam
+    selectClass(cls)
+  }
 
   // Loads the roster for whichever exam is picked in "New submission" — the
   // student picker only offers students enrolled in that exam's class.
   useEffect(() => {
     setNewStudentId(''); setStudentSearch('')
-    const ex = exams.find(x => x.id === parseInt(newExamId))
-    if (!ex) { setEnrolledStudents([]); return }
-    api.classes.enrolled(ex.class_id).then(setEnrolledStudents).catch(() => setEnrolledStudents([]))
-  }, [newExamId])
+    if (!selectedExam) { setEnrolledStudents([]); return }
+    api.classes.enrolled(selectedExam.class_id).then(setEnrolledStudents).catch(() => setEnrolledStudents([]))
+  }, [selectedExam?.id])
 
   // Loads the submission list whenever the shared selected exam changes — covers both
   // an explicit pick here and arriving with an exam already selected from Exams/Results.
@@ -112,9 +134,17 @@ export default function SubmissionsPage() {
     // list changes, so nothing is queued from a previously viewed exam.
     setSelectedForReprocess([])
     setReprocessMsg('')
+    setSubQuery('')
+    setBulkMsg('')
     if (!selectedExam) { setSubmissions([]); return }
     api.exams.submissions(selectedExam.id).then(setSubmissions).catch(() => setSubmissions([]))
   }, [selectedExam?.id])
+
+  async function loadQueue(examId = selectedExam?.id) {
+    if (!examId) { setQueue([]); return }
+    try { setQueue(await api.exams.reviewQueue(examId)) } catch { setQueue([]) }
+  }
+  useEffect(() => { setOnlyReview(false); loadQueue() }, [selectedExam?.id])
 
   // Bulk "process all" runs server-side and can outlive this component (e.g. you
   // navigate away mid-batch and come back, or a groupmate started it on another
@@ -341,9 +371,9 @@ export default function SubmissionsPage() {
 
   function downloadPaper() {
     if (!selectedSub) return
-    const a = document.createElement('a')
-    a.href = api.submissions.paperUrl(selectedSub.id)
-    document.body.appendChild(a); a.click(); a.remove()
+    const name = `paper_${selectedExam?.exam_code ?? 'exam'}_${selectedSub.student_id ?? selectedSub.id}.pdf`
+    api.download(api.submissions.paperUrl(selectedSub.id), name)
+      .catch(err => setUploadErr(`Download failed: ${err.message}`))
   }
 
   // ── Camera helpers ────────────────────────────────────────────────────────
@@ -437,34 +467,75 @@ export default function SubmissionsPage() {
 
   const canProcess = selectedSub?.files?.length > 0 && !processing
 
+  const examQ = examQuery.trim().toLowerCase()
+  const filteredExams = examQ
+    ? exams.filter(ex => ex.title.toLowerCase().includes(examQ) || ex.exam_code.toLowerCase().includes(examQ))
+    : exams
+  const reviewBySub = {}
+  queue.forEach(i => { reviewBySub[i.submission_id] = (reviewBySub[i.submission_id] ?? 0) + 1 })
+  const subQ = subQuery.trim().toLowerCase()
+  const filteredSubs = submissions.filter(s =>
+    (!subQ || s.student_name.toLowerCase().includes(subQ) || s.student_id.toLowerCase().includes(subQ)) &&
+    (!onlyReview || reviewBySub[s.id] > 0))
+
   return (
     <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">
       {/* Left panel */}
       <div className="flex flex-col gap-4">
         <h2 className={tw.heading}>Submissions</h2>
 
-        {/* Class filter — scopes both the create-form exam picker and the browse list below */}
-        <select className={tw.select} value={selectedClass?.id ?? ''}
-          onChange={e => {
-            const cls = classes.find(c => c.id === parseInt(e.target.value)) ?? null
-            selectClass(cls)
-          }}>
-          <option value="">All classes</option>
-          {classes.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
-        </select>
+        {/* One class selector scopes everything below it */}
+        <ClassPicker classes={classes} value={selectedClass} onChange={changeClass} />
+
+        {!selectedClass
+          ? <div className="flex h-28 items-center justify-center rounded-xl border border-dashed border-zinc-700 px-4 text-center">
+              <span className={tw.muted}>Select a class to see its exams and submissions.</span>
+            </div>
+          : <>
+        {/* Exam — the single exam choice; the create form and submission list follow it */}
+        <div className="flex flex-col gap-2">
+          <div className={tw.label}>Exams in {selectedClass.name} ({exams.length})</div>
+          {exams.length > 0 && (
+            <input className={tw.input} placeholder="Search exams by title or code…"
+              value={examQuery} onChange={e => setExamQuery(e.target.value)} />
+          )}
+          <div className="flex max-h-56 flex-col gap-2 overflow-y-auto pr-1">
+          {exams.length === 0
+            ? <Empty text="No exams in this class yet." />
+            : filteredExams.length === 0
+              ? <div className="py-2 text-xs text-zinc-500">No matching exams.</div>
+              : filteredExams.map(ex => (
+                <button key={ex.id} type="button"
+                  className={selectedExam?.id === ex.id ? tw.rowActive : tw.row}
+                  onClick={() => pickExam(ex)}>
+                  <div className="text-sm text-zinc-100">{ex.title}</div>
+                  <span className="text-xs text-zinc-500">{ex.exam_code}</span>
+                </button>
+              ))}
+          </div>
+          {!selectedExam && exams.length > 0 && (
+            <div className="text-xs text-zinc-500">Select an exam to create or view its submissions.</div>
+          )}
+        </div>
+
+        {/* Everything in this exam that is waiting on the teacher */}
+        {selectedExam && queue.length > 0 && (
+          <button type="button" onClick={() => setActiveTab('review')}
+            className="flex w-full items-center justify-between gap-3 rounded-lg border border-amber-700/40 bg-amber-950/20 px-3 py-2 text-left text-sm text-amber-200 transition hover:bg-amber-950/40">
+            <span>
+              ⚑ <b>{queue.length}</b> answer{queue.length === 1 ? '' : 's'} in this exam need{queue.length === 1 ? 's' : ''} review
+            </span>
+            <span className="shrink-0 text-xs underline underline-offset-2">Open Needs review →</span>
+          </button>
+        )}
 
         {/* Create */}
+        {selectedExam && (
         <form onSubmit={createSubmission} className={`${tw.card} flex flex-col gap-3`}>
-          <div className={tw.label}>New submission</div>
-          <select className={tw.select} value={newExamId} onChange={e => setNewExamId(e.target.value)}>
-            <option value="">Select exam…</option>
-            {exams.map(ex => (
-              <option key={ex.id} value={ex.id}>{ex.title} ({ex.exam_code})</option>
-            ))}
-          </select>
+          <div className={tw.label}>New submission for {selectedExam.title}</div>
           <div className="relative">
             <input className={tw.input}
-              placeholder={newExamId ? 'Search enrolled student…' : 'Select an exam first'}
+              placeholder="Search enrolled student…"
               value={studentSearch}
               disabled={!newExamId}
               onChange={e => { setStudentSearch(e.target.value); setNewStudentId(''); setStudentPickerOpen(true) }}
@@ -519,21 +590,7 @@ export default function SubmissionsPage() {
           </button>
           {bulkMsg && <div className="text-xs text-emerald-400">{bulkMsg}</div>}
         </form>
-
-        {/* Browse by exam */}
-        <div className="flex flex-col gap-2">
-          <div className={tw.label}>Browse by exam{selectedClass ? ` — ${selectedClass.name}` : ''}</div>
-          {exams.length === 0
-            ? <Empty text="No exams in this class yet." />
-            : exams.map(ex => (
-              <button key={ex.id} type="button"
-                className={selectedExam?.id === ex.id ? tw.rowActive : tw.row}
-                onClick={() => pickExam(ex)}>
-                <div className="text-sm text-zinc-100">{ex.title}</div>
-                <span className="text-xs text-zinc-500">{ex.exam_code}</span>
-              </button>
-            ))}
-        </div>
+        )}
 
         {/* Submission list */}
         {selectedExam && (
@@ -550,9 +607,29 @@ export default function SubmissionsPage() {
                 </button>
               )}
             </div>
+            {submissions.length > 0 && (
+              <div className="flex items-center gap-2">
+                <input className={tw.input} placeholder="Search submissions by student name or ID…"
+                  value={subQuery} onChange={e => setSubQuery(e.target.value)} />
+                <button type="button" onClick={() => setOnlyReview(o => !o)}
+                  disabled={queue.length === 0 && !onlyReview}
+                  title="Show only students with answers waiting for review"
+                  className={[
+                    'shrink-0 whitespace-nowrap rounded-md border px-3 py-2 text-xs transition disabled:opacity-40',
+                    onlyReview
+                      ? 'border-amber-500/60 bg-amber-500/15 text-amber-200'
+                      : 'border-zinc-700 bg-zinc-900 text-zinc-300 hover:bg-zinc-800',
+                  ].join(' ')}>
+                  ⚑ Needs review{queue.length > 0 ? ` (${Object.keys(reviewBySub).length})` : ''}
+                </button>
+              </div>
+            )}
+            <div className="flex max-h-80 flex-col gap-2 overflow-y-auto pr-1">
             {submissions.length === 0
               ? <Empty text="No submissions yet." />
-              : submissions.map(s => (
+              : filteredSubs.length === 0
+                ? <div className="py-2 text-xs text-zinc-500">No matching submissions.</div>
+                : filteredSubs.map(s => (
                 <div key={s.id} className={`${selectedSub?.id === s.id ? tw.rowActive : tw.row} flex items-center gap-2`}>
                   <input
                     type="checkbox"
@@ -567,7 +644,24 @@ export default function SubmissionsPage() {
                       <div className="text-sm text-zinc-100">{s.student_name}</div>
                       <div className={tw.muted}>{s.student_id}</div>
                     </div>
-                    <span className={tw.badge(s.status)}>{s.status}</span>
+                    <span className="flex items-center gap-1.5">
+                      {s.uploaded_by && (
+                        <span className="text-[10px] text-zinc-500" title="Who uploaded the scan">
+                          by {s.uploaded_by}
+                        </span>
+                      )}
+                      {reviewBySub[s.id] > 0 && (
+                        <span className="rounded-full bg-amber-500/20 px-1.5 py-0.5 text-[10px] font-medium text-amber-300"
+                          title={`${reviewBySub[s.id]} answer(s) waiting for review`}>
+                          ⚑ {reviewBySub[s.id]}
+                        </span>
+                      )}
+                      {s.is_late && (
+                        <span className="rounded-full bg-red-500/15 px-1.5 py-0.5 text-[10px] font-medium text-red-300"
+                          title="Submitted after the deadline">late</span>
+                      )}
+                      <span className={tw.badge(s.status)}>{s.status}</span>
+                    </span>
                   </button>
                   <button type="button" onClick={() => deleteSub(s)}
                     className="text-xs text-zinc-600 hover:text-red-400 transition shrink-0 px-1">
@@ -576,6 +670,7 @@ export default function SubmissionsPage() {
                 </div>
               ))
             }
+            </div>
           </div>
         )}
 
@@ -733,6 +828,8 @@ export default function SubmissionsPage() {
             )}
           </div>
         )}
+          </>
+        }
       </div>
 
       {/* Right panel */}
@@ -755,7 +852,10 @@ export default function SubmissionsPage() {
 
             {/* Upload / Camera */}
             <div className={tw.card}>
-              <div className={tw.label}>Scan / upload paper</div>
+              <div className={tw.label}>Scan / upload paper on behalf of student</div>
+              <div className="text-xs text-zinc-500 mb-1">
+                Students upload their own papers from the student portal; use this only when a student cannot.
+              </div>
 
               {/* Camera section — only shown when user opts in */}
               {camVisible && (

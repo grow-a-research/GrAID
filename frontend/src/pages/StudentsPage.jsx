@@ -230,7 +230,7 @@ export default function StudentsPage() {
 
         {filtered.length === 0
           ? <Empty text={students.length === 0 ? 'No students yet.' : 'No matches.'} />
-          : <div className="flex flex-col gap-2">
+          : <div className="flex max-h-[65vh] flex-col gap-2 overflow-y-auto pr-1">
               {filtered.map(s => (
                 <div key={s.id} className={tw.card}>
                   {editingId === s.student_id ? (

@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import { api } from '../api'
 import { tw, ErrorBox, Empty } from '../ui'
 import { useWorkflow } from '../context/WorkflowContext'
+import ClassPicker, { ExamPicker } from '../components/ClassPicker'
 import { REASON_LABELS, DECISION_COLOR } from '../flagLabels'
 
 // One row in the flagged-answers list. Reuses the same review endpoints as
@@ -98,8 +99,22 @@ export default function FlaggedAnswersPage() {
   useEffect(() => { api.classes.list().then(setClasses).catch(() => {}) }, [])
 
   useEffect(() => {
-    api.exams.list(selectedClass?.id).then(setExams).catch(() => setExams([]))
+    if (!selectedClass) { setExams([]); return }
+    api.exams.list(selectedClass.id).then(setExams).catch(() => setExams([]))
   }, [selectedClass?.id])
+
+  // Arriving with an exam already picked on another tab: show its class too.
+  useEffect(() => {
+    if (selectedExam && !selectedClass && classes.length > 0) {
+      const cls = classes.find(c => c.id === selectedExam.class_id)
+      if (cls) selectClass(cls)
+    }
+  }, [classes, selectedExam?.id])
+
+  function changeClass(cls) {
+    if (!cls) pickExam(null)   // clearing the class also closes the exam
+    selectClass(cls)
+  }
 
   useEffect(() => {
     setErr('')
@@ -138,30 +153,14 @@ export default function FlaggedAnswersPage() {
   return (
     <div className="flex flex-col gap-4">
       <div className="flex flex-wrap items-end gap-3">
-        <div className="flex flex-col gap-1 min-w-[200px]">
-          <div className={tw.label}>Class</div>
-          <select className={tw.select} value={selectedClass?.id ?? ''}
-            onChange={e => {
-              const cls = classes.find(c => c.id === parseInt(e.target.value)) ?? null
-              selectClass(cls)
-            }}>
-            <option value="">All classes</option>
-            {classes.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
-          </select>
+        <div className="flex flex-col gap-1 min-w-[220px]">
+          <ClassPicker classes={classes} value={selectedClass} onChange={changeClass} />
         </div>
-        <div className="flex flex-col gap-1 min-w-[240px] flex-1">
-          <div className={tw.label}>Exam</div>
-          <select className={tw.select} value={selectedExam?.id ?? ''}
-            onChange={e => {
-              const ex = exams.find(x => x.id === parseInt(e.target.value)) ?? null
-              pickExam(ex)
-            }}>
-            <option value="">Select an exam…</option>
-            {exams.map(ex => (
-              <option key={ex.id} value={ex.id}>{ex.title} ({ex.exam_code})</option>
-            ))}
-          </select>
-        </div>
+        {selectedClass && (
+          <div className="flex flex-col gap-1 min-w-[260px] flex-1">
+            <ExamPicker exams={exams} value={selectedExam} onChange={pickExam} />
+          </div>
+        )}
         {selectedExam && (
           <button className={tw.btnSm} onClick={refresh}>Refresh</button>
         )}
@@ -171,7 +170,9 @@ export default function FlaggedAnswersPage() {
 
       {!selectedExam
         ? <div className="flex h-40 items-center justify-center rounded-xl border border-dashed border-zinc-700">
-            <span className={tw.muted}>Select an exam to see its flagged answers</span>
+            <span className={tw.muted}>
+              {selectedClass ? 'Select an exam to see its flagged answers' : 'Select a class, then an exam, to see its flagged answers'}
+            </span>
           </div>
         : loading
           ? <div className={tw.muted}>Loading…</div>

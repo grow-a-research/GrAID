@@ -1,0 +1,11 @@
+# Everything that can contain student / panelist handwriting, downloaded
+# datasets, or trained weights stays out of git.
+consented/
+data/
+artifacts/
+imgur5k_images/
+*.safetensors
+*.bin
+*.pt
+__pycache__/
+*.pyc

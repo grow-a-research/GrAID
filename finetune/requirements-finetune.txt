@@ -1,0 +1,21 @@
+# Fine-tuning / evaluation dependencies. Separate from requirements.txt and
+# requirements-vast.txt on purpose: nothing here is needed by the live app.
+#
+# torch is EXCLUDED deliberately. Use the CUDA 12.8+ PyTorch build that ships
+# with the Vast.ai template (the RTX 5090 is Blackwell and needs it). Reinstalling
+# torch can replace it with a build that cannot drive the GPU.
+#
+#   pip install -r finetune/requirements-finetune.txt
+#   python3 -c "import torch; print(torch.cuda.is_available())"   # must print True
+
+transformers>=4.49.0
+accelerate>=1.0.0
+peft>=0.13.0
+datasets>=2.20.0
+qwen-vl-utils>=0.0.8
+pillow>=10.2.0
+opencv-python-headless>=4.10.0.0
+numpy>=1.26.4
+tqdm>=4.66.0
+# Only needed for --quant 4bit / 8bit (bf16 is the default and needs no bnb):
+# bitsandbytes>=0.45.0
